@@ -37,10 +37,7 @@ try:
         FP8_ALIGN,
         ExpertsGroupGemmContiguousNode,
         _stack_expert_weights,
-        _weighted_swiglu_fp32,
-        ceil_to_ue8m0,
         expert_weights_all_frozen,
-        fused_act_dequant_python,
         has_config,
         moe_token_padding_alignment,
     )
@@ -126,118 +123,8 @@ class TestMoeTokenPaddingAlignment(unittest.TestCase):
 
 
 @unittest.skipIf(_SKIP, _SKIP_REASON)
-class TestCeilToUe8m0(unittest.TestCase):
-    """``ceil_to_ue8m0`` rounds |x| UP to the nearest power of two by bumping
-    the IEEE-754 exponent when the mantissa is non-zero. Expected values are
-    derived by hand from the float32 bit layout, independent of the impl."""
-
-    def test_rounds_up_to_power_of_two(self):
-        values = [1.0, 2.0, 4.0, 0.5, 0.25, 3.0, 5.0, 6.0, 7.0, 1.5, 0.1, -3.0]
-        # By hand: powers of two are unchanged; anything with a non-zero
-        # mantissa jumps to the next power of two; abs() drops the sign.
-        expected = [
-            1.0,
-            2.0,
-            4.0,
-            0.5,
-            0.25,
-            4.0,
-            8.0,
-            8.0,
-            8.0,
-            2.0,
-            0.125,
-            4.0,
-        ]
-        x = paddle.to_tensor(values, dtype="float32")
-        out = ceil_to_ue8m0(x).numpy()
-        np.testing.assert_array_equal(out, np.array(expected, dtype=np.float32))
-
-    def test_not_identity_and_idempotent_on_pow2(self):
-        # Negative control: a non-power-of-two must actually change.
-        three = paddle.to_tensor([3.0], dtype="float32")
-        self.assertNotEqual(float(ceil_to_ue8m0(three).numpy()[0]), 3.0)
-        # Rounding an already-power-of-two value is a fixed point.
-        pow2 = paddle.to_tensor([0.25, 1.0, 8.0], dtype="float32")
-        once = ceil_to_ue8m0(pow2)
-        twice = ceil_to_ue8m0(once)
-        np.testing.assert_array_equal(once.numpy(), twice.numpy())
-        np.testing.assert_array_equal(once.numpy(), pow2.numpy())
-
-
 @unittest.skipIf(_SKIP, _SKIP_REASON)
-class TestWeightedSwigluFp32(unittest.TestCase):
-    """``_weighted_swiglu_fp32`` computes silu(gate) * up * probs in fp32 with
-    the gate/up split on the last axis. References are independent numpy."""
-
-    def test_matches_independent_silu_reference(self):
-        o1 = np.array(
-            [[0.0, 2.0, 3.0, -1.0], [1.0, -2.0, 0.5, 4.0]], np.float32
-        )
-        probs_col = np.array([[2.0], [0.5]], np.float32)
-        gate, up = o1[:, :2], o1[:, 2:]
-        ref = _silu(gate) * up * probs_col
-        got = _weighted_swiglu_fp32(
-            paddle.to_tensor(o1),
-            paddle.to_tensor(probs_col),
-        ).numpy()
-        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
-
-    def test_1d_probs_broadcast_per_row(self):
-        # 1-D probs [M] must broadcast as a per-row [M, 1] scale; distinct
-        # per-row values catch a wrong reshape/transpose.
-        o1 = np.array(
-            [[0.0, 2.0, 3.0, -1.0], [1.0, -2.0, 0.5, 4.0]], np.float32
-        )
-        probs_1d = np.array([2.0, 0.5], np.float32)
-        gate, up = o1[:, :2], o1[:, 2:]
-        ref = _silu(gate) * up * probs_1d.reshape(-1, 1)
-        got = _weighted_swiglu_fp32(
-            paddle.to_tensor(o1),
-            paddle.to_tensor(probs_1d),
-        ).numpy()
-        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
-
-    def test_clamp_is_asymmetric_gate_max_only(self):
-        # Contract: gate is clipped with max=c only (a large NEGATIVE gate is
-        # left alone), up is clipped to [-c, c]. gate=-5 stays -5 so silu(-5)
-        # differs from silu(clip(-5,-1,1))=silu(-1); this distinguishes a
-        # wrong symmetric clamp on the gate.
-        o1 = np.array([[-5.0, 2.0, 3.0, -3.0]], np.float32)
-        cv = 1.0
-        gate = np.clip(o1[:, :2], a_min=None, a_max=cv)  # max only
-        up = np.clip(o1[:, 2:], -cv, cv)
-        ref = _silu(gate) * up  # probs = 1 below
-        got = _weighted_swiglu_fp32(
-            paddle.to_tensor(o1),
-            paddle.ones([1, 1], dtype="float32"),
-            clamp_value=cv,
-        ).numpy()
-        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
-        # Sanity: the unclamped result would differ, proving clamp took effect.
-        unclamped = _silu(o1[:, :2]) * o1[:, 2:]
-        self.assertFalse(np.allclose(ref, unclamped))
-
-
 @unittest.skipIf(_SKIP, _SKIP_REASON)
-class TestFusedActDequantPython(unittest.TestCase):
-    """``fused_act_dequant_python`` expands each per-block scale across its
-    ``gran_k = K / num_blocks`` columns and multiplies. Distinguishable
-    per-block scales catch a wrong group->column mapping."""
-
-    def test_blockwise_scale_broadcast(self):
-        # K=4, two scale blocks -> gran_k=2 -> columns [0,0,1,1].
-        # Exact powers of two so the bf16 output is lossless.
-        x = paddle.to_tensor([[1.0, 2.0, 4.0, 8.0]], dtype="float32")
-        sf = paddle.to_tensor([[2.0, 16.0]], dtype="float32")
-        out = fused_act_dequant_python(x, sf).astype("float32").numpy()
-        # By hand: [1*2, 2*2, 4*16, 8*16]. A [0,1,0,1] mapping would give
-        # [2, 32, 8, 128], so exact equality pins the grouping.
-        np.testing.assert_array_equal(
-            out, np.array([[2.0, 4.0, 64.0, 128.0]], dtype=np.float32)
-        )
-
-
 @unittest.skipIf(_SKIP, _SKIP_REASON)
 class TestExpertWeightsAllFrozen(unittest.TestCase):
     """``expert_weights_all_frozen`` returns True only when every entry

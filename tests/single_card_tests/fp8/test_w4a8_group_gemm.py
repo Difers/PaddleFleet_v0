@@ -28,22 +28,15 @@ Run:
 """
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import paddle
 import paddle.nn.functional as F
 
+from paddlefleet.transformer.activations import situ_glu_scale_forward
 from paddlefleet.transformer.moe import fp8_utils
-from paddlefleet.transformer.moe.fp8_utils import (
-    W4A8_QUANT_BLOCK,
-    ceil_to_ue8m0,
-    fuse_stack_fp8_quant_python,
-    fuse_stack_transpose_fp8_quant_python,
-    fuse_weighted_swiglu_fp8_quant_clamp_python,
-    fuse_weighted_swiglu_fp8_quant_python,
-    fused_act_dequant_python,
-    quant_blockwize,
-)
+from paddlefleet.transformer.moe.fp8_utils import W4A8_QUANT_BLOCK
 
 try:
     from paddlefleet_ops import deep_gemm as _pf_deep_gemm
@@ -88,291 +81,6 @@ def _bits_equal(a, b):
     if a.dtype == paddle.bfloat16:
         return bool((a.view("int16") == b.view("int16")).all())
     return bool((a.view("int8") == b.view("int8")).all())
-
-
-class TestCeilToUe8m0(unittest.TestCase):
-    def test_values(self):
-        """ceil_to_ue8m0 rounds scales up to powers of two."""
-        x = paddle.to_tensor(
-            [0.5, 1.0, 1.5, 3.0, 0.3, 1e-4, 448.0], dtype="float32"
-        )
-        y = ceil_to_ue8m0(x).numpy()
-        np.testing.assert_allclose(y, [0.5, 1.0, 2.0, 4.0, 0.5, 2**-13, 512.0])
-        exp = np.log2(y)
-        np.testing.assert_allclose(exp, np.round(exp))
-
-
-class TestQuantBlockwize(unittest.TestCase):
-    def setUp(self):
-        paddle.seed(2026)
-        np.random.seed(2026)
-
-    def test_fp8_1x32_dequant_roundtrip(self):
-        """fp8 1x32 quant-dequant roundtrip keeps relative error small."""
-        x = paddle.randn([64, 256], dtype="bfloat16")
-        x_fp8, sf = quant_blockwize(x, quant_method="1x32", quant_dtype="fp8")
-        self.assertEqual(x_fp8.dtype, paddle.float8_e4m3fn)
-        self.assertEqual(list(sf.shape), [64, 256 // W4A8_QUANT_BLOCK])
-        # ue8m0: scales are powers of 2
-        exp = np.log2(sf.numpy())
-        np.testing.assert_allclose(exp, np.round(exp))
-        x_dq = fused_act_dequant_python(x_fp8, sf)
-        err = (x_dq.astype("float32") - x.astype("float32")).abs()
-        ref = x.astype("float32").abs().clip(min=1e-2)
-        self.assertLess(float((err / ref).mean()), 0.06)
-
-    def test_fp8_no_ue8m0_exact_scale(self):
-        """using_ue8m0_scale=False keeps the exact amax/448 scale."""
-        x = paddle.randn([16, 64], dtype="bfloat16")
-        x_fp8, sf = quant_blockwize(
-            x, quant_dtype="fp8", using_ue8m0_scale=False
-        )
-        x_view = x.astype("float32").reshape([16, -1, W4A8_QUANT_BLOCK]).numpy()
-        amax = np.clip(np.abs(x_view).max(axis=-1), 1e-4, None)
-        np.testing.assert_allclose(sf.numpy(), amax / 448.0, rtol=1e-6)
-        self.assertEqual(x_fp8.dtype, paddle.float8_e4m3fn)
-
-    def test_empty_input(self):
-        """Zero-row input returns empty tensors with correct shapes."""
-        x = paddle.empty([0, 64], dtype="bfloat16")
-        x_fp8, sf = quant_blockwize(x, quant_dtype="fp8")
-        self.assertEqual(list(x_fp8.shape), [0, 64])
-        self.assertEqual(list(sf.shape), [0, 2])
-        x_fp4, sf4 = quant_blockwize(x, quant_dtype="fp4")
-        self.assertEqual(list(x_fp4.shape), [0, 32])
-        self.assertEqual(list(sf4.shape), [0, 2])
-
-    def test_fp4_dequant_roundtrip(self):
-        """fp4 1x32 quant-dequant roundtrip stays correlated with the input."""
-        x = paddle.randn([32, 128], dtype="bfloat16")
-        x_fp4, sf = quant_blockwize(x, quant_method="1x32", quant_dtype="fp4")
-        self.assertEqual(x_fp4.dtype, paddle.int8)
-        self.assertEqual(list(x_fp4.shape), [32, 64])
-        self.assertEqual(list(sf.shape), [32, 128 // W4A8_QUANT_BLOCK])
-        x_dq = _unpack_fp4_to_float(x_fp4, sf)
-        x_ref = x.astype("float32").numpy()
-        self.assertGreater(_cos(x_dq, x_ref), 0.98)
-        block = x_ref.reshape(32, -1, W4A8_QUANT_BLOCK)
-        amax = np.abs(block).max(axis=-1).clip(min=1e-4)
-        self.assertTrue(
-            (sf.numpy() * FP4_E2M1_MAX >= amax * 0.999).all(),
-            "scale must cover per-block amax",
-        )
-
-    def test_fp4_no_ue8m0_exact_scale(self):
-        """fp4 with using_ue8m0_scale=False keeps the exact amax/6 scale."""
-        x = paddle.randn([8, 64], dtype="bfloat16")
-        x_fp4, sf = quant_blockwize(
-            x, quant_dtype="fp4", using_ue8m0_scale=False
-        )
-        x_view = x.astype("float32").reshape([8, -1, W4A8_QUANT_BLOCK]).numpy()
-        amax = np.clip(np.abs(x_view).max(axis=-1), 1e-4, None)
-        np.testing.assert_allclose(sf.numpy(), amax / FP4_E2M1_MAX, rtol=1e-6)
-        # dequantized values must still track the input
-        x_dq = _unpack_fp4_to_float(x_fp4, sf)
-        self.assertGreater(_cos(x_dq, x_view.reshape(8, -1)), 0.98)
-
-    def test_2d_tile_128x128_matches_manual_reference(self):
-        """gran_m > 1 branch: 128x128 tile quantization for weights."""
-        m, n = 256, 384
-        x = paddle.randn([m, n], dtype="bfloat16")
-        for use_ue8m0 in (True, False):
-            q, sf = quant_blockwize(
-                x,
-                quant_method="128x128",
-                quant_dtype="fp8",
-                using_ue8m0_scale=use_ue8m0,
-            )
-            self.assertEqual(q.dtype, paddle.float8_e4m3fn)
-            self.assertEqual(list(q.shape), [m, n])
-            self.assertEqual(list(sf.shape), [m // 128, n // 128])
-            # manual per-tile reference in numpy
-            x32 = x.astype("float32").numpy()
-            tiles = x32.reshape(m // 128, 128, n // 128, 128).transpose(
-                0, 2, 1, 3
-            )
-            amax = np.clip(np.abs(tiles).max(axis=(2, 3)), 1e-4, None)
-            ref_sf = amax / 448.0
-            if use_ue8m0:
-                ref_sf = np.exp2(np.ceil(np.log2(ref_sf)))
-            np.testing.assert_allclose(sf.numpy(), ref_sf, rtol=1e-6)
-            # dequantize back and check the error is bounded by fp8 noise
-            q32 = q.astype("float32").numpy()
-            q_tiles = q32.reshape(m // 128, 128, n // 128, 128).transpose(
-                0, 2, 1, 3
-            )
-            dq = q_tiles * ref_sf[:, :, None, None]
-            self.assertGreater(_cos(dq, tiles), 0.999)
-
-    def test_2d_tile_rejects_fp4(self):
-        """2D tile quantization only supports fp8; fp4 must be rejected."""
-        x = paddle.randn([128, 128], dtype="bfloat16")
-        with self.assertRaises(AssertionError):
-            quant_blockwize(x, quant_method="128x128", quant_dtype="fp4")
-
-    def test_2d_tile_rejects_non_divisible_m(self):
-        """2D tile quantization requires M to be a multiple of gran_m."""
-        x = paddle.randn([100, 128], dtype="bfloat16")
-        with self.assertRaises(AssertionError):
-            quant_blockwize(x, quant_method="128x128", quant_dtype="fp8")
-
-    def test_rejects_non_divisible_k(self):
-        """K must be a multiple of the quantization block size."""
-        x = paddle.randn([4, 48], dtype="bfloat16")
-        with self.assertRaises(AssertionError):
-            quant_blockwize(x, quant_method="1x32", quant_dtype="fp8")
-
-    def test_rejects_unsupported_dtype(self):
-        """An unsupported quant_dtype raises ValueError."""
-        x = paddle.randn([4, 64], dtype="bfloat16")
-        with self.assertRaises(ValueError):
-            quant_blockwize(x, quant_method="1x32", quant_dtype="int8")
-
-
-class TestStackQuantHelpers(unittest.TestCase):
-    def setUp(self):
-        paddle.seed(2026)
-        np.random.seed(2026)
-
-    def test_fuse_stack_transpose_fp4(self):
-        """Stacked weights are transposed then fp4-quantized along K."""
-        e, k, n = 2, 64, 128
-        w = paddle.randn([e, k, n], dtype="bfloat16")
-        # transpose: [E, K, N] -> [E, N, K/2]
-        w_fp4, sf = fuse_stack_transpose_fp8_quant_python(w, quant_dtype="fp4")
-        self.assertEqual(w_fp4.dtype, paddle.int8)
-        self.assertEqual(list(w_fp4.shape), [e, n, k // 2])
-        self.assertEqual(list(sf.shape), [e, n, k // W4A8_QUANT_BLOCK])
-        w_dq = _unpack_fp4_to_float(w_fp4, sf)
-        w_ref = w.astype("float32").transpose([0, 2, 1]).numpy()
-        self.assertGreater(_cos(w_dq, w_ref), 0.98)
-
-    def test_fuse_stack_fp4(self):
-        """Stacked weights are fp4-quantized along the last dim."""
-        e, k, n = 2, 128, 64
-        w = paddle.randn([e, k, n], dtype="bfloat16")
-        w_fp4, sf = fuse_stack_fp8_quant_python(w, quant_dtype="fp4")
-        self.assertEqual(list(w_fp4.shape), [e, k, n // 2])
-        self.assertEqual(list(sf.shape), [e, k, n // W4A8_QUANT_BLOCK])
-        w_dq = _unpack_fp4_to_float(w_fp4, sf)
-        self.assertGreater(_cos(w_dq, w.astype("float32").numpy()), 0.98)
-
-    def test_list_input(self):
-        """A list of expert weights behaves exactly like the stacked tensor."""
-        w_list = [paddle.randn([64, 32], dtype="bfloat16") for _ in range(3)]
-        w_fp4, sf = fuse_stack_transpose_fp8_quant_python(
-            w_list, quant_dtype="fp4"
-        )
-        self.assertEqual(list(w_fp4.shape), [3, 32, 32])
-        self.assertEqual(list(sf.shape), [3, 32, 2])
-        # a list must behave exactly like the stacked tensor
-        w_fp4_ref, sf_ref = fuse_stack_transpose_fp8_quant_python(
-            paddle.stack(w_list, axis=0), quant_dtype="fp4"
-        )
-        self.assertTrue(bool((w_fp4 == w_fp4_ref).all()))
-        self.assertTrue(bool((sf == sf_ref).all()))
-
-    def test_single_element_list_input(self):
-        """A 1-element list holds an already-stacked [E, R, C] tensor and
-        takes the w[0] branch in _stack_expert_weights."""
-        w = paddle.randn([2, 64, 64], dtype="bfloat16")
-        w_fp4_a, sf_a = fuse_stack_fp8_quant_python([w], quant_dtype="fp4")
-        w_fp4_b, sf_b = fuse_stack_fp8_quant_python(w, quant_dtype="fp4")
-        self.assertTrue(bool((w_fp4_a == w_fp4_b).all()))
-        self.assertTrue(bool((sf_a == sf_b).all()))
-
-    def test_2d_tile_layout_kept(self):
-        """quant_method='128x128' keeps the 2D CUDA fused-op layout."""
-        e, k, n = 2, 128, 256
-        w = paddle.randn([e, k, n], dtype="bfloat16")
-        q, sf = fuse_stack_fp8_quant_python(
-            w, quant_method="128x128", quant_dtype="fp8"
-        )
-        self.assertEqual(list(q.shape), [e * k, n])
-        self.assertEqual(list(sf.shape), [e * k // 128, n // 128])
-        q_t, sf_t = fuse_stack_transpose_fp8_quant_python(
-            w, quant_method="128x128", quant_dtype="fp8"
-        )
-        self.assertEqual(list(q_t.shape), [e * n, k])
-        self.assertEqual(list(sf_t.shape), [e * n // 128, k // 128])
-
-
-class TestWeightedSwigluQuant(unittest.TestCase):
-    def setUp(self):
-        paddle.seed(2026)
-        np.random.seed(2026)
-
-    def test_matches_fp32_reference(self):
-        """swiglu(o1)*probs quantized output matches the fp32 reference."""
-        m, h2 = 32, 128
-        o1 = paddle.randn([m, h2], dtype="bfloat16")
-        probs = paddle.rand([m, 1], dtype="float32")
-        o2_fp8, sf = fuse_weighted_swiglu_fp8_quant_python(o1, probs)
-        self.assertEqual(list(o2_fp8.shape), [m, h2 // 2])
-        self.assertEqual(list(sf.shape), [m, h2 // 2 // W4A8_QUANT_BLOCK])
-        x32 = o1.astype("float32")
-        gate, up = x32[:, : h2 // 2], x32[:, h2 // 2 :]
-        ref = (F.silu(gate) * up * probs).numpy()
-        got = fused_act_dequant_python(o2_fp8, sf).astype("float32").numpy()
-        err = np.abs(got - ref)
-        denom = np.clip(np.abs(ref), 1e-2, None)
-        self.assertLess(float((err / denom).mean()), 0.06)
-
-    def test_clamp_matches_fp32_reference(self):
-        """Clamped swiglu output matches the clamped fp32 reference."""
-        m, h2 = 16, 128
-        clamp_value = 1.0
-        o1 = 5.0 * paddle.randn([m, h2], dtype="bfloat16")
-        probs = paddle.rand([m, 1], dtype="float32")
-        o2_fp8, sf = fuse_weighted_swiglu_fp8_quant_clamp_python(
-            o1, probs, clamp_value
-        )
-        x32 = o1.astype("float32")
-        gate = x32[:, : h2 // 2].clip(max=clamp_value)
-        up = x32[:, h2 // 2 :].clip(min=-clamp_value, max=clamp_value)
-        ref = (F.silu(gate) * up * probs).numpy()
-        got = fused_act_dequant_python(o2_fp8, sf).astype("float32").numpy()
-        err = np.abs(got - ref)
-        denom = np.clip(np.abs(ref), 1e-2, None)
-        self.assertLess(float((err / denom).mean()), 0.06)
-
-    def test_probs_1d_matches_2d(self):
-        """1-D probs [M] (as passed by the e2e forward) must broadcast the
-        same way as [M, 1]."""
-        m, h2 = 16, 128
-        o1 = paddle.randn([m, h2], dtype="bfloat16")
-        probs = paddle.rand([m], dtype="float32")
-        q_1d, sf_1d = fuse_weighted_swiglu_fp8_quant_python(o1, probs)
-        q_2d, sf_2d = fuse_weighted_swiglu_fp8_quant_python(
-            o1, probs.unsqueeze(-1)
-        )
-        self.assertTrue(_bits_equal(q_1d, q_2d))
-        self.assertTrue(bool((sf_1d == sf_2d).all()))
-        clamp = 1.0
-        qc_1d, sfc_1d = fuse_weighted_swiglu_fp8_quant_clamp_python(
-            o1, probs, clamp
-        )
-        qc_2d, sfc_2d = fuse_weighted_swiglu_fp8_quant_clamp_python(
-            o1, probs.unsqueeze(-1), clamp
-        )
-        self.assertTrue(_bits_equal(qc_1d, qc_2d))
-        self.assertTrue(bool((sfc_1d == sfc_2d).all()))
-
-
-class TestFusedActDequantPython(unittest.TestCase):
-    def setUp(self):
-        paddle.seed(2026)
-
-    def test_1x128_granularity_inferred(self):
-        """Granularity is inferred from the scale shape, so 1x128 fp8
-        activations (the original fp8 path) also dequantize correctly."""
-        x = paddle.randn([16, 256], dtype="bfloat16")
-        x_fp8, sf = quant_blockwize(x, quant_method="1x128", quant_dtype="fp8")
-        self.assertEqual(list(sf.shape), [16, 2])
-        x_dq = fused_act_dequant_python(x_fp8, sf)
-        err = (x_dq.astype("float32") - x.astype("float32")).abs()
-        ref = x.astype("float32").abs().clip(min=1e-2)
-        self.assertLess(float((err / ref).mean()), 0.06)
 
 
 HAS_K_GROUPED_BF16_GEMM = HAS_FP8_FP4_GEMM and hasattr(
@@ -480,6 +188,7 @@ class TestW4A8GroupGemm(unittest.TestCase):
         clamp_value=None,
         dequant_input=False,
         recompute_moe_gate_up=False,
+        activation_type="swiglu",
     ):
         """Build an ExpertsGroupGemmContiguousNode with use_w4a8=True."""
         from paddlefleet.transformer.moe.fp8_utils import (
@@ -487,15 +196,23 @@ class TestW4A8GroupGemm(unittest.TestCase):
         )
 
         experts, custom_map = _make_experts_and_map(num_experts, k, n)
+        if activation_type == "situ":
+            custom_map.config = SimpleNamespace(
+                activation_situ_beta=4.0,
+                activation_situ_linear_beta=25.0,
+                situ_glu_fusion=False,
+            )
         node = ExpertsGroupGemmContiguousNode(
             custom_map,
             use_fp8_mlp=True,
             moe_deep_gemm=True,
             moe_expert_fusion=True,
             use_w4a8=True,
+            use_ue8m0=True,
             clamp_value=clamp_value,
             dequant_input=dequant_input,
             recompute_moe_gate_up=recompute_moe_gate_up,
+            activation_type=activation_type,
         )
         return node, experts
 
@@ -511,6 +228,48 @@ class TestW4A8GroupGemm(unittest.TestCase):
             ref_parts.append(o2 @ experts.weight2[i].astype("float32"))
             start += t
         return paddle.concat(ref_parts, axis=0).numpy()
+
+    def _situ_ref_forward(self, x, probs, tokens, experts, n):
+        """fp32 SiTU-GLU reference for the W4A8 forward path."""
+        ref_parts = []
+        start = 0
+        for i, t in enumerate(tokens):
+            xi = x[start : start + t].astype("float32")
+            o1 = xi @ experts.weight1[i].astype("float32")
+            o2 = situ_glu_scale_forward(
+                o1,
+                probs[start : start + t],
+                beta=4.0,
+                linear_beta=25.0,
+            )
+            ref_parts.append(o2 @ experts.weight2[i].astype("float32"))
+            start += t
+        return paddle.concat(ref_parts, axis=0).numpy()
+
+    def _situ_autograd_reference(self, x, probs, tokens, experts, n, out_grad):
+        """fp32 autograd reference returning SiTU dx/dprobs/dw1/dw2."""
+        x_ref = x.astype("float32").detach()
+        x_ref.stop_gradient = False
+        probs_ref = probs.astype("float32").detach()
+        probs_ref.stop_gradient = False
+        w1_ref = experts.weight1.astype("float32").detach()
+        w1_ref.stop_gradient = False
+        w2_ref = experts.weight2.astype("float32").detach()
+        w2_ref.stop_gradient = False
+        ref_parts = []
+        start = 0
+        for i, t in enumerate(tokens):
+            o1 = x_ref[start : start + t] @ w1_ref[i]
+            o2 = situ_glu_scale_forward(
+                o1,
+                probs_ref[start : start + t],
+                beta=4.0,
+                linear_beta=25.0,
+            )
+            ref_parts.append(o2 @ w2_ref[i])
+            start += t
+        paddle.concat(ref_parts, axis=0).backward(out_grad.astype("float32"))
+        return x_ref.grad, probs_ref.grad, w1_ref.grad, w2_ref.grad
 
     # ---------------- construction-time branches ----------------
 
@@ -529,6 +288,7 @@ class TestW4A8GroupGemm(unittest.TestCase):
                 use_fp8_mlp=False,
                 moe_deep_gemm=True,
                 moe_expert_fusion=True,
+                use_ue8m0=True,
                 use_w4a8=True,
             )
 
@@ -545,6 +305,7 @@ class TestW4A8GroupGemm(unittest.TestCase):
             moe_deep_gemm=True,
             moe_expert_fusion=True,
             use_bf16_gemm_weight_grad=False,
+            use_ue8m0=True,
             use_w4a8=True,
         )
         self.assertTrue(node.use_bf16_gemm_weight_grad)
@@ -593,6 +354,49 @@ class TestW4A8GroupGemm(unittest.TestCase):
         o3 = node.forward(x, probs, tokens)
         ref = self._bf16_ref_forward(x, probs, tokens, experts, n)
         self.assertGreater(_cos(o3.astype("float32").numpy(), ref), 0.97)
+
+    def test_situ_forward_backward_vs_fp32_reference(self):
+        """W4A8 SiTU preserves both forward and backward semantics."""
+        num_experts, k, n, tokens = 2, 256, 256, [128, 128]
+        node, experts = self._make_node(
+            num_experts,
+            k,
+            n,
+            activation_type="situ",
+        )
+        m = sum(tokens)
+        x = paddle.randn([m, k], dtype="bfloat16") * 0.5
+        probs = paddle.rand([m], dtype="float32")
+
+        output = node.forward(x, probs.unsqueeze(-1), tokens)
+        ref = self._situ_ref_forward(x, probs, tokens, experts, n)
+        self.assertGreater(
+            _cos(output.astype("float32").numpy(), ref),
+            0.95,
+        )
+
+        out_grad = paddle.randn([m, k], dtype="bfloat16")
+        dx, probs_grad = node.backward(out_grad.clone(), probs)
+        ref_dx, ref_pg, ref_dw1, ref_dw2 = self._situ_autograd_reference(
+            x, probs, tokens, experts, n, out_grad
+        )
+        self.assertGreater(
+            _cos(dx.astype("float32").numpy(), ref_dx.numpy()),
+            0.90,
+        )
+        self.assertGreater(
+            _cos(probs_grad.astype("float32").numpy(), ref_pg.numpy()),
+            0.90,
+        )
+        for got_dw, ref_dw in (
+            (experts.weight1.main_grad, ref_dw1),
+            (experts.weight2.main_grad, ref_dw2),
+        ):
+            self.assertIsNotNone(got_dw)
+            self.assertGreater(
+                _cos(got_dw.astype("float32").numpy(), ref_dw.numpy()),
+                0.90,
+            )
 
     def test_forward_clamp(self):
         """Forward with clamp_value matches the clamped bf16 reference."""
@@ -908,15 +712,15 @@ class TestW4A8GroupGemm(unittest.TestCase):
 
     def test_fwd_down_preallocated_o3(self):
         """A caller-provided o3 buffer (auto-subbatch path) must produce the
-        same bits as a freshly allocated one."""
-        num_experts, k, n, tokens = 2, 128, 128, [128, 128]
+        same bits as a freshly allocated one, including an empty expert."""
+        num_experts, k, n, tokens = 3, 128, 128, [128, 0, 128]
         node, experts = self._make_node(num_experts, k, n)
         m = sum(tokens)
         node.m_indices = node.gen_m_indices(tokens)
         o1 = paddle.randn([m, 2 * n], dtype="bfloat16")
         probs = paddle.rand([m, 1], dtype="float32")
         out_fresh = node._fwd_down_w4a8(o1.clone(), probs, experts.weight2)
-        buf = paddle.ones([m, k], dtype="bfloat16")
+        buf = paddle.full([m, k], float("nan"), dtype="bfloat16")
         out_buf = node._fwd_down_w4a8(
             o1.clone(), probs, experts.weight2, o3=buf
         )
@@ -924,14 +728,14 @@ class TestW4A8GroupGemm(unittest.TestCase):
         self.assertTrue(_bits_equal(out_fresh, out_buf))
 
     def test_bwd_gate_up_dx_none_matches_preallocated(self):
-        """A caller-provided dx buffer produces the same bits as a fresh one."""
-        num_experts, k, n, tokens = 2, 128, 128, [128, 128]
+        """A caller-provided dx buffer covers every row with an empty expert."""
+        num_experts, k, n, tokens = 3, 128, 128, [128, 0, 128]
         node, experts = self._make_node(num_experts, k, n)
         m = sum(tokens)
         node.m_indices = node.gen_m_indices(tokens)
         do1 = paddle.randn([m, 2 * n], dtype="bfloat16")
         dx_fresh = node._bwd_gate_up_input_w4a8(do1, experts.weight1)
-        buf = paddle.ones([m, k], dtype="bfloat16")
+        buf = paddle.full([m, k], float("nan"), dtype="bfloat16")
         dx_buf = node._bwd_gate_up_input_w4a8(do1, experts.weight1, dx=buf)
         self.assertTrue(dx_buf is buf)
         self.assertTrue(_bits_equal(dx_fresh, dx_buf))

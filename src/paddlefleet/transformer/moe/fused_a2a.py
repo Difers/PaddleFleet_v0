@@ -567,10 +567,28 @@ class DeepEPDispatch(PyLayer):
         moe_ep_barrier: bool = True,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_w4a8: bool = False,
     ):
         """Forward pass of fused dispatch."""
         if fp8_dispatch:
-            if using_sonic_moe:
+            if use_w4a8:
+                # W4A8 (H1): quantize activations 1x32 BEFORE dispatch with the
+                # exact op the experts node uses (_mxfp8_quant), then pack the
+                # per-row UE8M0 float32 scale into DeepEP's int32 companion (4
+                # groups/word). The row-local 1x32 quant and the per-row
+                # dispatch/unzip copies make this bitwise identical to the
+                # send-BF16-then-quantize default. Lazy import avoids a
+                # fused_a2a <-> fp8_utils import cycle.
+                from .fp8_utils import (
+                    _mxfp8_quant,
+                    _w4a8_pack_scale_for_deepep,
+                )
+
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                x_fp8, x_sf = _mxfp8_quant(x)
+                scale = _w4a8_pack_scale_for_deepep(x_sf)
+            elif using_sonic_moe:
                 assert quantize_activation_blockscaled_fast is not None, (
                     "Cannot find quantize_activation_blockscaled_fast, please update sonicmoe."
                 )
@@ -890,6 +908,7 @@ if HAVE_DEEP_EP:
         moe_ep_barrier: bool = True,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_w4a8: bool = False,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -918,6 +937,7 @@ if HAVE_DEEP_EP:
             moe_ep_barrier,
             use_ue8m0,
             using_sonic_moe,
+            use_w4a8,
         )
 
     def fused_combine(

@@ -25,11 +25,6 @@ Covered production behaviors:
     is asserted so flipping any single condition in production is caught.
   * ``has_config`` -- None map, missing key, falsy value all -> False; a
     present truthy value -> True.
-  * ``ceil_to_ue8m0`` -- rounds a positive fp32 scale UP to the next power of
-    two (leaving exact powers of two unchanged). Verified with distinguishable
-    inputs whose expected outputs differ from the inputs.
-  * ``_quantize_to_fp4_e2m1`` -- maps magnitudes to e2m1 codes 0..7 by the
-    midpoint boundaries, with bit3 as sign (never set for a zero code).
   * ``expert_weights_all_frozen`` -- None / empty -> False; all-frozen
     EagerParamBase list -> True; a single trainable entry makes the group
     not-frozen; a non-parameter entry is never frozen.
@@ -44,8 +39,6 @@ ModuleNotFoundError so a genuine API/compile regression still surfaces.
 import os
 import sys
 import unittest
-
-import numpy as np
 
 # Allow importing paddlefleet from the in-tree src/ when it is not installed.
 _SRC = os.path.join(
@@ -64,8 +57,6 @@ try:
 
     from paddlefleet.transformer.moe.fp8_utils import (
         FP8_ALIGN,
-        _quantize_to_fp4_e2m1,
-        ceil_to_ue8m0,
         expert_weights_all_frozen,
         has_config,
         moe_token_padding_alignment,
@@ -149,71 +140,7 @@ class TestHasConfig(unittest.TestCase):
 
 
 @unittest.skipUnless(_IMPORT_ERROR is None, _SKIP_REASON)
-class TestCeilToUe8m0(unittest.TestCase):
-    """ceil_to_ue8m0 rounds a positive fp32 scale up to the next power of two."""
-
-    def test_rounds_up_to_power_of_two(self):
-        # Hand-derived per the ue8m0 bit formula: exact powers of two are
-        # unchanged; anything with a nonzero mantissa bumps the exponent by 1.
-        #   1.0  -> 1.0   (exp 127, mantissa 0)
-        #   0.5  -> 0.5   (exp 126, mantissa 0)
-        #   2.0  -> 2.0   (exp 128, mantissa 0)
-        #   1.5  -> 2.0   (127 + 1)
-        #   0.75 -> 1.0   (126 + 1)
-        #   3.0  -> 4.0   (128 + 1)
-        #   5.0  -> 8.0   (129 + 1)
-        x = paddle.to_tensor(
-            [1.0, 0.5, 2.0, 1.5, 0.75, 3.0, 5.0], dtype="float32"
-        )
-        expected = np.array(
-            [1.0, 0.5, 2.0, 2.0, 1.0, 4.0, 8.0], dtype=np.float32
-        )
-        out = ceil_to_ue8m0(x)
-        # Powers of two are exact -> exact equality, no tolerance slack.
-        np.testing.assert_array_equal(out.numpy(), expected)
-
-    def test_result_is_always_a_power_of_two(self):
-        # Independent invariant: log2 of every output is an integer.
-        x = paddle.to_tensor([0.3, 1.1, 2.9, 6.5, 100.0, 1e-3], dtype="float32")
-        out = ceil_to_ue8m0(x).numpy().astype(np.float64)
-        log2 = np.log2(out)
-        np.testing.assert_array_equal(log2, np.round(log2))
-        # And each output is >= the input (rounding is upward).
-        self.assertTrue(np.all(out >= x.numpy().astype(np.float64) - 1e-12))
-
-
 @unittest.skipUnless(_IMPORT_ERROR is None, _SKIP_REASON)
-class TestQuantizeToFp4E2m1(unittest.TestCase):
-    """_quantize_to_fp4_e2m1 maps magnitudes to e2m1 codes with a sign bit."""
-
-    def test_positive_representable_values_map_to_codes(self):
-        # e2m1 representable magnitudes -> codes 0..7 (bit3 = sign, unset here).
-        x = paddle.to_tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype="float32"
-        )
-        expected = np.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=np.int32)
-        out = _quantize_to_fp4_e2m1(x)
-        np.testing.assert_array_equal(out.numpy().astype(np.int32), expected)
-
-    def test_sign_bit_and_zero_sign_suppression(self):
-        # Negative magnitudes get bit3 set: code | (1 << 3) = code | 8.
-        #   -0.5 -> 1 | 8 = 9 ; -1.5 -> 3 | 8 = 11 ; -6.0 -> 7 | 8 = 15
-        # Negative zero keeps code 0 (sign suppressed when code == 0).
-        x = paddle.to_tensor([-0.5, -1.5, -6.0, -0.0], dtype="float32")
-        expected = np.array([9, 11, 15, 0], dtype=np.int32)
-        out = _quantize_to_fp4_e2m1(x)
-        np.testing.assert_array_equal(out.numpy().astype(np.int32), expected)
-
-    def test_rounding_boundaries(self):
-        # Boundaries use strict >: exactly-on-boundary rounds toward the lower
-        # code. 0.24<0.25 -> 0 ; 0.26>0.25 -> 1 ; 2.5 not > 2.5 -> 4 ;
-        # 2.6 > 2.5 -> 5.
-        x = paddle.to_tensor([0.24, 0.26, 2.5, 2.6], dtype="float32")
-        expected = np.array([0, 1, 4, 5], dtype=np.int32)
-        out = _quantize_to_fp4_e2m1(x)
-        np.testing.assert_array_equal(out.numpy().astype(np.int32), expected)
-
-
 @unittest.skipUnless(_IMPORT_ERROR is None, _SKIP_REASON)
 class TestExpertWeightsAllFrozen(unittest.TestCase):
     """Frozen detection over stacked / list / single expert parameters."""

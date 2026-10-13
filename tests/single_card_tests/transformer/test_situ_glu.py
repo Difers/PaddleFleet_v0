@@ -469,9 +469,11 @@ class TestSituGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fp8_wgrad=False"):
             MoELayer(fp8_wgrad_config)
 
-        # w4a8 short-circuits fwd_down_fp8 / bwd_down_input_fp8 into kernels
-        # that hardcode SwiGLU, so SiTU has to be rejected by name instead of
-        # silently producing SwiGLU numerics.
+        # w4a8 computes SiTU-GLU x probs before its 1x32 quantizer (see
+        # ExpertsGroupGemmContiguousNode._mxfp8_act_quant), so SiTU is not
+        # rejected by name. Asserting the next validation's message is the
+        # regression guard: a reinstated "situ + w4a8" rejection would fire
+        # first and change it.
         w4a8_config = TransformerConfig(
             **config_kwargs,
             moe_use_fusion_node=True,
@@ -481,7 +483,7 @@ class TestSituGLU(unittest.TestCase):
             fp8_wgrad=False,
             use_w4a8=True,
         )
-        with self.assertRaisesRegex(ValueError, "use_w4a8=False"):
+        with self.assertRaisesRegex(ValueError, "requires use_ue8m0=True"):
             MoELayer(w4a8_config)
 
         # SonicMoE has its own SiTU-GLU fp8 epilogue, so it is accepted too and

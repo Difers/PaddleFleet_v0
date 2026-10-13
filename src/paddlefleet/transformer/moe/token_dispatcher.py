@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
-from .fp8_utils import FP8_ALIGN
+from .fp8_utils import FP8_ALIGN, _w4a8_quant_pack_for_hybridep_dispatch
 from .fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
     DeepEPCombineAsyncRefinedRecompute,
@@ -213,6 +213,7 @@ class _HybridEPManager(_DispatchManager):
         moe_ep_barrier: bool = True,
         hybridep_buffer_configs: dict | None = None,
         moe_deep_gemm: bool = False,
+        use_w4a8: bool = False,
     ):
         if not HAVE_HYBRID_EP:
             raise ImportError("HybridEP runtime is not available.")
@@ -234,6 +235,13 @@ class _HybridEPManager(_DispatchManager):
         self._active_buffer = None
         self.hybridep_buffer_configs = hybridep_buffer_configs or {}
         self._moe_deep_gemm = moe_deep_gemm
+        # use_w4a8: quantize activations 1x32 UE8M0 on the source tokens for the
+        # W4A8 mxfp8 1x32 dispatch and carry the packed scales in HybridEP's fp32
+        # scaling-factor slot (see mxfp8_dispatch.py) instead of the FP8 baseline's
+        # 1x128 recipe. The mxfp8 1x32 scale is packed into the blockwise-128 scale
+        # slot and handed to the UNMODIFIED hybridep fp8 dispatch (hybridep code is
+        # NOT changed). Static config, so it rides on the manager like moe_deep_gemm.
+        self._use_w4a8 = use_w4a8
         self._reset_dispatch_state()
         self._num_unpadded_tokens = None
 
@@ -432,7 +440,18 @@ class _HybridEPManager(_DispatchManager):
             max_num_tokens
         )
         scaling_factor = None
-        if use_fp8:
+        w4a8_fp8 = use_fp8 and self._use_w4a8
+        if w4a8_fp8:
+            # W4A8 (H1): quantize 1x32 UE8M0 after padding (like the 1x128
+            # branch) so the slot has exactly max_num_tokens * H/128 words, and
+            # pack the scales directly into the [T, H/128] token-major slot. NO
+            # transpose: unlike fp8_quant_blockwise's output_scale_transpose
+            # carrier the packed slot is already token-major. Padded source rows
+            # are never routed (their routing_map rows are all False).
+            hidden_states, scaling_factor = (
+                _w4a8_quant_pack_for_hybridep_dispatch(hidden_states)
+            )
+        elif use_fp8:
             hidden_states, scaling_factor = (
                 paddle.incubate.nn.functional.fp8_quant_blockwise(
                     hidden_states,
@@ -468,6 +487,13 @@ class _HybridEPManager(_DispatchManager):
             dispatched_probs = dispatched_probs[:num_permuted_tokens]
         if scale is not None:
             scale = scale[:num_permuted_tokens]
+        if w4a8_fp8:
+            # View the fp32 scale slot back to int32 (bytes unchanged -- no float
+            # op touches the packed scale). Both dispatchers now hand the expert
+            # node the same packed int32 [M, H/128] carrier, which _fwd_gate_up_w4a8
+            # unpacks to the exact float32 1x32 scale.
+            assert scale is not None, "HybridEP fp8 dispatch returned no scale"
+            scale = scale.view(paddle.int32)
         (
             _sparse_to_dense_map,
             _rdma_to_attn_map,
@@ -836,6 +862,7 @@ class _DeepEPManager(_DispatchManager):
         num_local_experts: int | None = None,
         moe_ep_barrier: bool = True,
         use_accuracy_compatible: bool = False,
+        use_w4a8: bool = False,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -843,6 +870,12 @@ class _DeepEPManager(_DispatchManager):
         self.num_local_experts = num_local_experts
         self.moe_ep_barrier = moe_ep_barrier
         self.use_accuracy_compatible = use_accuracy_compatible
+        # use_w4a8: quantize activations 1x32 UE8M0 on the source tokens for the
+        # W4A8 mxfp8 1x32 dispatch and send fp8 + packed int32 scale through DeepEP
+        # instead of BF16. The mxfp8 1x32 scale is packed into the blockwise-128
+        # scale slot and handed to the UNMODIFIED deep_ep fp8 dispatch (deep_ep code
+        # is NOT changed). Static config, so it rides on the manager (mirrors HybridEP).
+        self._use_w4a8 = use_w4a8
 
         # Metadata
         self.token_indices = None
@@ -896,6 +929,7 @@ class _DeepEPManager(_DispatchManager):
             fp8_dispatch=fp8_dispatch,
             async_finish=async_finish,
             use_ue8m0=use_ue8m0,
+            use_w4a8=self._use_w4a8,
         )
         self.handle = states["handle"]
         self.tokens_per_expert = states["tokens_per_expert"]
@@ -924,6 +958,7 @@ class _DeepEPManager(_DispatchManager):
             moe_ep_barrier=self.moe_ep_barrier,
             use_ue8m0=use_ue8m0,
             using_sonic_moe=using_sonic_moe,
+            use_w4a8=self._use_w4a8,
         )
         self.handle = states["handle"]
         self.tokens_per_expert = states["tokens_per_expert"]
@@ -1143,6 +1178,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hybridep_buffer_configs: dict | None = None,
         moe_deep_gemm: bool = False,
         use_accuracy_compatible: bool = False,
+        use_w4a8: bool = False,
     ):
         super().__init__(ep_group)
 
@@ -1162,11 +1198,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             "num_local_experts": self.num_local_experts,
             "moe_ep_barrier": moe_ep_barrier,
         }
+        # The W4A8 FP8-dispatch knobs are only understood by the DeepEP and
+        # HybridEP managers; _MoonEPManager does not accept them, so they must
+        # not ride in the common kwargs.
         if manager_cls is _HybridEPManager:
             manager_kwargs["hybridep_buffer_configs"] = hybridep_buffer_configs
             manager_kwargs["moe_deep_gemm"] = moe_deep_gemm
+            manager_kwargs["use_w4a8"] = use_w4a8
         elif manager_cls is _DeepEPManager:
             manager_kwargs["use_accuracy_compatible"] = use_accuracy_compatible
+            manager_kwargs["use_w4a8"] = use_w4a8
         self._comm_manager = manager_cls(**manager_kwargs)
         self.global_input_probs = None
 

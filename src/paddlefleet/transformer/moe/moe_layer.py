@@ -66,7 +66,10 @@ from paddlefleet.transformer.dw_overlap import (
     install_sonic_moe_dw_deferral,
 )
 from paddlefleet.transformer.paddle_norm import WrappedPaddleNorm
-from paddlefleet.transformer.transformer_config import dw_overlap_enabled
+from paddlefleet.transformer.transformer_config import (
+    dw_overlap_enabled,
+    w4a8_route_factor_post_w2_scale,
+)
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
@@ -367,7 +370,11 @@ class MoELayer(nn.Layer):
         self.fp8 = config.fp8
         self.use_ue8m0 = config.use_ue8m0
         self.use_w4a8 = config.use_w4a8
-        self.use_w4a8_fused_quant = config.use_w4a8_fused_quant
+        # W4A8 always sends fp8 1x32 activations + packed UE8M0 scales through the
+        # dispatch; driven by the single ``use_w4a8`` knob.
+        # Non-None means the router skipped folding routed_scaling_factor into probs
+        # and the fused expert node must apply it after the down projection instead.
+        self.w4a8_route_factor_post_w2 = w4a8_route_factor_post_w2_scale(config)
         # Two independent expert deferral points, one per expert weight:
         #   defer_expert_up_gate_dw -> w1 (up_gate_proj) weight grad
         #   defer_expert_down_dw    -> w2 (down_proj) weight grad, which
@@ -380,7 +387,9 @@ class MoELayer(nn.Layer):
         )
 
         self.using_sonic_moe = self.config.using_sonic_moe
-        self.fp8_dispatch = bool(config.fp8) and not self.use_w4a8
+        # fp8_dispatch quantizes activations before the all-to-all. It follows
+        # config.fp8 (W4A8 always fp8-dispatches, so no extra term).
+        self.fp8_dispatch = bool(config.fp8)
         self.fp8_wgrad = config.fp8_wgrad
         self.fp8_dispatch_bwd = (
             self.fp8_dispatch and self.using_sonic_moe and self.fp8_wgrad
@@ -395,7 +404,9 @@ class MoELayer(nn.Layer):
         #   DeepGEMM -- ExpertsGroupGemmContiguousNode has no fused
         #     activation+scale+quant kernel for SiTU, so it computes
         #     SiTU-GLU x probs in bf16 and then runs the generic blockwise
-        #     quantizer (see fp8_utils.fwd_down_fp8 / bwd_down_input_fp8).
+        #     quantizer (see fp8_utils.fwd_down_fp8 / bwd_down_input_fp8). The
+        #     w4a8 path does the same before its 1x32 quantizer (see
+        #     _mxfp8_act_quant / _bwd_down_input_w4a8).
         # SonicMoE's *bf16* path has no SiTU epilogue and raises from
         # sonicmoe/functional/__init__.py::_gemm_activation_name, so nothing can
         # silently degrade to SwiGLU there either.  fp8_wgrad remains
@@ -406,19 +417,25 @@ class MoELayer(nn.Layer):
                 "yet; please set fp8_wgrad=False so that dw1/dw2 are computed "
                 "in bf16."
             )
-        if self.hidden_act == situ and self.use_w4a8:
-            # w4a8 short-circuits fwd_down_fp8 / bwd_down_input_fp8 into
-            # _fwd_down_w4a8 / _bwd_down_input_w4a8, which fold silu into the
-            # 1x32 quantization kernel and never read activation_type. Without
-            # this guard SiTU-GLU would silently be computed as SwiGLU.
-            raise ValueError(
-                "SiTU-GLU is not supported on the w4a8 expert path, whose "
-                "fused quantization kernels hardcode SwiGLU; please set "
-                "use_w4a8=False."
-            )
         self.moe_subbatch_token_num_after_dispatch = (
             config.moe_subbatch_token_num_after_dispatch
         )
+        if self.use_w4a8:
+            if not self.use_ue8m0:
+                raise ValueError(
+                    "use_w4a8 requires use_ue8m0=True because the W4A8 "
+                    "1x32 DeepGEMM path consumes UE8M0 scales."
+                )
+            if (
+                self.moe_subbatch_token_num_after_dispatch is not None
+                and self.moe_subbatch_token_num_after_dispatch > 0
+                and not getattr(config, "use_auto_subbatch", False)
+            ):
+                raise ValueError(
+                    "use_w4a8 does not support static "
+                    "moe_subbatch_token_num_after_dispatch; use_auto_subbatch=True "
+                    "or unset the static subbatch option."
+                )
         if self.using_sonic_moe:
             assert paddlefleet_ops.is_sonic_moe_available(), (
                 paddlefleet_ops.blocked_import_messages[
@@ -744,6 +761,7 @@ class MoELayer(nn.Layer):
                     use_accuracy_compatible=getattr(
                         self, "use_accuracy_compatible", False
                     ),
+                    use_w4a8=self.use_w4a8,
                 )
                 if (
                     self.moe_token_dispatcher_type == "deepep"
@@ -1556,7 +1574,7 @@ class MoELayer(nn.Layer):
                         self.config, "use_accuracy_compatible", False
                     ),
                     use_w4a8=self.use_w4a8,
-                    use_w4a8_fused_quant=self.use_w4a8_fused_quant,
+                    w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
                 )
 
         hidden_states = inspect_tensor(
@@ -1695,6 +1713,8 @@ class MoELayer(nn.Layer):
             use_accuracy_compatible=getattr(
                 self.config, "use_accuracy_compatible", False
             ),
+            use_w4a8=self.use_w4a8,
+            w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
         )
 
     def dispatch_preprocess(self, args):
@@ -1805,7 +1825,7 @@ class MoELayer(nn.Layer):
                         self.config, "use_accuracy_compatible", False
                     ),
                     use_w4a8=self.use_w4a8,
-                    use_w4a8_fused_quant=self.use_w4a8_fused_quant,
+                    w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
                 )
 
             if is_first_fwd:
@@ -2284,6 +2304,15 @@ class MoELayer(nn.Layer):
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
         if not (self.moe_use_fusion_node and self.fp8):
             return
+        if getattr(self, "use_w4a8", False):
+            # Offline quant frees the BF16 expert storage right after this call,
+            # but the W4A8 expert GEMMs quantize FP4 from that BF16 every
+            # fwd/bwd.
+            raise ValueError(
+                "use_w4a8 does not support offline_quant_expert_weight: it "
+                "frees the BF16 expert weights that W4A8 quantizes from. Set "
+                "offline_quant_expert_weight=False."
+            )
         if hasattr(self, "grouped_gemm_experts") and isinstance(
             self.grouped_gemm_experts, SonicMoEExpert
         ):

@@ -35,6 +35,12 @@ from paddlefleet.train_infer_consistent_ops.permute import (
     scatter_canonical_rows,
 )
 
+from .mxfp8_dispatch import (
+    pack_ue8m0_to_fp32_slot,
+    pack_ue8m0_to_int32,
+    unpack_ue8m0_scale,
+)
+
 try:
     from paddlefleet_ops import (
         deep_gemm as paddlefleet_deep_gemm,
@@ -49,10 +55,10 @@ except (ImportError, RuntimeError):
 
 try:
     from paddlefleet_ops import (
-        w4a8_dequantize_1x32,
-        w4a8_quantize_1x32,
-        w4a8_stack_quantize_1x32,
-        w4a8_weighted_swiglu_quantize_1x32,
+        mxfp4_stack_quantize_1x32,
+        mxfp8_dequantize_1x32,
+        mxfp8_quantize_1x32,
+        mxfp8_weighted_swiglu_quantize_1x32,
     )
 
     HAS_W4A8_FUSED_QUANT = True
@@ -272,313 +278,75 @@ def tilewise_quant(x):
 
 
 # ---------------------------------------------------------------------------
-# w4a8 (fp4 权重 1x32 + fp8 激活 1x32) 在线量化散算子
-#
-# 实现参考 DeepGEMM 官方 python 参考实现（deep_gemm/utils/math.py）：
-#   ceil_to_ue8m0 / per_token_cast_to_fp8 / per_token_cast_to_fp4 /
-#   _quantize_to_fp4_e2m1 / cast_back_from_fp8
-# 命名约定：
-#   - 普通 blockwise 量化算子：quant_blockwize()，通过 attr 区分 fp4/fp8、ue8m0 等
-#   - 与 CUDA 融合算子对应的 python 散算子：原名 + "_python"
+# W4A8 (1x32 MXFP4 weights + 1x32 MXFP8 activations) online-quant helpers.
+# Thin wrappers over the fused SM100 CUDA ops (mxfp8_quantize_1x32 /
+# mxfp4_quantize_1x32 etc.). W4A8 always runs the fused path; the python
+# per-op reference implementation has been removed.
 # ---------------------------------------------------------------------------
 
 W4A8_QUANT_BLOCK = 32
 
 
-def _use_w4a8_fused_quant(enabled):
-    if enabled and not HAS_W4A8_FUSED_QUANT:
-        raise RuntimeError(
-            "use_w4a8_fused_quant=True requires paddlefleet_ops "
-            "built with the W4A8 1x32 CUDA custom ops"
-        )
-    return enabled
-
-
-def ceil_to_ue8m0(x):
-    """将 scale 向上取整到 2 的幂（ue8m0）。
-
-    等价 DeepGEMM math.py 的 ceil_to_ue8m0：
-        bits = x.abs().float().view(torch.int32)
-        exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
-        return (exp.clamp(1, 254) << 23).view(torch.float)
-    """
-    bits = x.abs().astype("float32").view("int32")
-    mask_ff = paddle.full_like(bits, 0xFF)
-    mask_7fffff = paddle.full_like(bits, 0x7FFFFF)
-    shift_23 = paddle.full_like(bits, 23)
-    exp = ((bits >> shift_23) & mask_ff) + ((bits & mask_7fffff) != 0).astype(
-        "int32"
-    )
-    return (exp.clip(1, 254) << shift_23).view("float32")
-
-
-def _quantize_to_fp4_e2m1(x):
-    """fp32 -> e2m1 4bit code（int32, 0~15），同 DeepGEMM _quantize_to_fp4_e2m1。
-
-    e2m1 可表示值 {0, 0.5, 1, 1.5, 2, 3, 4, 6}，
-    rounding 边界（相邻值中点）：0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0，
-    bit3 为符号位。
-    """
-    ax = x.abs()
-    code = paddle.zeros(ax.shape, dtype="int32")
-    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        code = code + (ax > boundary).astype("int32")
-    sign = ((x < 0) & (code != 0)).astype("int32")
-    shift_3 = paddle.full_like(code, 3)
-    return code | (sign << shift_3)
-
-
-def quant_blockwize(
-    x, quant_method="1x32", quant_dtype="fp8", using_ue8m0_scale=True
-):
-    """普通 blockwise 量化散算子（对齐 fp8_quant_blockwise 的 attr 风格）。
-
-    参考 DeepGEMM math.py 的 per_token_cast_to_fp8 / per_token_cast_to_fp4。
-
-    Args:
-        x: [M, K] bf16/fp32，K 必须能被块大小整除（fp4 时还需被 2 整除）
-        quant_method: "1xN"，块大小（如 "1x32" / "1x128"）
-        quant_dtype: "fp8"（e4m3fn）或 "fp4"（e2m1，两值打包成一个 int8）
-        using_ue8m0_scale: scale 是否向上取整到 2 的幂（SM100 1D1D kernel
-            内部会把 fp32 scale cast 成 packed ue8m0，故 w4a8 必须为 True）
-
-    Returns:
-        (q, sf):
-          fp8: q [M, K] float8_e4m3fn, sf [M, K/gran_k] fp32
-          fp4: q [M, K/2] int8（低 nibble 存前一个元素）, sf [M, K/gran_k] fp32
-    """
-    gran_m, gran_k = (int(v) for v in quant_method.split("x"))
-    assert x.ndim == 2, x.shape
-    m, n = x.shape
-    assert n % gran_k == 0, f"K={n} 必须是 {gran_k} 的倍数"
-
-    if gran_m > 1:
-        # 2D tile 量化（如 128x128，权重量化，同 CUDA fuse_stack_*_fp8_quant）
-        assert quant_dtype == "fp8", "2D tile 量化仅支持 fp8"
-        assert m % gran_m == 0, f"M={m} 必须是 {gran_m} 的倍数"
-        tiles = (
-            x.reshape([m // gran_m, gran_m, n // gran_k, gran_k])
-            .transpose([0, 2, 1, 3])
-            .astype("float32")
-        )
-        amax = tiles.abs().max(axis=[2, 3]).clip(min=1e-4)
-        sf = amax / 448.0
-        sf = ceil_to_ue8m0(sf) if using_ue8m0_scale else sf
-        q = (
-            (tiles * (1.0 / sf.unsqueeze(-1).unsqueeze(-1)))
-            .transpose([0, 2, 1, 3])
-            .reshape([m, n])
-            .astype(paddle.float8_e4m3fn)
-        )
-        return q, sf
-
-    if m == 0:
-        if quant_dtype == "fp8":
-            q = paddle.empty([0, n], dtype=paddle.float8_e4m3fn)
-        else:
-            q = paddle.empty([0, n // 2], dtype=paddle.int8)
-        return q, paddle.empty([0, n // gran_k], dtype=paddle.float32)
-
-    x_view = x.reshape([m, n // gran_k, gran_k]).astype("float32")
-    x_amax = x_view.abs().max(axis=2).clip(min=1e-4)
-
-    if quant_dtype == "fp8":
-        sf = x_amax / 448.0
-        sf = ceil_to_ue8m0(sf) if using_ue8m0_scale else sf
-        q = (
-            (x_view * (1.0 / sf.unsqueeze(2)))
-            .reshape([m, n])
-            .astype(paddle.float8_e4m3fn)
-        )
-        return q, sf
-
-    if quant_dtype == "fp4":
-        assert n % 2 == 0, n
-        sf = x_amax / 6.0
-        sf = ceil_to_ue8m0(sf) if using_ue8m0_scale else sf
-        x_scaled = x_view * (1.0 / sf.unsqueeze(2))
-        codes = _quantize_to_fp4_e2m1(x_scaled).reshape([m, n])
-        # 打包：两个 4bit code -> 一个字节，低 nibble 存前一个元素
-        # （同 DeepGEMM per_token_cast_to_fp4）
-        codes2 = codes.reshape([m, n // 2, 2])
-        mask_0f = paddle.full_like(codes2[:, :, 0], 0x0F)
-        shift_4 = paddle.full_like(codes2[:, :, 0], 4)
-        packed = (codes2[:, :, 0] & mask_0f) | (
-            (codes2[:, :, 1] & mask_0f) << shift_4
-        )
-        # 按 bit pattern 转 int8（>127 的按补码回绕）
-        packed = paddle.where(packed > 127, packed - 256, packed).astype("int8")
-        return packed, sf
-
-    raise ValueError(f"unsupported quant_dtype: {quant_dtype}")
-
-
 def _stack_expert_weights(w):
-    """把专家权重 list/stacked tensor 统一成 [E, H0, H1]。"""
+    """Stack expert weights (list / stacked tensor) into a single [E, H0, H1]."""
     if isinstance(w, (list, tuple)):
         w = w[0] if len(w) == 1 else paddle.stack(w, axis=0)
     assert w.ndim == 3, w.shape
     return w
 
 
-def fuse_stack_fp8_quant_python(
-    w, quant_method="1x32", quant_dtype="fp4", using_ue8m0_scale=True
-):
-    """fuse_stack_fp8_quant 的 python 散算子版本（不转置）。
+def _mxfp8_quant(x):
+    return mxfp8_quantize_1x32(x)
 
-    输入 w: [E, R, C] bf16 stacked 权重（或 tensor list，自动 stack），
-    沿最后一维（GEMM 收缩维）做 blockwise 量化。
-    返回: fp4 时 (w_q [E, R, C/2] int8, sf [E, R, C/gran_k] fp32)
+
+def _w4a8_pack_scale_for_deepep(x_sf):
+    """Pack a float32 1x32 UE8M0 activation scale ``[T, H/32]`` into DeepEP's
+    int32 scale companion ``[T, H/128]`` (4 exponent bytes per word).
+
+    Same int32 dtype as DeepEP's packed UE8M0 scale companion, so its dispatch
+    and ``moe_permute``'s per-row scale gather move it unchanged. The ``[T,
+    H/128]`` width matches the 1x32 E8M0 carrier, not the H/512-wide FP8 1x128
+    UE8M0 one.
     """
-    w = _stack_expert_weights(w)
-    e, r, c = w.shape
-    q, sf = quant_blockwize(
-        w.reshape([e * r, c]),
-        quant_method=quant_method,
-        quant_dtype=quant_dtype,
-        using_ue8m0_scale=using_ue8m0_scale,
-    )
-    if not quant_method.startswith("1x"):
-        # 2D tile（如 128x128）时保持 CUDA 融合算子的 2D 布局：
-        # q [E*R, C], sf [E*R/gm, C/gk]
-        return q, sf
-    return (
-        q.reshape([e, r, q.shape[-1]]),
-        sf.reshape([e, r, sf.shape[-1]]),
-    )
+    return pack_ue8m0_to_int32(x_sf)
 
 
-def fuse_stack_transpose_fp8_quant_python(
-    w, quant_method="1x32", quant_dtype="fp4", using_ue8m0_scale=True
-):
-    """fuse_stack_transpose_fp8_quant 的 python 散算子版本。
+def _w4a8_quant_pack_for_hybridep_dispatch(x):
+    """Pre-dispatch W4A8 activation quant for HybridEP fp8 dispatch.
 
-    输入 w: [E, H0, H1]，先转置成 [E, H1, H0] 再沿最后一维量化。
+    Runs the *same* 1x32 quant the expert node runs after the all-to-all
+    (``_mxfp8_quant(x)``) on the source tokens, then repacks the UE8M0 fp32
+    scales ``[T, H/32]`` into HybridEP's fp32 ``scaling_factor`` slot ``[T,
+    H/128]`` (4 exponent bytes per word). The slot is a byte container built
+    directly in [T, H/128] token-major layout -- it must NOT be transposed like
+    the 1x128 ``output_scale_transpose`` carrier. The 1x32 quant is row-local and
+    dispatch/permute are pure per-row copies, so the receiver recovers exactly
+    the (fp8, scale) the post-dispatch quant would have produced.
     """
-    w = _stack_expert_weights(w)
-    return fuse_stack_fp8_quant_python(
-        w.transpose([0, 2, 1]).contiguous(),
-        quant_method=quant_method,
-        quant_dtype=quant_dtype,
-        using_ue8m0_scale=using_ue8m0_scale,
-    )
+    x_fp8, x_sf = _mxfp8_quant(x)
+    return x_fp8, pack_ue8m0_to_fp32_slot(x_sf)
 
 
-def _weighted_swiglu_fp32(o1, probs, clamp_value=None):
-    """fp32 全程计算 swiglu(o1) * probs（与 CUDA 融合算子内部精度一致）。
-
-    CUDA 版 fuse_weighted_swiglu_fp8_quant(_clamp) 在 kernel 内用 fp32
-    计算 silu(gate)*up*probs 后直接量化，不落 bf16 中间结果；python 版
-    同样保持 fp32，才能与融合算子位级对齐。
-    """
-    x32 = o1.astype("float32")
-    h = x32.shape[-1] // 2
-    gate, up = x32[:, :h], x32[:, h:]
-    if clamp_value is not None:
-        gate = gate.clip(max=clamp_value)
-        up = up.clip(min=-clamp_value, max=clamp_value)
-    p = probs.astype("float32")
-    if p.ndim == 1:
-        # 端到端 forward 传入的 unzipped_probs 是 1-D [M]（CUDA 融合算子内部兼容），
-        # python 版需显式广播为 [M, 1]
-        p = p.reshape([-1, 1])
-    return F.silu(gate) * up * p
-
-
-def fuse_weighted_swiglu_fp8_quant_python(
-    o1, probs, quant_method="1x32", using_ue8m0_scale=True
-):
-    """fuse_weighted_swiglu_fp8_quant 的 python 散算子版本。
-
-    o2 = swiglu(o1) * probs（fp32 中间计算），再做 blockwise fp8 量化。
-    quant_method="1x128" 且 using_ue8m0_scale=True 时与 CUDA 融合算子
-    （using_pow2_scaling=True）逐位一致。
-    返回: (o2_fp8 [M, H] float8_e4m3fn, sf [M, H/gran_k] fp32)
-    """
-    o2 = _weighted_swiglu_fp32(o1, probs)
-    return quant_blockwize(
-        o2,
-        quant_method=quant_method,
-        quant_dtype="fp8",
-        using_ue8m0_scale=using_ue8m0_scale,
-    )
-
-
-def fuse_weighted_swiglu_fp8_quant_clamp_python(
-    o1, probs, clamp_value, quant_method="1x32", using_ue8m0_scale=True
-):
-    """fuse_weighted_swiglu_fp8_quant_clamp 的 python 散算子版本。
-
-    clamp 语义与 CUDA 版一致：gate 上界夹 min(x, c)，up 对称夹 clip(y, -c, c)。
-    quant_method="1x128" 且 using_ue8m0_scale=True 时与 CUDA 融合算子逐位一致。
-    """
-    o2 = _weighted_swiglu_fp32(o1, probs, clamp_value)
-    return quant_blockwize(
-        o2,
-        quant_method=quant_method,
-        quant_dtype="fp8",
-        using_ue8m0_scale=using_ue8m0_scale,
-    )
-
-
-def fused_act_dequant_python(x_fp8, sf):
-    """fused_act_dequant 的 python 散算子版本（blockwise 反量化）。
-
-    参考 DeepGEMM math.py 的 cast_back_from_fp8：
-        group_idx = arange(n) // gran_k
-        return x_fp8.float() * sf[:, group_idx]
-
-    输入: x_fp8 [M, K] float8_e4m3fn, sf [M, K/gran_k] fp32
-    返回: bf16 [M, K]
-    """
-    m, n = x_fp8.shape
-    assert sf.shape[0] == m and n % sf.shape[1] == 0, (
-        f"{x_fp8.shape} vs {sf.shape}"
-    )
-    gran_k = n // sf.shape[1]
-    group_idx = paddle.arange(n, dtype="int64") // gran_k
-    sf_expanded = paddle.index_select(sf.astype("float32"), group_idx, axis=1)
-    return (x_fp8.astype("float32") * sf_expanded).astype("bfloat16")
-
-
-def _w4a8_quant(x, quant_dtype, use_w4a8_fused_quant=False):
-    if _use_w4a8_fused_quant(use_w4a8_fused_quant):
-        return w4a8_quantize_1x32(x, 0 if quant_dtype == "fp8" else 1)
-    return quant_blockwize(x, quant_dtype=quant_dtype)
-
-
-def _w4a8_stack_quant(weights, transpose, use_w4a8_fused_quant=False):
-    if _use_w4a8_fused_quant(use_w4a8_fused_quant):
-        weights = _stack_expert_weights(weights)
-        return w4a8_stack_quantize_1x32(weights, transpose)
-    fn = (
-        fuse_stack_transpose_fp8_quant_python
-        if transpose
-        else fuse_stack_fp8_quant_python
-    )
-    return fn(weights, quant_dtype="fp4")
-
-
-def _w4a8_weighted_swiglu_quant(
-    o1, probs, clamp_value=None, use_w4a8_fused_quant=False
-):
-    if _use_w4a8_fused_quant(use_w4a8_fused_quant):
-        return w4a8_weighted_swiglu_quantize_1x32(
-            o1,
-            probs,
-            0.0 if clamp_value is None else float(clamp_value),
+def _mxfp4_stack_quant(weights, transpose, use_ue8m0=True):
+    if not use_ue8m0:
+        raise ValueError(
+            "mxfp4 stack quant requires use_ue8m0=True; "
+            "the fused SM100 kernels use UE8M0 scales"
         )
-    if clamp_value is not None and clamp_value > 0:
-        return fuse_weighted_swiglu_fp8_quant_clamp_python(
-            o1, probs, clamp_value
-        )
-    return fuse_weighted_swiglu_fp8_quant_python(o1, probs)
+    weights = _stack_expert_weights(weights)
+    return mxfp4_stack_quantize_1x32(weights, transpose)
 
 
-def _w4a8_dequant(x_fp8, sf, use_w4a8_fused_quant=False):
-    if _use_w4a8_fused_quant(use_w4a8_fused_quant):
-        return w4a8_dequantize_1x32(x_fp8, sf)
-    return fused_act_dequant_python(x_fp8, sf)
+def _mxfp8_weighted_swiglu_quant(o1, probs, clamp_value=None):
+    return mxfp8_weighted_swiglu_quantize_1x32(
+        o1,
+        probs,
+        0.0 if clamp_value is None else float(clamp_value),
+    )
+
+
+def _mxfp8_dequant(x_fp8, sf):
+    return mxfp8_dequantize_1x32(x_fp8, sf)
 
 
 def split_group_gemm(
@@ -915,7 +683,7 @@ class ExpertsGroupGemmContiguousNode:
         activation_type="swiglu",
         use_accuracy_compatible=False,
         use_w4a8=False,
-        use_w4a8_fused_quant=False,
+        w4a8_route_factor_post_w2=None,
     ):
         """
             Initializes the experts group gemm contiguous node.
@@ -1011,21 +779,44 @@ class ExpertsGroupGemmContiguousNode:
             use_accuracy_compatible=use_accuracy_compatible,
         )
         self.use_w4a8 = use_w4a8
-        self.use_w4a8_fused_quant = use_w4a8_fused_quant
-        if use_w4a8:
-            assert moe_expert_fusion and moe_deep_gemm and use_fp8_mlp, (
-                "use_w4a8 需要 moe_expert_fusion + moe_deep_gemm + use_fp8_mlp"
+        # Scalar the router deliberately did not fold into probs; applied after
+        # the down projection so the FP8 activation quantizer sees the same
+        # tensor the inference stack quantizes. None means the router folded it.
+        self.w4a8_route_factor_post_w2 = w4a8_route_factor_post_w2
+        if w4a8_route_factor_post_w2 is not None and not use_w4a8:
+            # The router already dropped the factor from probs; only the W4A8
+            # down path puts it back. Any other path would silently emit
+            # outputs scaled down by routed_scaling_factor, so fail loudly.
+            raise ValueError(
+                "w4a8_route_factor_post_w2 is only supported on the W4A8 down "
+                f"path, but use_w4a8={use_w4a8}"
             )
-            # assert not dequant_input, (
-            #     "use_w4a8 要求关闭 fp8_dispatch（专家输入 bf16），"
-            #     "不支持 dequant_input"
-            # )
+        if use_w4a8:
+            try:
+                capability = paddle.device.cuda.get_device_capability()
+            except Exception as exc:
+                raise RuntimeError(
+                    "use_w4a8 requires a CUDA SM100 device; unable to query "
+                    "the current device capability."
+                ) from exc
+            if capability[0] != 10:
+                raise RuntimeError(
+                    "use_w4a8 requires an SM100 (compute capability 10.x) "
+                    f"device, got {capability[0]}.{capability[1]}."
+                )
+            # use_ue8m0 and the static-subbatch rejection are validated once at
+            # config time in MoELayer.__init__; the node only re-checks the
+            # device and the structural requirements its GEMM relies on.
+            assert moe_expert_fusion and moe_deep_gemm and use_fp8_mlp, (
+                "use_w4a8 requires moe_expert_fusion + moe_deep_gemm + use_fp8_mlp"
+            )
             assert hasattr(
                 paddlefleet_deep_gemm, "m_grouped_fp8_fp4_gemm_nt_contiguous"
             ), (
-                "use_w4a8 需要 paddlefleet_ops.deep_gemm 提供 fp8*fp4 grouped GEMM"
+                "use_w4a8 requires paddlefleet_ops.deep_gemm to provide the "
+                "fp8*fp4 grouped GEMM"
             )
-            # 用户指定：w4a8 下 dw 全部走 bf16 grouped gemm
+            # Under w4a8, all dW goes through the bf16 grouped gemm
             self.use_bf16_gemm_weight_grad = True
         _check_expert_dw_deferral_supported(
             defer_expert_up_gate_dw,
@@ -1176,8 +967,8 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, n] = [m_sum, k] * [num_groups, k, n] (m_sum = sum(tokens_per_expert))
         """
         if self.use_w4a8:
-            # 反向存储（dequant_input: fp8 1x32 / 否则 bf16）在 _fwd_gate_up_w4a8
-            # 内完成，直接复用前向的量化结果
+            # Backward storage (dequant_input: fp8 1x32 / else bf16) is done
+            # inside _fwd_gate_up_w4a8, reusing the forward quant result directly
             return self._fwd_gate_up_w4a8(x, expert_w1, scale=scale)
         # concat w1, shape is [num_groups, n, k]
 
@@ -1267,15 +1058,16 @@ class ExpertsGroupGemmContiguousNode:
         return o1
 
     # ------------------------------------------------------------------
-    # w4a8 路径：权重 fp4 1x32 在线量化 + 激活 fp8 1x32 量化 + DeepGEMM fp8*fp4
+    # W4A8 path: online fp4 1x32 weight quant + fp8 1x32 activation quant +
+    # DeepGEMM fp8*fp4
     # ------------------------------------------------------------------
 
     def _w4a8_grouped_gemm(self, x_fp8, x_sf, w_fp4, w_sf, out):
-        """调用 DeepGEMM 的 m_grouped fp8*fp4 contiguous GEMM (SM100 1D1D)。
+        """Call DeepGEMM's m_grouped fp8*fp4 contiguous GEMM (SM100 1D1D).
 
-        x_fp8/x_sf: 激活 fp8 1x32 量化结果 [M, K] / [M, K/32]
-        w_fp4/w_sf: 权重 fp4 1x32 量化结果 [E, N, K/2] / [E, N, K/32]
-        out: [M, N] bf16；grouped_layout 即 self.m_indices（每行 group id）。
+        x_fp8/x_sf: fp8 1x32 activation quant result [M, K] / [M, K/32]
+        w_fp4/w_sf: fp4 1x32 weight quant result [E, N, K/2] / [E, N, K/32]
+        out: [M, N] bf16; grouped_layout is self.m_indices (per-row group id).
         """
         paddlefleet_deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
             (x_fp8, x_sf),
@@ -1288,15 +1080,34 @@ class ExpertsGroupGemmContiguousNode:
         return out
 
     def _fwd_gate_up_w4a8(self, x, expert_w1, scale=None):
-        """w4a8 前向 up_gate: o1 = x(fp8 1x32) @ w1(fp4 1x32)^T
+        """W4A8 forward up_gate: o1 = x(fp8 1x32) @ w1(fp4 1x32)^T
 
         [m_sum, n] = [m_sum, k] * [num_groups, k, n]
+
+        ``scale`` is non-None only under the W4A8 mxfp8 dispatch path (DeepEP or
+        HybridEP): ``x`` is then the already-quantized fp8 activation and
+        ``scale`` its per-row 1x32 UE8M0 scale packed into an int32 carrier
+        ``[M, K/128]`` (the DeepEP companion directly; the HybridEP fp32 slot
+        viewed back to int32 by the dispatcher). We unpack it to the exact
+        float32 ``[M, K/32]`` the post-dispatch ``_mxfp8_quant`` would have
+        produced, so the GEMM input and the tensors stored for backward are
+        byte-for-byte identical to the quantize-after-dispatch path.
         """
-        assert scale is None, "TODO w4a8支持fp8_dispatch"
         x_fp8 = x_sf = None
-        if x is None:
-            # backward recompute：dequant_input 下直接复用存储的 1x32 fp8，
-            # 免去一次反量化+再量化
+        if scale is not None:
+            assert self.dequant_input, (
+                "a scale implies the all-to-all used fp8, so dequant_input "
+                "must be enabled"
+            )
+            assert x is not None and x.dtype == paddle.float8_e4m3fn, (
+                "w4a8 fp8 dispatch expects an fp8 activation input, got "
+                f"{None if x is None else x.dtype}"
+            )
+            x_fp8 = x if x.is_contiguous() else x.contiguous()
+            x_sf = unpack_ue8m0_scale(scale, x.shape[-1] // W4A8_QUANT_BLOCK)
+        elif x is None:
+            # backward recompute: under dequant_input reuse the stored 1x32 fp8
+            # directly, saving a dequantize + requantize round-trip
             if self.dequant_input:
                 assert self.input_fp8 is not None
                 x_fp8, x_sf = self.input_fp8, self.input_scale
@@ -1304,19 +1115,16 @@ class ExpertsGroupGemmContiguousNode:
                 assert self.input is not None
                 x = self.input
         # [E, K, N] -> [E, N, K/2]
-        w1_fp4, w1_sf = _w4a8_stack_quant(
+        w1_fp4, w1_sf = _mxfp4_stack_quant(
             expert_w1,
             transpose=True,
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
+            use_ue8m0=self.use_ue8m0,
         )
         if x_fp8 is None:
-            x_fp8, x_sf = _w4a8_quant(
-                x,
-                quant_dtype="fp8",
-                use_w4a8_fused_quant=self.use_w4a8_fused_quant,
-            )
-        # 给反向存储：dequant_input 存 fp8 1x32 量化结果（省显存，
-        # 反向 bf16 wgrad 用 fused_act_dequant_python 反量化），否则存 bf16
+            x_fp8, x_sf = _mxfp8_quant(x)
+        # Store for backward: under dequant_input keep the fp8 1x32 quant result
+        # (saves memory; the bf16 wgrad dequantizes it with _mxfp8_dequant),
+        # otherwise store bf16
         if self.dequant_input:
             self.input_fp8, self.input_scale = x_fp8, x_sf
         else:
@@ -1329,56 +1137,79 @@ class ExpertsGroupGemmContiguousNode:
             self._w4a8_grouped_gemm(x_fp8, x_sf, w1_fp4, w1_sf, o1)
         return o1
 
-    def _fwd_down_w4a8(
-        self, o1, unzipped_probs, expert_w2, o3=None, clear_o1=False
-    ):
-        """w4a8 前向 down: o3 = swiglu(o1)*probs (fp8 1x32) @ w2(fp4 1x32)^T
+    def _mxfp8_act_quant(self, o1, unzipped_probs):
+        """Activation + router-scale + fp8 1x32 quant of the gate/up output for
+        the w4a8 down path.
 
-        [m_sum, k] = [m_sum, n] * [num_groups, n, k]
+        SwiGLU uses the fused weighted-swiglu quant kernel (SiLU hardcoded).
+        SiTU-GLU has no fused kernel, so it
+        reuses the validated ``situ_glu_scale_forward`` (fp32 intermediates,
+        identical to the non-w4a8 fp8 situ path in ``fwd_down_fp8``) and then
+        applies the standard w4a8 1x32 fp8 quant. ``clamp_value`` does not apply
+        to situ, matching the fp8/bf16 situ branches.
         """
-        # 在线量化权重：[E, H, K] -> [E, K, H/2]
-        w2_fp4, w2_sf = _w4a8_stack_quant(
-            expert_w2,
-            transpose=True,
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
-        )
-        o2_fp8, o2_sf = _w4a8_weighted_swiglu_quant(
+        if self.activation_type == "situ":
+            o2 = situ_glu_scale_forward(
+                o1,
+                unzipped_probs,
+                self.activation_situ_beta,
+                self.activation_situ_linear_beta,
+                situ_glu_fusion=self.situ_glu_fusion,
+            )
+            o2_fp8, o2_sf = _mxfp8_quant(o2)
+            del o2
+            return o2_fp8, o2_sf
+        return _mxfp8_weighted_swiglu_quant(
             o1,
             unzipped_probs,
             self.clamp_value,
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
         )
+
+    def _fwd_down_w4a8(
+        self, o1, unzipped_probs, expert_w2, o3=None, clear_o1=False
+    ):
+        """W4A8 forward down: o3 = swiglu(o1)*probs (fp8 1x32) @ w2(fp4 1x32)^T
+
+        [m_sum, k] = [m_sum, n] * [num_groups, n, k]
+        """
+        # Online weight quant: [E, H, K] -> [E, K, H/2]
+        w2_fp4, w2_sf = _mxfp4_stack_quant(
+            expert_w2,
+            transpose=True,
+            use_ue8m0=self.use_ue8m0,
+        )
+        o2_fp8, o2_sf = self._mxfp8_act_quant(o1, unzipped_probs)
         if clear_o1:
             o1._clear_to_zero_allocation()
 
         o3_shape = [o2_fp8.shape[0], w2_fp4.shape[1]]
         if o3 is not None:
             assert o3.shape == o3_shape, f"{o3.shape} vs {o3_shape}"
-            o3.zero_()
         else:
             o3 = paddle.empty(o3_shape, dtype=paddle.bfloat16)
         if numpy.prod(o2_fp8.shape) != 0:
             self._w4a8_grouped_gemm(o2_fp8, o2_sf, w2_fp4, w2_sf, o3)
+        if self.w4a8_route_factor_post_w2 is not None:
+            # Apply the deferred post-w2 scale (see the __init__ comment on
+            # self.w4a8_route_factor_post_w2). In place because o3 may be a
+            # caller-provided output buffer (see fwd_down's o3 arg).
+            o3.scale_(self.w4a8_route_factor_post_w2)
         return o3
 
     def _bwd_down_input_w4a8(
         self, expert_w2, unzipped_grad, o1, unzipped_probs
     ):
-        """w4a8 反向 down dgrad: do2 = do3(fp8 1x32) @ w2(fp4 1x32)
+        """W4A8 backward down dgrad: do2 = do3(fp8 1x32) @ w2(fp4 1x32)
 
         [m_sum, n] = [m_sum, k] * [num_groups, k, n]
-        w2 [E, N, K] 不转置，收缩维为 K（do3 的列维）。
+        w2 [E, N, K] not transposed; the contracting dim is K (do3's columns).
         """
-        w2_fp4, w2_sf = _w4a8_stack_quant(
+        w2_fp4, w2_sf = _mxfp4_stack_quant(
             expert_w2,
             transpose=False,
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
+            use_ue8m0=self.use_ue8m0,
         )
-        grad_fp8, grad_sf = _w4a8_quant(
-            unzipped_grad,
-            quant_dtype="fp8",
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
-        )
+        grad_fp8, grad_sf = _mxfp8_quant(unzipped_grad)
 
         do2_s = paddle.empty(
             [grad_fp8.shape[0], w2_fp4.shape[1]], dtype=unzipped_grad.dtype
@@ -1386,7 +1217,24 @@ class ExpertsGroupGemmContiguousNode:
         if numpy.prod(grad_fp8.shape) != 0:
             self._w4a8_grouped_gemm(grad_fp8, grad_sf, w2_fp4, w2_sf, do2_s)
 
-        # swiglu 反向沿用现有逻辑（clamp / inplace / out-of-place 分支）
+        # SiTU-GLU: reuse the validated
+        # situ_glu_scale_backward on bf16; it returns (do1, o2_s, probs_grad),
+        # matching this method's return contract. do1/o2_s are freshly allocated
+        # (no o1 inplace reuse); backward_impl_fp8's inplace-release guard
+        # already excludes situ (used_inplace_swiglu checks activation_type), so
+        # o1 is not freed early under the GPU-async read.
+        if self.activation_type == "situ":
+            return situ_glu_scale_backward(
+                o1,
+                unzipped_probs,
+                do2_s,
+                self.activation_situ_beta,
+                self.activation_situ_linear_beta,
+                situ_glu_fusion=self.situ_glu_fusion,
+            )
+
+        # swiglu backward reuses the existing logic (clamp / inplace /
+        # out-of-place branches)
         with paddle.amp.auto_cast(False):
             if self.clamp_value is not None and self.clamp_value > 0:
                 do1, probs_grad, o2_s = fused_swiglu_weighted_clamp_bwd(
@@ -1409,28 +1257,23 @@ class ExpertsGroupGemmContiguousNode:
         return do1, o2_s, probs_grad
 
     def _bwd_gate_up_input_w4a8(self, do1, expert_w1, dx=None):
-        """w4a8 反向 up_gate dgrad: dx = do1(fp8 1x32) @ w1(fp4 1x32)
+        """W4A8 backward up_gate dgrad: dx = do1(fp8 1x32) @ w1(fp4 1x32)
 
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
-        w1 [E, K, N] 不转置，收缩维为 N（do1 的列维）。
+        w1 [E, K, N] not transposed; the contracting dim is N (do1's columns).
         """
-        w1_fp4, w1_sf = _w4a8_stack_quant(
+        w1_fp4, w1_sf = _mxfp4_stack_quant(
             expert_w1,
             transpose=False,
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
+            use_ue8m0=self.use_ue8m0,
         )
-        do1_fp8, do1_sf = _w4a8_quant(
-            do1,
-            quant_dtype="fp8",
-            use_w4a8_fused_quant=self.use_w4a8_fused_quant,
-        )
+        do1_fp8, do1_sf = _mxfp8_quant(do1)
 
         dx_shape = [do1_fp8.shape[0], w1_fp4.shape[1]]
         if dx is None:
             dx = paddle.empty(shape=dx_shape, dtype=do1.dtype)
         else:
             assert dx.shape == dx_shape, f"{dx.shape} vs {dx_shape}"
-            dx.zero_()
         if numpy.prod(do1_fp8.shape) != 0:
             self._w4a8_grouped_gemm(do1_fp8, do1_sf, w1_fp4, w1_sf, dx)
         return dx
@@ -2420,18 +2263,52 @@ class ExpertsGroupGemmContiguousNode:
 
         num_expert = len(expert_w1)
 
-        hs_out, scale = inspect_tensor(
-            "moe_dispatched_hidden",
-            self.layer_number,
-            (hs_out, scale),
-            pre_save_func=lambda pair: canonical_rows(
-                dequant_dispatched_hidden_bf16(*pair)
-            ),
-            post_load_func=lambda canon: (
-                scatter_dispatched_hidden_bf16(hs_out, scale, canon),
-                None,
-            ),
-        )
+        if self.use_w4a8 and scale is not None:
+            # W4A8 mxfp8 dispatch path: (hs_out, scale) = (fp8, packed int32 1x32
+            # UE8M0 scale carrier) handed over by the dispatcher. The 1x128-only
+            # fused_act_dequant cannot read the 1x32 scale, and the packed carrier
+            # must not be touched by any float op, so the probe views it back to
+            # int32, unpacks to the exact float32 1x32 scale and uses the W4A8
+            # dequant; a loaded dump comes back as bf16 + scale=None and is then
+            # quantized after the fact exactly like the bf16-dispatch path.
+            hs_out, scale = inspect_tensor(
+                "moe_dispatched_hidden",
+                self.layer_number,
+                (hs_out, scale),
+                pre_save_func=lambda pair: canonical_rows(
+                    _mxfp8_dequant(
+                        pair[0],
+                        unpack_ue8m0_scale(
+                            pair[1], pair[0].shape[-1] // W4A8_QUANT_BLOCK
+                        ),
+                    )
+                ),
+                post_load_func=lambda canon: (
+                    scatter_canonical_rows(
+                        _mxfp8_dequant(
+                            hs_out,
+                            unpack_ue8m0_scale(
+                                scale, hs_out.shape[-1] // W4A8_QUANT_BLOCK
+                            ),
+                        ),
+                        canon,
+                    ),
+                    None,
+                ),
+            )
+        else:
+            hs_out, scale = inspect_tensor(
+                "moe_dispatched_hidden",
+                self.layer_number,
+                (hs_out, scale),
+                pre_save_func=lambda pair: canonical_rows(
+                    dequant_dispatched_hidden_bf16(*pair)
+                ),
+                post_load_func=lambda canon: (
+                    scatter_dispatched_hidden_bf16(hs_out, scale, canon),
+                    None,
+                ),
+            )
 
         # o1
         o1 = self.fwd_gate_up(
@@ -2857,6 +2734,13 @@ class ExpertsGroupGemmContiguousNode:
         else:
             o1 = self.o1
 
+        if self.w4a8_route_factor_post_w2 is not None:
+            # routed_scaling_factor must be applied before out_grad fans out to
+            # the dgrad (bwd_down_input_fp8) and the w2 wgrad (bwd_down_weight);
+            # scaling only one would leave the other missing the factor. In
+            # place because out_grad is later reused as the dx output buffer.
+            out_grad.scale_(self.w4a8_route_factor_post_w2)
+
         # do2
         do1, o2_s, probs_grad = self.bwd_down_input_fp8(
             expert_w2, out_grad, o1, unzipped_probs, inplace_swiglu_prob=True
@@ -2972,11 +2856,11 @@ class ExpertsGroupGemmContiguousNode:
         if x is None:
             if self.dequant_input:
                 if self.use_w4a8:
-                    # w4a8 输入是 fp8 1x32 量化（fused_act_dequant 仅支持 1x128）
-                    x = _w4a8_dequant(
+                    # w4a8 input is fp8 1x32 quant (fused_act_dequant only
+                    # supports 1x128)
+                    x = _mxfp8_dequant(
                         self.input_fp8,
                         self.input_scale,
-                        use_w4a8_fused_quant=self.use_w4a8_fused_quant,
                     )
                 else:
                     x = paddle.incubate.nn.functional.fused_act_dequant(

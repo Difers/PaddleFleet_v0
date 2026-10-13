@@ -17,6 +17,13 @@
 //   * amax is clamped to 1e-4 before division;
 //   * scale is rounded upward to an exact UE8M0 power of two;
 //   * E2M1 uses strict midpoint comparisons and packs even K in the low nibble.
+//
+// 01-kernel adds two vectorized fast paths for mxfp4_stack_quantize_1x32
+// (StackContig/StackTranspose Bf16Fp4Quantize1x32VecKernel), used only for
+// 16-byte-aligned bfloat16 above kPairKernelMinGroups. They only widen the
+// loads and reorder the per-group amax reduction (commutative/associative
+// fmaxf), so the FP4 and UE8M0 scale bytes are bitwise identical to the
+// original kernels; every other shape/dtype falls through unchanged.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -24,7 +31,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -41,6 +47,7 @@ constexpr float kFp4Max = 6.0f;
 constexpr int kMaxGridX = 1024 * 1024;
 constexpr int kGroupWarpsPerBlock = 8;
 constexpr int kGroupThreadsPerBlock = kGroupWarpsPerBlock * 32;
+constexpr int64_t kPairKernelMinGroups = 256;
 
 enum class QuantKind : int64_t { kFp8 = 0, kFp4 = 1 };
 
@@ -62,6 +69,14 @@ __device__ __forceinline__ float WarpMax(float value) {
     value = fmaxf(value, __shfl_down_sync(kMask, value, offset));
   }
   return __shfl_sync(kMask, value, 0);
+}
+
+__device__ __forceinline__ float HalfWarpMax(float value, unsigned mask) {
+#pragma unroll
+  for (int offset = 8; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_down_sync(mask, value, offset, 16));
+  }
+  return __shfl_sync(mask, value, 0, 16);
 }
 
 __device__ __forceinline__ float CeilUe8m0(float value) {
@@ -144,6 +159,49 @@ __global__ void Quantize1x32Kernel(const T* __restrict__ input,
   }
 }
 
+template <QuantKind Kind>
+__global__ void QuantizeBf16Pair1x32Kernel(
+    const __nv_bfloat16* __restrict__ input,
+    void* __restrict__ output,
+    float* __restrict__ scale,
+    int64_t total_groups) {
+  const int lane = threadIdx.x & 31;
+  const int subwarp = lane >> 4;
+  const int sublane = lane & 15;
+  const int warp = threadIdx.x >> 5;
+  constexpr int kGroupsPerBlock = kGroupWarpsPerBlock * 2;
+  for (int64_t group = static_cast<int64_t>(blockIdx.x) * kGroupsPerBlock +
+                       warp * 2 + subwarp;
+       group < total_groups;
+       group += static_cast<int64_t>(gridDim.x) * kGroupsPerBlock) {
+    const int64_t input_base = group * kQuantBlock;
+    const auto pair = reinterpret_cast<const __nv_bfloat162*>(
+        input)[group * (kQuantBlock / 2) + sublane];
+    const float first = __bfloat162float(pair.x);
+    const float second = __bfloat162float(pair.y);
+    const unsigned subwarp_mask = subwarp == 0 ? 0x0000ffffu : 0xffff0000u;
+    const float amax =
+        HalfWarpMax(fmaxf(fabsf(first), fabsf(second)), subwarp_mask);
+    const float quant_max = Kind == QuantKind::kFp8 ? kFp8Max : kFp4Max;
+    const float group_scale = CeilUe8m0(fmaxf(amax, kAmaxFloor) / quant_max);
+    if (sublane == 0) {
+      scale[group] = group_scale;
+    }
+    if constexpr (Kind == QuantKind::kFp8) {
+      auto* fp8_output = reinterpret_cast<__nv_fp8_e4m3*>(output);
+      fp8_output[input_base + sublane * 2] =
+          static_cast<__nv_fp8_e4m3>(first / group_scale);
+      fp8_output[input_base + sublane * 2 + 1] =
+          static_cast<__nv_fp8_e4m3>(second / group_scale);
+    } else {
+      const uint8_t low = EncodeE2m1Strict(first / group_scale);
+      const uint8_t high = EncodeE2m1Strict(second / group_scale);
+      reinterpret_cast<int8_t*>(output)[group * 16 + sublane] =
+          static_cast<int8_t>(low | (high << 4));
+    }
+  }
+}
+
 template <typename T>
 __global__ void StackTransposeFp4Quantize1x32Kernel(const T* __restrict__ input,
                                                     int8_t* __restrict__ output,
@@ -206,6 +264,226 @@ __global__ void StackTransposeFp4Quantize1x32Kernel(const T* __restrict__ input,
   }
 }
 
+// BF16 transpose fast path. The legacy transpose kernel computes one column
+// maximum serially on only 32 threads. This variant assigns four columns to
+// each warp and uses eight-lane reductions, while keeping the same tile and
+// output layout so the quantization contract remains unchanged.
+__global__ void StackTransposeBf16Fp4Quantize1x32Kernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scale,
+    int64_t rows,
+    int64_t cols) {
+  __shared__ __nv_bfloat16 tile[kQuantBlock][kQuantBlock + 1];
+  __shared__ float tile_scale[kQuantBlock];
+
+  const int64_t expert = blockIdx.z;
+  const int64_t row_group = blockIdx.y;
+  const int64_t col_group = blockIdx.x;
+  const int thread = threadIdx.x;
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  const int64_t input_expert_base = expert * rows * cols;
+
+#pragma unroll
+  for (int linear = thread; linear < kQuantBlock * kQuantBlock;
+       linear += blockDim.x) {
+    const int local_row = linear / kQuantBlock;
+    const int local_col = linear % kQuantBlock;
+    const int64_t global_row = row_group * kQuantBlock + local_row;
+    const int64_t global_col = col_group * kQuantBlock + local_col;
+    tile[local_row][local_col] =
+        input[input_expert_base + global_row * cols + global_col];
+  }
+  __syncthreads();
+
+  // Each warp handles four columns. Each eight-lane subgroup scans four
+  // rows, then reduces within that subgroup. Every column therefore uses all
+  // rows but no longer relies on a single thread's serial loop.
+  const int column = warp * 4 + (lane >> 3);
+  const int subgroup_lane = lane & 7;
+  if (column < kQuantBlock) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int row = subgroup_lane; row < kQuantBlock; row += 8) {
+      amax = fmaxf(amax, fabsf(__bfloat162float(tile[row][column])));
+    }
+    const unsigned mask = 0xffu << ((lane >> 3) * 8);
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+      amax = fmaxf(__shfl_down_sync(mask, amax, offset, 8), amax);
+    }
+    if (subgroup_lane == 0) {
+      const float group_scale = CeilUe8m0(fmaxf(amax, kAmaxFloor) / kFp4Max);
+      tile_scale[column] = group_scale;
+      const int64_t global_col = col_group * kQuantBlock + column;
+      scale[(expert * cols + global_col) * (rows / kQuantBlock) + row_group] =
+          group_scale;
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int linear = thread; linear < kQuantBlock * (kQuantBlock / 2);
+       linear += blockDim.x) {
+    const int local_col = linear / (kQuantBlock / 2);
+    const int local_pair = linear % (kQuantBlock / 2);
+    const float group_scale = tile_scale[local_col];
+    const uint8_t low = EncodeE2m1Strict(
+        __bfloat162float(tile[local_pair * 2][local_col]) / group_scale);
+    const uint8_t high = EncodeE2m1Strict(
+        __bfloat162float(tile[local_pair * 2 + 1][local_col]) / group_scale);
+    const int64_t global_col = col_group * kQuantBlock + local_col;
+    const int64_t global_pair = row_group * (kQuantBlock / 2) + local_pair;
+    output[(expert * cols + global_col) * (rows / 2) + global_pair] =
+        static_cast<int8_t>(low | (high << 4));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Vectorized FP4 stack-quant fast paths (bitwise identical to the kernels
+// above).
+// -----------------------------------------------------------------------------
+
+// transpose == false.  Contiguous [E, R, C] -> [E, R, C/2] with a scale per
+// 32-element run along C.  Four warp lanes own one group; each lane loads 8
+// contiguous bf16 with a single 128-bit int4 load, reduces amax across the 4
+// lanes (XOR butterfly, which stays inside the aligned 4-lane block), and emits
+// its 8 values as 4 packed FP4 bytes via one 32-bit store.  Numerically this is
+// the same per-group amax -> CeilUe8m0 -> EncodeE2m1Strict pipeline as
+// QuantizeBf16Pair1x32Kernel<kFp4>; only the load/store width and the amax
+// reduction order differ (both bitwise-safe).
+__global__ void StackContigBf16Fp4Quantize1x32VecKernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scale,
+    int64_t total_groups) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int group_in_warp = lane >> 2;  // 0..7, shared by a group's 4 lanes
+  const int part = lane & 3;            // 0..3, which 8-element quarter
+  const int warps_per_block = blockDim.x >> 5;
+  const int64_t groups_per_block = static_cast<int64_t>(warps_per_block) * 8;
+  for (int64_t base = static_cast<int64_t>(blockIdx.x) * groups_per_block;
+       base < total_groups;
+       base += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t group = base + warp * 8 + group_in_warp;
+    const bool valid = group < total_groups;
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      v[j] = 0.0f;
+    }
+    if (valid) {
+      const int4 packed = *reinterpret_cast<const int4*>(
+          input + group * kQuantBlock + part * 8);
+      const __nv_bfloat16* elems =
+          reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        v[j] = __bfloat162float(elems[j]);
+      }
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      amax = fmaxf(amax, fabsf(v[j]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float group_scale = CeilUe8m0(fmaxf(amax, kAmaxFloor) / kFp4Max);
+    if (valid) {
+      if (part == 0) {
+        scale[group] = group_scale;
+      }
+      uint32_t word = 0;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const uint8_t low = EncodeE2m1Strict(v[b * 2] / group_scale);
+        const uint8_t high = EncodeE2m1Strict(v[b * 2 + 1] / group_scale);
+        word |= static_cast<uint32_t>(static_cast<uint8_t>(low | (high << 4)))
+                << (b * 8);
+      }
+      reinterpret_cast<uint32_t*>(output)[group * 4 + part] = word;
+    }
+  }
+}
+
+// transpose == true.  Same shared-memory tile + per-column 32-row reduction as
+// StackTransposeBf16Fp4Quantize1x32Kernel, but with 128-bit tile loads and the
+// scale kept in registers (no tile_scale[] and no second __syncthreads): each
+// column's 8 owning lanes XOR-reduce the amax so every lane holds it, then
+// write that column's 16 bytes directly.  The grid, tile layout, amax rows,
+// scale/output index math and encode are otherwise identical, so the result is
+// bitwise identical.
+__global__ void StackTransposeBf16Fp4Quantize1x32VecKernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scale,
+    int64_t rows,
+    int64_t cols) {
+  __shared__ __nv_bfloat16 tile[kQuantBlock][kQuantBlock + 1];
+
+  const int64_t expert = blockIdx.z;
+  const int64_t row_group = blockIdx.y;
+  const int64_t col_group = blockIdx.x;
+  const int thread = threadIdx.x;
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  const int64_t input_expert_base = expert * rows * cols;
+
+  // Load the 32x32 tile with 128-bit (int4 = 8 bf16) global loads.  The tile is
+  // 1024 bf16 = 128 int4; the first 128 threads each issue one load.
+  constexpr int kInt4PerTile = (kQuantBlock * kQuantBlock) / 8;
+  for (int v = thread; v < kInt4PerTile; v += blockDim.x) {
+    const int local_row = v >> 2;        // 4 int4 per 32-column row
+    const int local_col0 = (v & 3) * 8;  // 8-column block
+    const int64_t global_row = row_group * kQuantBlock + local_row;
+    const int64_t global_col0 = col_group * kQuantBlock + local_col0;
+    const int4 packed = *reinterpret_cast<const int4*>(
+        input + input_expert_base + global_row * cols + global_col0);
+    const __nv_bfloat16* elems =
+        reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      tile[local_row][local_col0 + j] = elems[j];
+    }
+  }
+  __syncthreads();
+
+  // Each warp owns four columns; each column is reduced by an 8-lane subgroup.
+  const int column = warp * 4 + (lane >> 3);
+  const int subgroup_lane = lane & 7;
+  float amax = 0.0f;
+#pragma unroll
+  for (int row = subgroup_lane; row < kQuantBlock; row += 8) {
+    amax = fmaxf(amax, fabsf(__bfloat162float(tile[row][column])));
+  }
+  // XOR butterfly over the aligned 8-lane subgroup -> every lane holds the max.
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const float group_scale = CeilUe8m0(fmaxf(amax, kAmaxFloor) / kFp4Max);
+  const int64_t global_col = col_group * kQuantBlock + column;
+  if (subgroup_lane == 0) {
+    scale[(expert * cols + global_col) * (rows / kQuantBlock) + row_group] =
+        group_scale;
+  }
+  // The 8 owning lanes emit the column's 16 packed bytes, two adjacent bytes
+  // each, matching the (expert, col, row-pair) output layout above.
+  int8_t* out_col =
+      output + (expert * cols + global_col) * (rows / 2) + row_group * 16;
+#pragma unroll
+  for (int q = 0; q < 2; ++q) {
+    const int local_pair = subgroup_lane * 2 + q;
+    const uint8_t low = EncodeE2m1Strict(
+        __bfloat162float(tile[local_pair * 2][column]) / group_scale);
+    const uint8_t high = EncodeE2m1Strict(
+        __bfloat162float(tile[local_pair * 2 + 1][column]) / group_scale);
+    out_col[local_pair] = static_cast<int8_t>(low | (high << 4));
+  }
+}
+
 template <bool HasClamp>
 __global__ void WeightedSwigluFp8Quantize1x32Kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -246,6 +524,74 @@ __global__ void WeightedSwigluFp8Quantize1x32Kernel(
   }
 }
 
+// The weighted SwiGLU quantizer has the same 32-element group structure as the
+// ordinary BF16 quantizer. Two 16-lane subwarps process two groups per warp,
+// reducing the amount of idle work in the activation and scale calculation.
+template <bool HasClamp>
+__global__ void WeightedSwigluBf16PairQuantize1x32Kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ probs,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int64_t rows,
+    int64_t hidden,
+    float clamp_value,
+    int64_t total_groups) {
+  const int lane = threadIdx.x & 31;
+  const int subwarp = lane >> 4;
+  const int sublane = lane & 15;
+  const int warp = threadIdx.x >> 5;
+  constexpr int kGroupsPerBlock = kGroupWarpsPerBlock * 2;
+  const unsigned subwarp_mask = subwarp == 0 ? 0x0000ffffu : 0xffff0000u;
+
+  for (int64_t group_index =
+           static_cast<int64_t>(blockIdx.x) * kGroupsPerBlock + warp * 2 +
+           subwarp;
+       group_index < total_groups;
+       group_index += static_cast<int64_t>(gridDim.x) * kGroupsPerBlock) {
+    const int64_t groups_per_row = hidden / kQuantBlock;
+    const int64_t row = group_index / groups_per_row;
+    const int64_t group = group_index - row * groups_per_row;
+    const int64_t col = group * kQuantBlock + sublane * 2;
+
+    // The input is [row, gate( hidden ), up( hidden )]. In BF16-pair units,
+    // the two halves start at row*hidden and row*hidden + hidden/2.
+    const int64_t pair_base =
+        row * hidden + group * (kQuantBlock / 2) + sublane;
+    const auto gate_pair =
+        reinterpret_cast<const __nv_bfloat162*>(input)[pair_base];
+    const auto up_pair = reinterpret_cast<const __nv_bfloat162*>(
+        input)[row * hidden + hidden / 2 + group * (kQuantBlock / 2) + sublane];
+    float gate0 = __bfloat162float(gate_pair.x);
+    float gate1 = __bfloat162float(gate_pair.y);
+    float up0 = __bfloat162float(up_pair.x);
+    float up1 = __bfloat162float(up_pair.y);
+    if constexpr (HasClamp) {
+      gate0 = fminf(gate0, clamp_value);
+      gate1 = fminf(gate1, clamp_value);
+      up0 = fmaxf(fminf(up0, clamp_value), -clamp_value);
+      up1 = fmaxf(fminf(up1, clamp_value), -clamp_value);
+    }
+    const float prob = probs[row];
+    const float sigmoid0 = HasClamp ? 1.0f / (1.0f + __expf(-gate0))
+                                    : __frcp_rn(1.0f + __expf(-gate0));
+    const float sigmoid1 = HasClamp ? 1.0f / (1.0f + __expf(-gate1))
+                                    : __frcp_rn(1.0f + __expf(-gate1));
+    const float value0 = gate0 * sigmoid0 * up0 * prob;
+    const float value1 = gate1 * sigmoid1 * up1 * prob;
+    const float amax =
+        HalfWarpMax(fmaxf(fabsf(value0), fabsf(value1)), subwarp_mask);
+    const float group_scale = CeilUe8m0(fmaxf(amax, kAmaxFloor) / kFp8Max);
+    if (sublane == 0) {
+      scale[group_index] = group_scale;
+    }
+    output[row * hidden + col] =
+        static_cast<__nv_fp8_e4m3>(value0 / group_scale);
+    output[row * hidden + col + 1] =
+        static_cast<__nv_fp8_e4m3>(value1 / group_scale);
+  }
+}
+
 __global__ void DequantizeFp8OneBy32Kernel(
     const __nv_fp8_e4m3* __restrict__ input,
     const float* __restrict__ scale,
@@ -266,6 +612,21 @@ void CheckGpuContiguous(const paddle::Tensor& input, const char* op_name) {
   PD_CHECK(input.is_contiguous(), op_name, " requires a contiguous tensor");
 }
 
+inline bool IsBfloat16PairAligned(const paddle::Tensor& input) {
+  auto& mutable_input = const_cast<paddle::Tensor&>(input);
+  const auto address =
+      reinterpret_cast<uintptr_t>(mutable_input.data<phi::bfloat16>());
+  return address % alignof(__nv_bfloat162) == 0;
+}
+
+// 16-byte (int4 / 128-bit load) alignment check for the vectorized fast paths.
+inline bool IsBfloat16Aligned16(const paddle::Tensor& input) {
+  auto& mutable_input = const_cast<paddle::Tensor&>(input);
+  const auto address =
+      reinterpret_cast<uintptr_t>(mutable_input.data<phi::bfloat16>());
+  return address % 16 == 0;
+}
+
 template <typename Fn>
 void DispatchFloatInput(const paddle::Tensor& input, Fn&& fn) {
   auto& mutable_input = const_cast<paddle::Tensor&>(input);
@@ -278,15 +639,20 @@ void DispatchFloatInput(const paddle::Tensor& input, Fn&& fn) {
       fn(mutable_input.data<float>());
       break;
     default:
-      PD_THROW("W4A8 quantization supports only bfloat16 and float32 input");
+      PD_THROW("MX 1x32 quantization supports only bfloat16 and float32 input");
   }
 }
 
 }  // namespace
 
-std::vector<paddle::Tensor> W4A8Quantize1x32(const paddle::Tensor& input,
-                                             int64_t quant_kind) {
-  constexpr const char* kOpName = "w4a8_quantize_1x32";
+std::vector<paddle::Tensor> MxQuantize1x32Impl(const paddle::Tensor& input,
+                                               int64_t quant_kind) {
+  // Shared implementation behind the two thin PD ops mxfp8_quantize_1x32
+  // (kind=0) and mxfp4_quantize_1x32 (kind=1); the op name is picked per kind
+  // so PD_CHECK diagnostics name the op the caller actually invoked.
+  const char* kOpName = quant_kind == static_cast<int64_t>(QuantKind::kFp8)
+                            ? "mxfp8_quantize_1x32"
+                            : "mxfp4_quantize_1x32";
   CheckGpuContiguous(input, kOpName);
   PD_CHECK(input.shape().size() == 2, kOpName, " expects rank-2 input");
   PD_CHECK(input.shape()[1] % kQuantBlock == 0,
@@ -313,7 +679,42 @@ std::vector<paddle::Tensor> W4A8Quantize1x32(const paddle::Tensor& input,
 
   DispatchFloatInput(input, [&](auto* input_ptr) {
     using InputT = std::remove_cv_t<std::remove_pointer_t<decltype(input_ptr)>>;
-    if (is_fp8) {
+    if constexpr (std::is_same_v<InputT, __nv_bfloat16>) {
+      constexpr int kGroupsPerBlock = kGroupWarpsPerBlock * 2;
+      if (groups < kPairKernelMinGroups || !IsBfloat16PairAligned(input)) {
+        if (is_fp8) {
+          Quantize1x32Kernel<InputT, QuantKind::kFp8>
+              <<<GridFor((groups + kGroupWarpsPerBlock - 1) /
+                         kGroupWarpsPerBlock),
+                 kGroupThreadsPerBlock,
+                 0,
+                 input.stream()>>>(
+                  input_ptr, output.data(), scale.data<float>(), groups);
+        } else {
+          Quantize1x32Kernel<InputT, QuantKind::kFp4>
+              <<<GridFor((groups + kGroupWarpsPerBlock - 1) /
+                         kGroupWarpsPerBlock),
+                 kGroupThreadsPerBlock,
+                 0,
+                 input.stream()>>>(
+                  input_ptr, output.data(), scale.data<float>(), groups);
+        }
+      } else if (is_fp8) {
+        QuantizeBf16Pair1x32Kernel<QuantKind::kFp8>
+            <<<GridFor((groups + kGroupsPerBlock - 1) / kGroupsPerBlock),
+               kGroupThreadsPerBlock,
+               0,
+               input.stream()>>>(
+                input_ptr, output.data(), scale.data<float>(), groups);
+      } else {
+        QuantizeBf16Pair1x32Kernel<QuantKind::kFp4>
+            <<<GridFor((groups + kGroupsPerBlock - 1) / kGroupsPerBlock),
+               kGroupThreadsPerBlock,
+               0,
+               input.stream()>>>(
+                input_ptr, output.data(), scale.data<float>(), groups);
+      }
+    } else if (is_fp8) {
       Quantize1x32Kernel<InputT, QuantKind::kFp8>
           <<<GridFor((groups + kGroupWarpsPerBlock - 1) / kGroupWarpsPerBlock),
              kGroupThreadsPerBlock,
@@ -333,9 +734,19 @@ std::vector<paddle::Tensor> W4A8Quantize1x32(const paddle::Tensor& input,
   return {output, scale};
 }
 
-std::vector<paddle::Tensor> W4A8StackQuantize1x32(const paddle::Tensor& input,
-                                                  bool transpose) {
-  constexpr const char* kOpName = "w4a8_stack_quantize_1x32";
+// Thin PD wrappers with the quant kind hard-wired; each gets its own
+// PD_BUILD_OP / InferShape / InferDtype below.
+std::vector<paddle::Tensor> MxFp8Quantize1x32(const paddle::Tensor& input) {
+  return MxQuantize1x32Impl(input, static_cast<int64_t>(QuantKind::kFp8));
+}
+
+std::vector<paddle::Tensor> MxFp4Quantize1x32(const paddle::Tensor& input) {
+  return MxQuantize1x32Impl(input, static_cast<int64_t>(QuantKind::kFp4));
+}
+
+std::vector<paddle::Tensor> MxFp4StackQuantize1x32(const paddle::Tensor& input,
+                                                   bool transpose) {
+  constexpr const char* kOpName = "mxfp4_stack_quantize_1x32";
   CheckGpuContiguous(input, kOpName);
   PD_CHECK(input.shape().size() == 3, kOpName, " expects [E, R, C]");
   const int64_t experts = input.shape()[0];
@@ -371,31 +782,98 @@ std::vector<paddle::Tensor> W4A8StackQuantize1x32(const paddle::Tensor& input,
       const dim3 grid(cols / kQuantBlock,
                       rows / kQuantBlock,
                       static_cast<unsigned int>(experts));
-      StackTransposeFp4Quantize1x32Kernel<InputT>
-          <<<grid, 256, 0, input.stream()>>>(input_ptr,
-                                             output.data<int8_t>(),
-                                             scale.data<float>(),
-                                             rows,
-                                             cols);
+      const int64_t tiles =
+          experts * (rows / kQuantBlock) * (cols / kQuantBlock);
+      if constexpr (std::is_same_v<InputT, __nv_bfloat16>) {
+        if (tiles >= kPairKernelMinGroups && IsBfloat16Aligned16(input)) {
+          // Vectorized fast path (128-bit tile loads, single barrier).
+          StackTransposeBf16Fp4Quantize1x32VecKernel<<<grid,
+                                                       256,
+                                                       0,
+                                                       input.stream()>>>(
+              input_ptr,
+              output.data<int8_t>(),
+              scale.data<float>(),
+              rows,
+              cols);
+        } else if (tiles >= kPairKernelMinGroups &&
+                   IsBfloat16PairAligned(input)) {
+          StackTransposeBf16Fp4Quantize1x32Kernel<<<grid,
+                                                    256,
+                                                    0,
+                                                    input.stream()>>>(
+              input_ptr,
+              output.data<int8_t>(),
+              scale.data<float>(),
+              rows,
+              cols);
+        } else {
+          StackTransposeFp4Quantize1x32Kernel<InputT>
+              <<<grid, 256, 0, input.stream()>>>(input_ptr,
+                                                 output.data<int8_t>(),
+                                                 scale.data<float>(),
+                                                 rows,
+                                                 cols);
+        }
+      } else {
+        StackTransposeFp4Quantize1x32Kernel<InputT>
+            <<<grid, 256, 0, input.stream()>>>(input_ptr,
+                                               output.data<int8_t>(),
+                                               scale.data<float>(),
+                                               rows,
+                                               cols);
+      }
     } else {
       const int64_t groups = experts * rows * (cols / kQuantBlock);
-      Quantize1x32Kernel<InputT, QuantKind::kFp4>
-          <<<GridFor((groups + kGroupWarpsPerBlock - 1) / kGroupWarpsPerBlock),
-             kGroupThreadsPerBlock,
-             0,
-             input.stream()>>>(
-              input_ptr, output.data(), scale.data<float>(), groups);
+      if constexpr (std::is_same_v<InputT, __nv_bfloat16>) {
+        constexpr int kGroupsPerBlock = kGroupWarpsPerBlock * 2;
+        constexpr int64_t kVecGroupsPerBlock =
+            static_cast<int64_t>(kGroupThreadsPerBlock / 32) * 8;
+        if (groups >= kPairKernelMinGroups && IsBfloat16Aligned16(input)) {
+          // Vectorized fast path: 4 lanes own a group, one 128-bit load each.
+          StackContigBf16Fp4Quantize1x32VecKernel<<<
+              GridFor((groups + kVecGroupsPerBlock - 1) / kVecGroupsPerBlock),
+              kGroupThreadsPerBlock,
+              0,
+              input.stream()>>>(
+              input_ptr, output.data<int8_t>(), scale.data<float>(), groups);
+        } else if (groups < kPairKernelMinGroups ||
+                   !IsBfloat16PairAligned(input)) {
+          Quantize1x32Kernel<InputT, QuantKind::kFp4>
+              <<<GridFor((groups + kGroupWarpsPerBlock - 1) /
+                         kGroupWarpsPerBlock),
+                 kGroupThreadsPerBlock,
+                 0,
+                 input.stream()>>>(
+                  input_ptr, output.data(), scale.data<float>(), groups);
+        } else {
+          QuantizeBf16Pair1x32Kernel<QuantKind::kFp4>
+              <<<GridFor((groups + kGroupsPerBlock - 1) / kGroupsPerBlock),
+                 kGroupThreadsPerBlock,
+                 0,
+                 input.stream()>>>(
+                  input_ptr, output.data(), scale.data<float>(), groups);
+        }
+      } else {
+        Quantize1x32Kernel<InputT, QuantKind::kFp4>
+            <<<GridFor((groups + kGroupWarpsPerBlock - 1) /
+                       kGroupWarpsPerBlock),
+               kGroupThreadsPerBlock,
+               0,
+               input.stream()>>>(
+                input_ptr, output.data(), scale.data<float>(), groups);
+      }
     }
   });
   CheckCudaLaunch(kOpName);
   return {output, scale};
 }
 
-std::vector<paddle::Tensor> W4A8WeightedSwigluQuantize1x32(
+std::vector<paddle::Tensor> MxFp8WeightedSwigluQuantize1x32(
     const paddle::Tensor& input,
     const paddle::Tensor& probs,
     double clamp_value) {
-  constexpr const char* kOpName = "w4a8_weighted_swiglu_quantize_1x32";
+  constexpr const char* kOpName = "mxfp8_weighted_swiglu_quantize_1x32";
   CheckGpuContiguous(input, kOpName);
   CheckGpuContiguous(probs, kOpName);
   PD_CHECK(input.dtype() == paddle::DataType::BFLOAT16,
@@ -428,7 +906,38 @@ std::vector<paddle::Tensor> W4A8WeightedSwigluQuantize1x32(
       mutable_input.data<phi::bfloat16>());
   auto* output_ptr =
       reinterpret_cast<__nv_fp8_e4m3*>(output.data<phi::float8_e4m3fn>());
-  if (clamp_value > 0.0) {
+  const bool use_pair_kernel =
+      groups >= kPairKernelMinGroups && IsBfloat16PairAligned(input);
+  constexpr int kGroupsPerBlock = kGroupWarpsPerBlock * 2;
+  if (use_pair_kernel) {
+    if (clamp_value > 0.0) {
+      WeightedSwigluBf16PairQuantize1x32Kernel<true>
+          <<<GridFor((groups + kGroupsPerBlock - 1) / kGroupsPerBlock),
+             kGroupThreadsPerBlock,
+             0,
+             input.stream()>>>(input_ptr,
+                               mutable_probs.data<float>(),
+                               output_ptr,
+                               scale.data<float>(),
+                               rows,
+                               hidden,
+                               static_cast<float>(clamp_value),
+                               groups);
+    } else {
+      WeightedSwigluBf16PairQuantize1x32Kernel<false>
+          <<<GridFor((groups + kGroupsPerBlock - 1) / kGroupsPerBlock),
+             kGroupThreadsPerBlock,
+             0,
+             input.stream()>>>(input_ptr,
+                               mutable_probs.data<float>(),
+                               output_ptr,
+                               scale.data<float>(),
+                               rows,
+                               hidden,
+                               0.0f,
+                               groups);
+    }
+  } else if (clamp_value > 0.0) {
     WeightedSwigluFp8Quantize1x32Kernel<true>
         <<<GridFor((groups + kGroupWarpsPerBlock - 1) / kGroupWarpsPerBlock),
            kGroupThreadsPerBlock,
@@ -459,9 +968,9 @@ std::vector<paddle::Tensor> W4A8WeightedSwigluQuantize1x32(
   return {output, scale};
 }
 
-std::vector<paddle::Tensor> W4A8Dequantize1x32Impl(
-    const paddle::Tensor& input, const paddle::Tensor& scale) {
-  constexpr const char* kOpName = "w4a8_dequantize_1x32";
+std::vector<paddle::Tensor> MxFp8Dequantize1x32(const paddle::Tensor& input,
+                                                const paddle::Tensor& scale) {
+  constexpr const char* kOpName = "mxfp8_dequantize_1x32";
   CheckGpuContiguous(input, kOpName);
   CheckGpuContiguous(scale, kOpName);
   PD_CHECK(input.dtype() == paddle::DataType::FLOAT8_E4M3FN,
@@ -498,19 +1007,26 @@ std::vector<paddle::Tensor> W4A8Dequantize1x32Impl(
   return {output};
 }
 
-std::vector<std::vector<int64_t>> QuantInferShape(
-    std::vector<int64_t> input_shape, int64_t quant_kind) {
-  const bool fp8 = quant_kind == static_cast<int64_t>(QuantKind::kFp8);
-  return {{input_shape[0], fp8 ? input_shape[1] : input_shape[1] / 2},
+std::vector<std::vector<int64_t>> MxFp8QuantInferShape(
+    std::vector<int64_t> input_shape) {
+  return {{input_shape[0], input_shape[1]},
           {input_shape[0], input_shape[1] / kQuantBlock}};
 }
 
-std::vector<paddle::DataType> QuantInferDtype(paddle::DataType input_dtype,
-                                              int64_t quant_kind) {
-  return {quant_kind == static_cast<int64_t>(QuantKind::kFp8)
-              ? paddle::DataType::FLOAT8_E4M3FN
-              : paddle::DataType::INT8,
-          paddle::DataType::FLOAT32};
+std::vector<paddle::DataType> MxFp8QuantInferDtype(
+    paddle::DataType input_dtype) {
+  return {paddle::DataType::FLOAT8_E4M3FN, paddle::DataType::FLOAT32};
+}
+
+std::vector<std::vector<int64_t>> MxFp4QuantInferShape(
+    std::vector<int64_t> input_shape) {
+  return {{input_shape[0], input_shape[1] / 2},
+          {input_shape[0], input_shape[1] / kQuantBlock}};
+}
+
+std::vector<paddle::DataType> MxFp4QuantInferDtype(
+    paddle::DataType input_dtype) {
+  return {paddle::DataType::INT8, paddle::DataType::FLOAT32};
 }
 
 std::vector<std::vector<int64_t>> StackInferShape(
@@ -552,33 +1068,39 @@ std::vector<paddle::DataType> DequantInferDtype(paddle::DataType input_dtype,
   return {paddle::DataType::BFLOAT16};
 }
 
-PD_BUILD_OP(w4a8_quantize_1x32)
+PD_BUILD_OP(mxfp8_quantize_1x32)
     .Inputs({"input"})
     .Outputs({"output", "scale"})
-    .Attrs({"quant_kind: int64_t"})
-    .SetKernelFn(PD_KERNEL(W4A8Quantize1x32))
-    .SetInferShapeFn(PD_INFER_SHAPE(QuantInferShape))
-    .SetInferDtypeFn(PD_INFER_DTYPE(QuantInferDtype));
+    .SetKernelFn(PD_KERNEL(MxFp8Quantize1x32))
+    .SetInferShapeFn(PD_INFER_SHAPE(MxFp8QuantInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(MxFp8QuantInferDtype));
 
-PD_BUILD_OP(w4a8_stack_quantize_1x32)
+PD_BUILD_OP(mxfp4_quantize_1x32)
+    .Inputs({"input"})
+    .Outputs({"output", "scale"})
+    .SetKernelFn(PD_KERNEL(MxFp4Quantize1x32))
+    .SetInferShapeFn(PD_INFER_SHAPE(MxFp4QuantInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(MxFp4QuantInferDtype));
+
+PD_BUILD_OP(mxfp4_stack_quantize_1x32)
     .Inputs({"input"})
     .Outputs({"output", "scale"})
     .Attrs({"transpose: bool"})
-    .SetKernelFn(PD_KERNEL(W4A8StackQuantize1x32))
+    .SetKernelFn(PD_KERNEL(MxFp4StackQuantize1x32))
     .SetInferShapeFn(PD_INFER_SHAPE(StackInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(StackInferDtype));
 
-PD_BUILD_OP(w4a8_weighted_swiglu_quantize_1x32)
+PD_BUILD_OP(mxfp8_weighted_swiglu_quantize_1x32)
     .Inputs({"input", "probs"})
     .Outputs({"output", "scale"})
     .Attrs({"clamp_value: double"})
-    .SetKernelFn(PD_KERNEL(W4A8WeightedSwigluQuantize1x32))
+    .SetKernelFn(PD_KERNEL(MxFp8WeightedSwigluQuantize1x32))
     .SetInferShapeFn(PD_INFER_SHAPE(WeightedSwigluInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(WeightedSwigluInferDtype));
 
-PD_BUILD_OP(w4a8_dequantize_1x32)
+PD_BUILD_OP(mxfp8_dequantize_1x32)
     .Inputs({"input", "scale"})
     .Outputs({"output"})
-    .SetKernelFn(PD_KERNEL(W4A8Dequantize1x32Impl))
+    .SetKernelFn(PD_KERNEL(MxFp8Dequantize1x32))
     .SetInferShapeFn(PD_INFER_SHAPE(DequantInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(DequantInferDtype));
