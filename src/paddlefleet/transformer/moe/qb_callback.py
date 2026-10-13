@@ -216,13 +216,15 @@ class MoEQuantileBalancingCallback:
                 layer.e_score_correction_bias.set_value(b_new)
 
         # --- Step 7: Update binning range for next step ---
+        # Keep the buffers' shape [1] (see register_buffer in moe_router.py):
+        # a persistable 0-D buffer cannot be resharded by flex_checkpoint.
         new_min = float(b_new.min().item()) - 1.0
         new_max = float(b_new.max().item()) + 1.0
         layer.qb_bin_min.set_value(
-            paddle.to_tensor(new_min, dtype=paddle.float32)
+            paddle.full([1], new_min, dtype=paddle.float32)
         )
         layer.qb_bin_max.set_value(
-            paddle.to_tensor(new_max, dtype=paddle.float32)
+            paddle.full([1], new_max, dtype=paddle.float32)
         )
 
         # --- Step 8: Reset histogram and expert_usage ---

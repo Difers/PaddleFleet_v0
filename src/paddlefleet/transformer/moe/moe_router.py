@@ -709,11 +709,19 @@ class StandardMoERouter(nn.Layer):
 
             # QB Binning range -- persisted because it affects the next step's
             # histogram and therefore must survive checkpoint resumption.
+            # Shape [1] rather than 0-D: a persistable 0-D buffer cannot be
+            # resharded. flex_checkpoint's assign_sharded_weight() derives the
+            # copy region by intersecting the source and target shards per
+            # dimension and then calls paddle.slice(axes=list(range(ndim))),
+            # which rejects an empty `axes` when ndim == 0, so changing the
+            # parallelism degree on a resume raises. Shape [1] is also the
+            # convention for scalar state elsewhere (e.g. the optimizers'
+            # beta1_pow_acc / beta2_pow_acc).
             self.register_buffer(
-                "qb_bin_min", paddle.to_tensor(-1.0, dtype=paddle.float32)
+                "qb_bin_min", paddle.full([1], -1.0, dtype=paddle.float32)
             )
             self.register_buffer(
-                "qb_bin_max", paddle.to_tensor(1.0, dtype=paddle.float32)
+                "qb_bin_max", paddle.full([1], 1.0, dtype=paddle.float32)
             )
 
         # Hash-routing state. Activated lazily via set_layer_number() so that the

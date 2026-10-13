@@ -105,8 +105,8 @@ def _make_layer(
     layer.qb_histogram = paddle.to_tensor(histogram_np, dtype=paddle.int32)
     layer.num_experts_per_tok = K
     layer.num_experts = N_EXPERTS
-    layer.qb_bin_min = paddle.to_tensor(b_min, dtype=paddle.float32)
-    layer.qb_bin_max = paddle.to_tensor(b_max, dtype=paddle.float32)
+    layer.qb_bin_min = paddle.full([1], b_min, dtype=paddle.float32)
+    layer.qb_bin_max = paddle.full([1], b_max, dtype=paddle.float32)
     layer.config = MagicMock()
     layer.config.sequence_parallel = sequence_parallel
     layer.config.expert_model_parallel_size = ep_size
