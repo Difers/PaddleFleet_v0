@@ -92,13 +92,13 @@ class TestMTPDistillationLossCP(unittest.TestCase):
             scatter_apply = ContextParallelScatterOp.apply
 
             ContextParallelGatherOp.apply = (
-                lambda tensor, axis, mode: gather_apply(
-                    tensor, axis, mode="contiguous_allgather"
+                lambda tensor, axis, mode, **kwargs: gather_apply(
+                    tensor, axis, mode="contiguous_allgather", **kwargs
                 )
             )
             ContextParallelScatterOp.apply = (
-                lambda tensor, axis, mode: scatter_apply(
-                    tensor, axis, mode="contiguous_allgather"
+                lambda tensor, axis, mode, **kwargs: scatter_apply(
+                    tensor, axis, mode="contiguous_allgather", **kwargs
                 )
             )
 

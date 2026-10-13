@@ -2320,6 +2320,18 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # calculate_per_token_loss: reject layouts whose token count is not
+        # handled yet, instead of silently mis-scaling the loss.
+        if self.calculate_per_token_loss:
+            assert not self.sequence_parallel, (
+                "calculate_per_token_loss + sequence_parallel is unsupported: "
+                "T_global counts TP-sharded labels but is not reduced over TP, "
+                "so it would be ~tp times too small."
+            )
+            assert self.csa_compress_ratios is None, (
+                "calculate_per_token_loss + csa_compress_ratios is unsupported: "
+                "the per-token normalisation has not been validated for CSA."
+            )
         # ``True`` predates the "hf" target and has always meant Megatron, so
         # canonicalize it to the explicit name; every falsy spelling collapses to
         # False. An unknown target raises rather than falling back to the default

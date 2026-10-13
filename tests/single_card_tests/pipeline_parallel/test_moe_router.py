@@ -32,6 +32,10 @@ Covered (all runnable on CPU, no collectives, no ``world_size`` faking):
     selection: for each expert only its highest-scoring tokens survive, and any
     token that was not originally selected (score 0) is zeroed (checked against
     an independent numpy reference).
+  * ``StandardMoERouter._cal_seq_aux_loss`` - single-rank (tp=cp=1) line
+    aggregation on the plain branch: equal-weight line mean on the legacy path
+    versus the token-weighted line sum under ``calculate_per_token_loss`` with
+    more than one line.
 
 The pure math methods are invoked as real *unbound* methods with a minimal
 stand-in ``self`` that only carries the data attributes they read
@@ -48,6 +52,7 @@ orchestration, not cross-rank semantics.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -83,6 +88,9 @@ class _RouterStub:
 
     def __init__(self, num_experts):
         self.num_experts = num_experts
+        # _cal_aux_loss now reads getattr(self.config, "calculate_per_token_loss",
+        # False); give the stub a config so the guard sees the legacy (False) path.
+        self.config = SimpleNamespace(calculate_per_token_loss=False)
 
 
 @unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
@@ -387,6 +395,211 @@ class TestProbsDropPolicy(unittest.TestCase):
             [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=np.float32
         )
         np.testing.assert_array_equal(out.numpy(), expected)
+
+
+class _SeqAuxRouterStub:
+    """``self`` for ``_cal_seq_aux_loss`` on the single-rank (tp=cp=1) path.
+
+    Carries only the data attributes that method reads. ``routing_type`` is
+    checked by the caller, not inside the method, so it is not needed here.
+    """
+
+    def __init__(self, num_experts, per_token):
+        self.num_experts = num_experts
+        self.use_accuracy_compatible = False
+        self.tensor_model_parallel_size = 1
+        self.context_parallel_size = 1
+        self.sequence_parallel = False
+        self.config = SimpleNamespace(
+            sequence_parallel=False,
+            experimental_dataflow=False,
+            pad_token_id=0,
+            gpt_model_use_experimental_version=False,
+            calculate_per_token_loss=per_token,
+        )
+
+
+@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
+class TestCalSeqAuxLossPerLineWeighting(unittest.TestCase):
+    """``_cal_seq_aux_loss`` line aggregation on the plain branch (neither
+    ``use_accuracy_compatible`` nor ``gpt_model_use_experimental_version``).
+
+    Each line ``b`` gets its own O(1) value
+    ``m_b = (E/K) * sum_e f_be * P_be / t_b**2``, where ``t_b`` is that line's
+    non-padded token count. The two aggregations differ only when the lines hold
+    different numbers of valid tokens:
+      * legacy / non-per-token: ``mean_b(m_b)``; under
+        ``calculate_per_token_loss`` that mean is then multiplied by
+        ``sum_b t_b``, giving ``mean_b(m_b) * sum_b t_b``.
+      * ``calculate_per_token_loss`` with B > 1: the exact token-weighted sum
+        ``sum_b m_b * t_b``, which is what the trainer's single 1/T_global
+        expects.
+    Expected values come from an independent numpy computation, never from the
+    code under test. Only the single-rank path is exercised; the TP/CP gathers
+    stay out of scope (see the module docstring).
+    """
+
+    E = 4
+    K = 2
+
+    def setUp(self):
+        paddle.set_device("cpu")
+
+    @staticmethod
+    def _inputs():
+        """Deterministic ragged batch: line 0 has 3 valid tokens, line 1 has 1."""
+        ids = np.array([[1, 1, 1, 0], [1, 0, 0, 0]], dtype=np.int64)
+        probs = np.zeros((2, 4, 4), dtype=np.float32)
+        probs[0, 0] = [0.4, 0.3, 0.2, 0.1]
+        probs[0, 1] = [0.1, 0.5, 0.3, 0.1]
+        probs[0, 2] = [0.25, 0.25, 0.25, 0.25]
+        probs[1, 0] = [0.7, 0.1, 0.1, 0.1]
+        routing = np.zeros((2, 4, 4), dtype=np.float32)
+        routing[0, 0, [0, 1]] = 1.0
+        routing[0, 1, [1, 2]] = 1.0
+        routing[0, 2, [0, 3]] = 1.0
+        routing[1, 0, [0, 1]] = 1.0
+        return ids, probs, routing
+
+    @classmethod
+    def _per_line_reference(cls, ids, probs, routing):
+        """``m_b`` per line plus each line's token count, by independent numpy."""
+        t = (ids != 0).sum(-1).astype(np.float64)
+        f = routing.sum(1).astype(np.float64)
+        p = probs.sum(1).astype(np.float64)
+        cost = f / (t[:, None] * (cls.K / cls.E))
+        return (cost * p / t[:, None]).sum(1), t
+
+    def _call(self, ids, probs, routing, per_token):
+        bsz, seq_len = ids.shape
+        return float(
+            StandardMoERouter._cal_seq_aux_loss(
+                _SeqAuxRouterStub(self.E, per_token),
+                paddle.to_tensor(probs.reshape(bsz * seq_len, self.E)),
+                self.K,
+                paddle.to_tensor(routing.reshape(bsz * seq_len, self.E)),
+                seq_len,
+                bsz,
+                input_ids=paddle.to_tensor(ids),
+            )
+        )
+
+    def test_per_token_ragged_lines_use_token_weighted_sum(self):
+        ids, probs, routing = self._inputs()
+        m, t = self._per_line_reference(ids, probs, routing)
+        weighted = float((m * t).sum())
+        mean_form = float(m.mean() * t.sum())
+        # The two aggregations must actually disagree here, otherwise this test
+        # would pass for the wrong reason.
+        self.assertGreater(abs(mean_form - weighted) / weighted, 1e-3)
+        got = self._call(ids, probs, routing, per_token=True)
+        self.assertAlmostEqual(got / weighted, 1.0, places=5)
+
+    def test_per_token_equal_lines_agree_with_mean_form(self):
+        # Both lines hold 2 valid tokens -> the weighting is a no-op.
+        ids, probs, routing = self._inputs()
+        ids = np.array([[1, 1, 0, 0], [1, 1, 0, 0]], dtype=np.int64)
+        probs[0, 2] = 0.0
+        routing[0, 2] = 0.0
+        probs[1, 1] = [0.2, 0.2, 0.3, 0.3]
+        routing[1, 1, [2, 3]] = 1.0
+        m, t = self._per_line_reference(ids, probs, routing)
+        got = self._call(ids, probs, routing, per_token=True)
+        self.assertAlmostEqual(got / float((m * t).sum()), 1.0, places=5)
+        self.assertAlmostEqual(got / float(m.mean() * t.sum()), 1.0, places=5)
+
+    def test_per_token_single_line_keeps_mean_times_total(self):
+        # B == 1: the per-line weighting is skipped, so the value stays on the
+        # original mean-then-multiply path.
+        ids, probs, routing = self._inputs()
+        ids, probs, routing = ids[:1], probs[:1], routing[:1]
+        m, t = self._per_line_reference(ids, probs, routing)
+        got = self._call(ids, probs, routing, per_token=True)
+        self.assertAlmostEqual(got / float(m.mean() * t.sum()), 1.0, places=5)
+
+    def test_legacy_path_still_averages_lines_equally(self):
+        ids, probs, routing = self._inputs()
+        m, _ = self._per_line_reference(ids, probs, routing)
+        got = self._call(ids, probs, routing, per_token=False)
+        self.assertAlmostEqual(got / float(m.mean()), 1.0, places=5)
+
+    def test_per_token_without_input_ids_scales_by_seq_len_times_batch(self):
+        # No input_ids: every position is valid, so the mean is multiplied by
+        # S * B instead of the per-line token counts.
+        ids, probs, routing = self._inputs()
+        bsz, seq_len = ids.shape
+
+        def call(per_token):
+            return float(
+                StandardMoERouter._cal_seq_aux_loss(
+                    _SeqAuxRouterStub(self.E, per_token),
+                    paddle.to_tensor(probs.reshape(bsz * seq_len, self.E)),
+                    self.K,
+                    paddle.to_tensor(routing.reshape(bsz * seq_len, self.E)),
+                    seq_len,
+                    bsz,
+                )
+            )
+
+        legacy = call(False)
+        self.assertAlmostEqual(
+            call(True) / (legacy * seq_len * bsz), 1.0, places=5
+        )
+
+
+@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
+class TestPerTokenZLossAndAuxGuard(unittest.TestCase):
+    """``calculate_per_token_loss`` on ``_cal_z_loss`` / ``_cal_aux_loss``."""
+
+    def setUp(self):
+        paddle.set_device("cpu")
+
+    @staticmethod
+    def _stub(per_token):
+        stub = _RouterStub(num_experts=3)
+        stub.config = SimpleNamespace(
+            calculate_per_token_loss=per_token,
+            sequence_parallel=False,
+            experimental_dataflow=False,
+            pad_token_id=0,
+            gpt_model_use_experimental_version=False,
+        )
+        return stub
+
+    def test_z_loss_per_token_is_raw_masked_sum(self):
+        logits_np = np.array(
+            [[0.1, 0.5, -0.2], [1.0, 0.0, 0.3], [0.2, 0.2, 0.2]],
+            dtype=np.float32,
+        )
+        ids = np.array([[5, 7, 0]], dtype=np.int64)  # last token is padding
+        mask = (ids.reshape(-1) != 0).astype(np.float64)
+        lse = np.log(np.exp(logits_np.astype(np.float64)).sum(-1))
+        raw = float((lse**2 * mask).sum())
+
+        def call(per_token):
+            return float(
+                StandardMoERouter._cal_z_loss(
+                    self._stub(per_token),
+                    paddle.to_tensor(logits_np),
+                    input_ids=paddle.to_tensor(ids),
+                )
+            )
+
+        self.assertAlmostEqual(call(True) / raw, 1.0, places=5)
+        self.assertAlmostEqual(call(False) / (raw / mask.sum()), 1.0, places=5)
+
+    def test_z_loss_per_token_requires_input_ids(self):
+        logits = paddle.randn([3, 3], dtype="float32")
+        with self.assertRaisesRegex(AssertionError, "input_ids"):
+            StandardMoERouter._cal_z_loss(self._stub(True), logits)
+        # Legacy path still accepts a missing input_ids.
+        StandardMoERouter._cal_z_loss(self._stub(False), logits)
+
+    def test_aux_loss_rejects_per_token(self):
+        gates = paddle.full([2, 3], 1.0 / 3.0, dtype="float32")
+        mask = paddle.ones([2, 3], dtype="int64")
+        with self.assertRaisesRegex(AssertionError, "seq_aux_loss"):
+            StandardMoERouter._cal_aux_loss(self._stub(True), gates, mask)
 
 
 if __name__ == "__main__":

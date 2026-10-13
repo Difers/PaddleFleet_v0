@@ -64,6 +64,21 @@ if is_flash_mask_available():
         ) from exc
 
 
+# Global calculate_per_token_loss switch, set once by the trainer and read by
+# ContextParallelScatterOp.backward (a stateless PyLayer, hence module-level).
+_PER_TOKEN_GRAD_SCALE = False
+
+
+def set_per_token_grad_scale(enabled):
+    """Enable/disable per-token gradient scaling in the CP scatter backward."""
+    global _PER_TOKEN_GRAD_SCALE
+    _PER_TOKEN_GRAD_SCALE = bool(enabled)
+
+
+def _per_token_grad_scale_enabled():
+    return _PER_TOKEN_GRAD_SCALE
+
+
 def mark_context_parallel_parameter_disable_scale_grad(param_or_layer):
     """
     Mark parameters or layers to disable context parallel gradient scaling.
@@ -540,9 +555,18 @@ class ContextParallelScatterOp(PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, axis=0, mode="dualchunk_allgather"):
+    def forward(
+        ctx,
+        input_tensor,
+        axis=0,
+        mode="dualchunk_allgather",
+        scale_grad_by_cp=False,
+    ):
         ctx.axis = axis
         ctx.mode = mode
+        # Only embedding-output call sites pass True; it takes effect only when
+        # the global per-token switch is also on. See backward.
+        ctx.scale_grad_by_cp = scale_grad_by_cp
         hcg = fleet.get_hybrid_communicate_group()
 
         assert hcg.get_context_parallel_world_size() > 1, (
@@ -560,10 +584,26 @@ class ContextParallelScatterOp(PyLayer):
     @staticmethod
     def backward(ctx, grad_output):
         if ctx.mode.startswith("contiguous"):
-            return all_gather_contiguous(
+            grad = all_gather_contiguous(
                 grad_output, group=ctx.group, axis=ctx.axis
             )
-        return all_gather_balance(grad_output, axis=ctx.axis, group=ctx.group)
+        else:
+            grad = all_gather_balance(
+                grad_output, axis=ctx.axis, group=ctx.group
+            )
+        # Per-token loss: after the all-gather every CP rank holds the same
+        # full-sequence grad, so the embedding weight would be counted cp times
+        # by the SUM grad reduce. Divide by the CP size.
+        if (
+            getattr(ctx, "scale_grad_by_cp", False)
+            and _per_token_grad_scale_enabled()
+        ):
+            nranks = getattr(ctx.group, "nranks", 1)
+            if nranks and nranks > 1:
+                # ``grad`` is a freshly allocated all-gather output that nothing
+                # else aliases, so scale in place to avoid a full-size temporary.
+                grad.scale_(1.0 / nranks)
+        return grad
 
 
 class ContextParallelGatherOp(PyLayer):

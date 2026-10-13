@@ -312,5 +312,29 @@ class TestGetAccessor(unittest.TestCase):
         self.assertEqual(cfg.get("definitely_not_a_field", 42), 42)
 
 
+@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
+class TestPerTokenLossValidation(unittest.TestCase):
+    """calculate_per_token_loss rejects layouts whose token count is unhandled."""
+
+    def test_rejects_sequence_parallel(self):
+        # SP is silently dropped at tp=1, so use tp=2 to keep it on.
+        with self.assertRaisesRegex(AssertionError, "sequence_parallel"):
+            _make_config(
+                calculate_per_token_loss=True,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            )
+
+    def test_rejects_csa_compress_ratios(self):
+        with self.assertRaisesRegex(AssertionError, "csa_compress_ratios"):
+            _make_config(
+                calculate_per_token_loss=True, csa_compress_ratios=[0, 0]
+            )
+
+    def test_plain_layout_accepted(self):
+        cfg = _make_config(calculate_per_token_loss=True)
+        self.assertTrue(cfg.calculate_per_token_loss)
+
+
 if __name__ == "__main__":
     unittest.main()

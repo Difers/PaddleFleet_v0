@@ -803,6 +803,11 @@ class StandardMoERouter(nn.Layer):
 
         """
         # TODO: @DrownFish19 update aux_loss for Qwen2MoE and DeepSeekV2&V3
+        assert not getattr(self.config, "calculate_per_token_loss", False), (
+            "calculate_per_token_loss only supports routing_type='seq_aux_loss': "
+            "this aux loss is a local mean with no valid-token count to scale "
+            "it to a sum."
+        )
         me = paddle.mean(gates, axis=0)
         ce = paddle.mean(mask.cast("float32"), axis=0)
         aux_loss = paddle.sum(me * ce) * float(self.num_experts)
@@ -960,6 +965,10 @@ class StandardMoERouter(nn.Layer):
         else:
             denom = paddle.to_tensor(float(max_seq_len), dtype="float32")
 
+        # True when the plain branch already applied per-line token weighting,
+        # so the per-token scaling at the end must be skipped.
+        per_token_line_weighted = False
+
         if getattr(self.config, "gpt_model_use_experimental_version", False):
             # Align with ernie: divide by S first, then multiply by E/K (two-step to match float order)
             # [B, E]
@@ -1012,12 +1021,39 @@ class StandardMoERouter(nn.Layer):
                         top_k / self.num_experts, dtype="float32"
                     )
                 )
-                # [B, E] -> [B] -> []
-                seq_aux_loss = (
-                    (cost_coeff * all_probs.sum(axis=seq_axis) / denom)
-                    .sum(axis=1)
-                    .mean()
+                # [B, E] -> [B]: per-line aux, normalised by that line's tokens.
+                per_line_aux = (
+                    cost_coeff * all_probs.sum(axis=seq_axis) / denom
+                ).sum(axis=1)
+                # Per-token with B > 1 and per-line denom: weight each line by
+                # its own token count (exact token-weighted sum) instead of
+                # mean x total below.
+                per_token_line_weighted = (
+                    getattr(self.config, "calculate_per_token_loss", False)
+                    and input_ids is not None
+                    and batch_size > 1
                 )
+                if per_token_line_weighted:
+                    # [B] -> []
+                    seq_aux_loss = (per_line_aux * denom.squeeze(-1)).sum()
+                else:
+                    # [B] -> []
+                    seq_aux_loss = per_line_aux.mean()
+        if (
+            getattr(self.config, "calculate_per_token_loss", False)
+            and not per_token_line_weighted
+        ):
+            # Per-token: seq_aux_loss is a token mean; scale it by the
+            # microbatch's valid-token count so the trainer's 1/T_global keeps
+            # router_aux_loss_coef unchanged (Megatron's
+            # aux_loss_scale_num_tokens). The experimental-version branch uses
+            # mean-over-lines x total, which is approximate when lines have
+            # different valid-token counts.
+            if input_ids is not None:
+                per_token_total = token_count_per_line.sum()
+            else:
+                per_token_total = denom * float(batch_size)
+            seq_aux_loss = seq_aux_loss * per_token_total
         return seq_aux_loss
 
     def _cal_z_loss(
@@ -1074,7 +1110,17 @@ class StandardMoERouter(nn.Layer):
             l_zloss = (
                 logits.logsumexp(1).square() * loss_mask
             ).sum() / paddle.clip(denom, min=1e-6)
+            if getattr(self.config, "calculate_per_token_loss", False):
+                # Per-token: undo the 1/denom to get the raw masked sum; the
+                # trainer applies 1/T_global.
+                l_zloss = l_zloss * denom
         else:
+            assert not getattr(
+                self.config, "calculate_per_token_loss", False
+            ), (
+                "calculate_per_token_loss + router_z_loss requires input_ids "
+                "to provide the valid-token count."
+            )
             l_zloss = paddle.logsumexp(logits, axis=1).square().mean()
 
         return l_zloss

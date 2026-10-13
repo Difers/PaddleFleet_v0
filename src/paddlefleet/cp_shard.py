@@ -128,19 +128,29 @@ def embedding_grad_is_cp_gathered(config):
     )
 
 
-def to_cp_local(x, config, axis=1):
+def to_cp_local(x, config, axis=1, scale_grad_by_cp=False):
     """Move ``x`` from global to local sequence coordinates.
 
     The caller asserts that ``x`` is global and that its global work is done.
     Returns ``x`` unchanged when it is ``None``, ``cp_size == 1``, or the batch
     was sharded by the loader. Not idempotent -- see the module docstring.
+
+    ``scale_grad_by_cp`` is for embedding outputs under
+    ``calculate_per_token_loss``: the scatter backward all-gathers the
+    gradient, so every rank ends up holding the full-length gradient and the
+    pure-SUM grad reduce of that path would count it ``cp`` times. Only the
+    ``"scatter"`` implementation needs it; the others hand back this rank's
+    share only. See ``ContextParallelScatterOp.backward``.
     """
     if x is None:
         return x
     source = cp_shard_source(config)
     if source == "scatter":
         return ContextParallelScatterOp.apply(
-            x, axis=axis, mode=config.cp_balance_mode
+            x,
+            axis=axis,
+            mode=config.cp_balance_mode,
+            scale_grad_by_cp=scale_grad_by_cp,
         )
     if source == "local":
         return extract_local_cp_chunks(
