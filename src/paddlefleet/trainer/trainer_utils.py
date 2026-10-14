@@ -1690,6 +1690,7 @@ def init_optimizer(optimizer, model_sharded_state_dict, state_dict_metadata):
         ".w_0",
     ]
     inner_opt = getattr(optimizer, "_inner_opt", None)
+
     static_to_struct_mapping = {}
     model_sharded_state_dict = dict(sorted(model_sharded_state_dict.items()))
     for k, v in model_sharded_state_dict.items():

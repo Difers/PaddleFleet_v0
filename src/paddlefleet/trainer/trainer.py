@@ -5573,7 +5573,17 @@ class Trainer:
             info = muon_info_map.get(param.name)
             if info is None and not param.stop_gradient:
                 missing.append(name)
-            param.use_muon = bool(info is not None and info.use_muon)
+            use_muon = bool(info is not None and info.use_muon)
+            use_hyperball = bool(
+                info is not None and getattr(info, "use_hyperball", False)
+            )
+            # Hyperball (AdamH, e.g. lm_head) must stay keep-whole just like Muon:
+            # its projection needs the full-matrix ||W||_F, matching stage1's
+            # keep_whole = use_muon or use_hyperball. If sliced as fused AdamW the
+            # Muon optimizer only sees fuse_params_* buffers, misses the
+            # muon_param_info_map and silently degrades to plain AdamW (no
+            # projection) -> loss diverges from stage1.
+            param.use_muon = use_muon or use_hyperball
         if missing:
             raise ValueError(
                 f"muon_param_info_map misses trainable params: {missing[:8]}"
