@@ -23,6 +23,8 @@ like shared experts, dense-MoE hybrid layers, and MTP (Multi-Token Prediction).
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from paddlefleet.transformer.dsa_layout import is_dsa_skip_topk_layer
+
 
 @dataclass
 class MoEAOAConfigParams:
@@ -63,6 +65,9 @@ class MoEAOAConfigParams:
     model_prefix: str = "model."
 
     index_n_heads: int = 0
+    indexer_types: List[str] | None = None
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 0
 
     # Only magic send builds the MTP layers' own ``mtp_embed`` table.
     enable_mtp_magic_send: bool = False
@@ -82,7 +87,7 @@ class MoEAOAConfigGenerator:
         class GlmMoeDsaAOAGenerator(MoEAOAConfigGenerator):
             def _get_attention_statements(self, params, layer_idx, prefix, fleet_prefix):
                 if params.multi_latent_attention:
-                    return self._get_mla_attention_statements(params, prefix, fleet_prefix)
+                    return self._get_mla_attention_statements(params, layer_idx, prefix, fleet_prefix)
                 return super()._get_attention_statements(params, layer_idx, prefix, fleet_prefix)
     """
 
@@ -111,6 +116,26 @@ class MoEAOAConfigGenerator:
         if num_experts is None:
             num_experts = getattr(config, "num_experts", None) or 0
 
+        # DSA providers hold the HF fields under their transform_rules names.
+        index_n_heads = getattr(config, "index_n_heads", None)
+        if index_n_heads is None:
+            index_n_heads = getattr(config, "dsa_index_n_heads", 0)
+        if index_n_heads is None:
+            index_n_heads = 0
+
+        indexer_types = getattr(config, "indexer_types", None)
+        if indexer_types is None:
+            indexer_types = getattr(config, "dsa_indexer_types", None)
+
+        index_topk_freq = getattr(config, "index_topk_freq", None)
+        if index_topk_freq is None:
+            index_topk_freq = getattr(config, "dsa_indexer_topk_freq", 1)
+        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", None)
+        if index_skip_topk_offset is None:
+            index_skip_topk_offset = getattr(
+                config, "dsa_indexer_skip_topk_offset", 0
+            )
+
         return MoEAOAConfigParams(
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
@@ -135,7 +160,11 @@ class MoEAOAConfigGenerator:
             use_qk_norm=getattr(config, "use_qk_norm", False),
             has_shared_experts=cls._has_shared_experts(config),
             model_prefix=cls._get_model_prefix(config),
-            index_n_heads=getattr(config, "index_n_heads", 0),
+            # Providers hold these HF fields under their transform_rules names.
+            index_n_heads=index_n_heads,
+            indexer_types=indexer_types,
+            index_topk_freq=index_topk_freq,
+            index_skip_topk_offset=index_skip_topk_offset,
             enable_mtp_magic_send=getattr(
                 config, "enable_mtp_magic_send", False
             ),
@@ -390,7 +419,7 @@ class MoEAOAConfigGenerator:
         """
         if params.multi_latent_attention:
             return cls._get_mla_attention_statements(
-                params, prefix, fleet_prefix
+                params, layer_idx, prefix, fleet_prefix
             )
         return cls._get_standard_attention_statements(
             params, prefix, fleet_prefix
@@ -413,8 +442,42 @@ class MoEAOAConfigGenerator:
         return statements
 
     @classmethod
+    def _indexer_type_for_layer(
+        cls, params: MoEAOAConfigParams, layer_idx: int
+    ) -> str:
+        """Resolve DSA indexer type for a layer.
+
+        ``indexer_types`` describes decoder layers only (length =
+        ``num_hidden_layers``). MTP layers (layer_idx >= num_hidden_layers)
+        own a full indexer in the official checkpoint even when the last
+        decoder entry is ``shared``.
+        """
+        if params.num_hidden_layers and layer_idx >= params.num_hidden_layers:
+            return "full"
+        if params.indexer_types is None:
+            return (
+                "shared"
+                if is_dsa_skip_topk_layer(
+                    layer_idx + 1,
+                    params.index_skip_topk_offset,
+                    params.index_topk_freq,
+                )
+                else "full"
+            )
+        if not 0 <= layer_idx < len(params.indexer_types):
+            raise ValueError(
+                f"indexer_types has no entry for decoder layer {layer_idx}; "
+                f"length is {len(params.indexer_types)}"
+            )
+        return params.indexer_types[layer_idx]
+
+    @classmethod
     def _get_mla_attention_statements(
-        cls, params: MoEAOAConfigParams, prefix: str, fleet_prefix: str
+        cls,
+        params: MoEAOAConfigParams,
+        layer_idx: int,
+        prefix: str,
+        fleet_prefix: str,
     ) -> List[str]:
         """Generate Multi-Latent Attention (MLA) statements.
 
@@ -436,6 +499,15 @@ class MoEAOAConfigGenerator:
             )
 
         if params.index_n_heads and params.index_n_heads > 0:
+            indexer_type = cls._indexer_type_for_layer(params, layer_idx)
+            if indexer_type not in {"full", "shared"}:
+                raise ValueError(
+                    f"Unsupported indexer type {indexer_type!r} for layer {layer_idx}; "
+                    "expected 'full' or 'shared'"
+                )
+            if indexer_type == "shared":
+                return statements
+
             indexer_weights = [
                 "wq_b",
                 "wk",
@@ -807,7 +879,9 @@ class MoEAOAConfigGenerator:
                 cls._get_inv_grouped_gemm_layer_statements(params, fleet_prefix)
             )
 
-            # MoE expert weight inversion
+            # MoE expert weight inversion. For MTP layers the live module tree
+            # is fleet_prefix=...transformer_layer, but the official HF layout
+            # is model.layers.{L}.mlp.experts.* (no transformer_layer infix).
             statements.extend(
                 cls._get_inv_moe_expert_statements(params, prefix, fleet_prefix)
             )
@@ -827,7 +901,7 @@ class MoEAOAConfigGenerator:
         """Generate inverse attention-related statements."""
         if params.multi_latent_attention:
             return cls._get_inv_mla_attention_statements(
-                params, prefix, fleet_prefix
+                params, layer_idx, prefix, fleet_prefix
             )
         return cls._get_inv_standard_attention_statements(
             params, prefix, fleet_prefix
@@ -858,7 +932,11 @@ class MoEAOAConfigGenerator:
 
     @classmethod
     def _get_inv_mla_attention_statements(
-        cls, params: MoEAOAConfigParams, prefix: str, fleet_prefix: str
+        cls,
+        params: MoEAOAConfigParams,
+        layer_idx: int,
+        prefix: str,
+        fleet_prefix: str,
     ) -> List[str]:
         """Generate inverse Multi-Latent Attention (MLA) statements."""
         statements = [
@@ -877,6 +955,15 @@ class MoEAOAConfigGenerator:
             )
 
         if params.index_n_heads and params.index_n_heads > 0:
+            indexer_type = cls._indexer_type_for_layer(params, layer_idx)
+            if indexer_type not in {"full", "shared"}:
+                raise ValueError(
+                    f"Unsupported indexer type {indexer_type!r} for layer {layer_idx}; "
+                    "expected 'full' or 'shared'"
+                )
+            if indexer_type == "shared":
+                return statements
+
             indexer_weights = [
                 "wq_b",
                 "wk",

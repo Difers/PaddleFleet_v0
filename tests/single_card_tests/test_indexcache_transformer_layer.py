@@ -166,6 +166,7 @@ class TestIndexCacheTransformerLayerStateTransitions(unittest.TestCase):
                     layer_number=1,
                     full_recompute=False,
                     _docmask_meta_kwargs=lambda: {},
+                    _dsa_topk_holder_kwargs=lambda dict_args: {},
                     _forward_impl=forward_impl,
                 )
                 with (

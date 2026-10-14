@@ -127,6 +127,15 @@ class GlmMoeDsaConfig(PretrainedConfig):
 
     model_type = "glm_moe_dsa"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # Keep Fleet overrides and checkpoint fields in the same storage.
+    attribute_map = {
+        "num_classes": "num_labels",
+        "rotary_interleaved": "indexer_rope_interleave",
+        "dsa_indexer_topk_freq": "index_topk_freq",
+        "dsa_indexer_skip_topk_offset": "index_skip_topk_offset",
+        "dsa_indexer_types": "indexer_types",
+        "dsa_index_share_for_mtp_iteration": "index_share_for_mtp_iteration",
+    }
 
     def __init__(
         self,
@@ -144,6 +153,8 @@ class GlmMoeDsaConfig(PretrainedConfig):
         use_cache=True,
         rope_theta=10000.0,
         rope_scaling=None,
+        rope_interleave=False,
+        indexer_rope_interleave=None,
         attention_bias=False,
         attention_dropout=0.0,
         moe_intermediate_size=1408,
@@ -167,6 +178,10 @@ class GlmMoeDsaConfig(PretrainedConfig):
         fd_fallback=False,
         **kwargs,
     ):
+        # Official checkpoints keep rope_scaling null and use rope_parameters.
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if rope_parameters is None:
+            rope_parameters = rope_scaling
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -182,6 +197,12 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.rope_interleave = rope_interleave
+        self.indexer_rope_interleave = (
+            False
+            if indexer_rope_interleave is None
+            else indexer_rope_interleave
+        )
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.sliding_window = sliding_window
@@ -190,8 +211,17 @@ class GlmMoeDsaConfig(PretrainedConfig):
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        self.rope_parameters = self.rope_scaling
+        self.rope_parameters = rope_parameters
         standardize_rope_params(self, rope_theta=rope_theta)
+        self.rope_theta = self.rope_parameters["rope_theta"]
+        self.rotary_base = self.rope_theta
+        rope_type = self.rope_parameters["rope_type"]
+        self.rope_type = "rope" if rope_type == "default" else rope_type
+        # The top-level partial_rotary_factor owns this value on save/load.
+        if isinstance(self.rope_parameters, dict):
+            self.rope_parameters.pop("partial_rotary_factor", None)
+        if isinstance(self.rope_scaling, dict):
+            self.rope_scaling.pop("partial_rotary_factor", None)
         rope_config_validation(self)
 
         # MoE arguments
@@ -220,6 +250,8 @@ class GlmMoeDsaConfig(PretrainedConfig):
         super().__init__(
             **kwargs,
         )
+        # Serialize the official RoPE parameters, not their derived aliases.
+        self.register_unsavable_keys(["rotary_base", "rope_type"])
 
 
 __all__ = ["GlmMoeDsaConfig"]

@@ -1170,10 +1170,12 @@ class TestDSAIndexerLossLoggingHelperTrackMetrics(unittest.TestCase):
     def setUp(self):
         DSAIndexerLossLoggingHelper.tracker = {}
         DSAIndexerLossLoggingHelper.num_layers = None
+        DSAIndexerLossLoggingHelper.num_shared_layers = 0
 
     def tearDown(self):
         DSAIndexerLossLoggingHelper.tracker = {}
         DSAIndexerLossLoggingHelper.num_layers = None
+        DSAIndexerLossLoggingHelper.num_shared_layers = 0
 
     @patch.object(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker")
     def test_track_metrics_empty_tracker_noop(self, mock_reduce):
@@ -1217,6 +1219,34 @@ class TestDSAIndexerLossLoggingHelperTrackMetrics(unittest.TestCase):
         expected = 1.0
         self.assertAlmostEqual(
             total_loss_dict["indexer loss"].item(), expected, places=4
+        )
+
+    @patch.object(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker")
+    def test_track_metrics_excludes_shared_indexer_layers(self, mock_reduce):
+        """Shared DSA layers record no loss and must not dilute the average."""
+        config = SimpleNamespace(
+            num_hidden_layers=4,
+            num_nextn_predict_layers=0,
+            num_empty_layers_add_in_head=0,
+            dsa_index_share_for_mtp_iteration=False,
+            dsa_indexer_topk_freq=1,
+            dsa_indexer_skip_topk_offset=0,
+            dsa_indexer_types=["full", "shared", "full", "shared"],
+        )
+        DSAIndexerLossLoggingHelper.register_total_num_layers(config)
+        self.assertEqual(DSAIndexerLossLoggingHelper.num_shared_layers, 2)
+        for layer in (1, 3):
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                paddle.to_tensor(3.0, dtype="float32"),
+                layer_number=layer,
+                num_layers=4,
+            )
+        total_loss_dict = {}
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=1.0, iteration=1, total_loss_dict=total_loss_dict
+        )
+        self.assertAlmostEqual(
+            total_loss_dict["indexer loss"].item(), 3.0, places=4
         )
 
     @patch.object(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker")

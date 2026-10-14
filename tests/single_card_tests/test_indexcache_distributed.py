@@ -35,7 +35,25 @@ from paddlefleet.transformer.indexcache_state import apply_stop_gradient_mask
 class TestIndexCacheNativePipeline(unittest.TestCase):
     def test_gpt_uses_native_pipeline_forward(self):
         self.assertIn(PipelineLayer, GPTModel.__bases__)
-        self.assertIs(GPTModel.forward, PipelineLayer.forward)
+        # GPTModel.forward only wraps PipelineLayer.forward to drop the
+        # stage-local DSA top-k holder; IndexCache state passes through it.
+        state = apply_stop_gradient_mask(
+            tuple(paddle.ones([1]) for _ in range(3))
+        )
+        received = {"hidden": paddle.ones([1]), "indexcache_state": state}
+        seen = []
+
+        def native_forward(self, input, chunk_id=None):
+            seen.append(input)
+            return {**input, "_dsa_topk_holder": {}}
+
+        with patch.object(PipelineLayer, "forward", native_forward):
+            output = GPTModel.forward(object.__new__(GPTModel), received)
+
+        self.assertIsNot(seen[0], received)
+        self.assertEqual(seen[0].keys(), received.keys())
+        self.assertNotIn("_dsa_topk_holder", output)
+        self.assertIs(output["indexcache_state"], state)
 
     def test_native_codec_preserves_state_tensors_and_gradient_mask(self):
         for size in (3, 8):
@@ -122,7 +140,9 @@ class TestIndexCacheNativePipeline(unittest.TestCase):
                 model = self._build_model(
                     self._config(virtual_pipeline_model_parallel_size=vpp)
                 )
-                self.assertIs(model.forward.__func__, PipelineLayer.forward)
+                # Only the holder-dropping wrapper sits on top of the native
+                # PipelineLayer forward (see test_gpt_uses_native_pipeline_forward).
+                self.assertIs(model.forward.__func__, GPTModel.forward)
                 inputs = paddle.ones([2, 3])
                 inputs.stop_gradient = False
                 model(inputs).sum().backward()
