@@ -2179,6 +2179,27 @@ class MultiTokenPredictionLayer(FleetLayer):
             dict_args.pop("mtp_full_input_ids", None) if magic_send else None
         )
 
+        # clear_every_step_cache=false 时 erndata 数据流不下发 cu_seqlens_q, 从固定形状的
+        # flashmask 行(attn_mask_startend_row_indices)反推, 供 magic_send 的 packed-roll
+        # (_prepare_erndata_magic_decoder_input) 使用。反推值只保留在局部变量, 不写回
+        # dict_args: 本层末尾 return dict_args, 写回会让这个 [num_docs+1] 变长 tensor 重新
+        # 进入 pipeline dict(separate_mtp_headloss 下 PP 切分点可落在 MTP 层之后), 跨 p2p
+        # 复用形状缓存再次死锁。
+        recovered_cu_seqlens_q = dict_args.get("cu_seqlens_q")
+        if (
+            recovered_cu_seqlens_q is None
+            and getattr(self.config, "use_erndata", False)
+            and dict_args.get("attn_mask_startend_row_indices") is not None
+        ):
+            from paddlefleet.transformer.kimi_delta_attention import (
+                build_cu_seqlens,
+            )
+
+            _mask = dict_args["attn_mask_startend_row_indices"]
+            recovered_cu_seqlens_q = build_cu_seqlens(
+                _mask, _mask.shape[0], _mask.shape[2], keep_single_segment=True
+            ).astype("int32")
+
         # mHC + erndata: the backbone contract layer has already handed over
         # the pre-contraction multi-stream backbone output through
         # dict_args["mhc_multistream"]: [B*(K+1), S, n*h], K+1 slots
@@ -2204,7 +2225,7 @@ class MultiTokenPredictionLayer(FleetLayer):
             )
             decoder_input = self._prepare_erndata_magic_decoder_input(
                 mtp_full_input_ids,
-                dict_args.get("cu_seqlens_q"),
+                recovered_cu_seqlens_q,
             )
         else:
             tensor_list = paddle.split(hidden_states_concat, num_nextn + 1)

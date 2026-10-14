@@ -35,7 +35,7 @@ K = 2
 B, L, H = 1, 12, 4
 
 
-def _make_config(use_erndata, mtp_attention_flexible=False):
+def _make_config(use_erndata):
     return SimpleNamespace(
         num_nextn_predict_layers=K,
         mtp_load_weight_only=False,
@@ -46,32 +46,32 @@ def _make_config(use_erndata, mtp_attention_flexible=False):
         experimental_dataflow=False,
         separate_mtp_input=False,
         use_erndata=use_erndata,
-        mtp_attention_flexible=mtp_attention_flexible,
     )
 
 
-def _make_fake_layer(use_erndata, mtp_attention_flexible=False):
-    fake = SimpleNamespace(
-        config=_make_config(use_erndata, mtp_attention_flexible)
-    )
+def _make_fake_layer(use_erndata):
+    fake = SimpleNamespace(config=_make_config(use_erndata))
     fake._mtp_enabled = lambda is_mtp: HySparseTransformerLayer._mtp_enabled(
         fake, is_mtp
     )
     return fake
 
 
-def _make_dict_args(seq_len, mask_seq_len=None):
+def _make_dict_args(seq_len, mask_seq_len=None, with_mtp_masks=False):
     """dict_args as seen by the main decoder layer.
 
     hidden_states is the MTP (K+1)-way batch-dim stack in both styles;
     position_ids / mask carry seq_len entries (L for megatron, L+K for ernie5).
     Under mtp_attention_flexible the main mask already arrives at length L
-    while position_ids are still L+K, so ``mask_seq_len`` may differ.
-    input_ids stays None to keep the test free of fleet/CP process groups.
+    while position_ids are still L+K, so ``mask_seq_len`` may differ. The
+    switch is only visible to the layer indirectly: the collator emits
+    ``mtp_startend_row_indices_all`` only when it is on, and the layer keys the
+    K-trim skip off that key's presence (``with_mtp_masks``). input_ids stays
+    None to keep the test free of fleet/CP process groups.
     """
     if mask_seq_len is None:
         mask_seq_len = seq_len
-    return {
+    dict_args = {
         "hidden_states": paddle.randn([(K + 1) * B, L, H]),
         "position_ids": paddle.arange(seq_len)
         .reshape([1, seq_len])
@@ -81,6 +81,11 @@ def _make_dict_args(seq_len, mask_seq_len=None):
         ),
         "input_ids": None,
     }
+    if with_mtp_masks:
+        dict_args["mtp_startend_row_indices_all"] = paddle.full(
+            [B, K, mask_seq_len, 1], mask_seq_len, dtype="int32"
+        )
+    return dict_args
 
 
 class TestMegatronSkipsSeqTrims:
@@ -160,12 +165,14 @@ class TestMtpAttentionFlexibleSkipsMaskTrim:
     (mask_seq_len = max_seq_len - K) while input_ids / position_ids still
     carry L+K. Only the mask K-trim must be skipped -- trimming an
     already-length-L mask yields L-K and crashes DSv4 doc-mask packing
-    (startend_row_indices [B,1,L-K,1] vs hidden [B,1,L,1]).
+    (startend_row_indices [B,1,L-K,1] vs hidden [B,1,L,1]). The layer detects
+    the switch by the collator-emitted ``mtp_startend_row_indices_all`` key,
+    since mtp_attention_flexible itself is not a TransformerConfig field.
     """
 
     def test_position_ids_trimmed_mask_kept_full_length(self):
-        fake = _make_fake_layer(False, mtp_attention_flexible=True)
-        dict_args = _make_dict_args(L + K, mask_seq_len=L)
+        fake = _make_fake_layer(False)
+        dict_args = _make_dict_args(L + K, mask_seq_len=L, with_mtp_masks=True)
         ctx = HySparseTransformerLayer._mtp_split(fake, dict_args, is_mtp=False)
         assert ctx is not None
         assert dict_args["position_ids"].shape == [B, L]
@@ -174,8 +181,8 @@ class TestMtpAttentionFlexibleSkipsMaskTrim:
         assert ctx["attn_mask_mtp"] is None
 
     def test_restore_reassembles_position_ids_mask_stays_L(self):
-        fake = _make_fake_layer(False, mtp_attention_flexible=True)
-        dict_args = _make_dict_args(L + K, mask_seq_len=L)
+        fake = _make_fake_layer(False)
+        dict_args = _make_dict_args(L + K, mask_seq_len=L, with_mtp_masks=True)
         ctx = HySparseTransformerLayer._mtp_split(fake, dict_args, is_mtp=False)
         output = dict_args["hidden_states"]
         HySparseTransformerLayer._mtp_restore(fake, dict_args, output, ctx)

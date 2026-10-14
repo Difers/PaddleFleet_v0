@@ -971,8 +971,13 @@ class TransformerLayer(nn.Layer):
             # only the mask trim must be skipped -- trimming an already-length-L
             # mask by K yields L-K and crashes DSv4 doc-mask packing
             # (startend_row_indices [B,1,L-K,1] vs hidden [B,1,L,1]).
-            _mtp_mask_already_main_len = _mtp_is_megatron or getattr(
-                self.config, "mtp_attention_flexible", False
+            # mtp_attention_flexible 不是 TransformerConfig 字段(它只在
+            # ModelArguments / collator 侧, 从未同步到模型 config), 从 config 读会
+            # 恒为 False; 改为按数据判定: collator 只有在该开关打开时才下发
+            # ``mtp_startend_row_indices_all`` (collate.py), 故其存在于 dict_args 即
+            # 表示主 mask 已是长度 L。
+            _mtp_mask_already_main_len = _mtp_is_megatron or (
+                "mtp_startend_row_indices_all" in dict_args
             )
             if (
                 not self.config.experimental_dataflow
@@ -2728,9 +2733,11 @@ class HySparseTransformerLayer(TransformerLayer):
         # main mask already arrives at length L (MTP masks ship separately in
         # mtp_startend_row_indices_all), so the K-trim must be skipped --
         # trimming an already-length-L mask yields L-K and crashes DSv4
-        # doc-mask packing.
-        _mtp_mask_already_main_len = _mtp_is_megatron or getattr(
-            self.config, "mtp_attention_flexible", False
+        # doc-mask packing. mtp_attention_flexible is not a TransformerConfig
+        # field (config read would be always-False), so detect it by the
+        # collator-emitted mtp_startend_row_indices_all being present.
+        _mtp_mask_already_main_len = _mtp_is_megatron or (
+            "mtp_startend_row_indices_all" in dict_args
         )
         if (
             not self.config.experimental_dataflow

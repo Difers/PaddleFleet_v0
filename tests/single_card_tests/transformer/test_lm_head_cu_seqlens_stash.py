@@ -24,8 +24,10 @@ GPTLMHead.__new__.
 
 from __future__ import annotations
 
+import types
 import unittest
 
+import numpy as np
 import paddle
 
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
@@ -56,6 +58,24 @@ class TestLMHeadCuSeqlensStash(unittest.TestCase):
         head = GPTLMHead.__new__(GPTLMHead)
         head._stash_cu_seqlens_q({"hidden_states": None, "cu_seqlens_q": None})
         self.assertIsNone(LanguageLoss._cu_seqlens_q_stash)
+
+    def test_recover_from_mask_when_cu_seqlens_absent(self) -> None:
+        # clear_every_step_cache=False 时数据流不下发 cu_seqlens_q, LM head 从固定形状
+        # 的 flashmask 行反推 batch-flat doc 边界。
+        head = GPTLMHead.__new__(GPTLMHead)
+        head.config = types.SimpleNamespace(use_erndata=True)
+        # 单样本两个 doc [0,4) / [4,8) -> 反推 cu_seqlens_q 应为 [0, 4, 8]。
+        mask = paddle.to_tensor(
+            [[[[4], [4], [4], [4], [8], [8], [8], [8]]]], dtype="int32"
+        )
+        head._stash_cu_seqlens_q(
+            {"hidden_states": None, "attn_mask_startend_row_indices": mask}
+        )
+        self.assertIsNotNone(LanguageLoss._cu_seqlens_q_stash)
+        np.testing.assert_array_equal(
+            LanguageLoss._cu_seqlens_q_stash.numpy(),
+            np.array([0, 4, 8], dtype="int32"),
+        )
 
 
 if __name__ == "__main__":

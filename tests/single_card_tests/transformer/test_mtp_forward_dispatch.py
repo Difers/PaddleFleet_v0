@@ -117,6 +117,28 @@ class TestMtpForwardMegatron(unittest.TestCase):
             recorded["attn_mask"].numpy(), mask.numpy()
         )
 
+    def test_recovered_cu_seqlens_not_written_back(self) -> None:
+        # clear_every_step_cache=false: mask present, cu_seqlens_q absent. The
+        # recovered boundary must stay local and not re-enter the returned
+        # pipeline dict (otherwise the variable-length tensor would ride p2p
+        # again under separate_mtp_headloss).
+        K, S, H = 1, 8, 4
+        layer, _ = _make_layer(K)
+        hs = paddle.arange((K + 1) * S * H, dtype="float32").reshape(
+            [K + 1, S, H]
+        )
+        mask = paddle.to_tensor(
+            [[[[4], [4], [4], [4], [8], [8], [8], [8]]]], dtype="int32"
+        )
+        out = layer._forward_megatron_style(
+            {
+                "hidden_states": hs,
+                "attn_mask_startend_row_indices": mask,
+                "context": None,
+            }
+        )
+        self.assertNotIn("cu_seqlens_q", out)
+
     def test_absent_mask_raises(self) -> None:
         K, S, H = 2, 6, 4
         layer, _ = _make_layer(K)

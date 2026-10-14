@@ -389,6 +389,25 @@ class GPTLMHead(ColumnParallelLinear):
         the dict in GPTEmbedding.forward), so this is a no-op there.
         """
         cu_seqlens_q = dict_args.get("cu_seqlens_q", None)
+        if cu_seqlens_q is None and getattr(
+            getattr(self, "config", None), "use_erndata", False
+        ):
+            # clear_every_step_cache=False 时 cu_seqlens_q 不随 pipeline dict 传递
+            # (变长 tensor 跨 PP p2p 会死锁), 从固定形状的 flashmask 行反推 batch-flat
+            # doc 边界。attn_mask_startend_row_indices 与 cu_seqlens_q 同住 pipeline
+            # dict, 但形状固定, 不会触发形状缓存复用问题。mask 恒为 [B,1,L,1] 单列。
+            mask = dict_args.get("attn_mask_startend_row_indices", None)
+            if mask is not None:
+                from paddlefleet.transformer.kimi_delta_attention import (
+                    build_cu_seqlens,
+                )
+
+                cu_seqlens_q = build_cu_seqlens(
+                    mask,
+                    mask.shape[0],
+                    mask.shape[2],
+                    keep_single_segment=True,
+                ).astype("int32")
         if cu_seqlens_q is not None:
             from paddlefleet.models.common.language_loss.language_loss import (
                 LanguageLoss as _LangLoss,

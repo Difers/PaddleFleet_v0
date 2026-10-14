@@ -279,6 +279,31 @@ class TestGptEmbeddingMegatron(unittest.TestCase):
                     )
                     self.assertNotIn("mtp_decoder_inputs", out)
 
+    def test_recover_cu_seqlens_q_from_mask_when_absent(self) -> None:
+        # clear_every_step_cache=False 时数据流不下发 cu_seqlens_q, 组网侧从固定形状
+        # 的 flashmask 行反推 batch-flat doc 边界; 反推值不得写回 pipeline dict。
+        K, B, L, H = 1, 1, 8, 4
+        emb = _make_embedding(K, B, L, H)
+        emb.config.gpt_model_use_experimental_version = False
+        input_ids = paddle.arange(B * L, dtype="int64").reshape([B, L]).cuda()
+        # 单样本两个 doc [0,4) / [4,8): mask 行存各自 doc 的独占结束位置。
+        mask = paddle.to_tensor(
+            [[[[4], [4], [4], [4], [8], [8], [8], [8]]]], dtype="int32"
+        ).cuda()
+
+        out = emb.forward(
+            {"input_ids": input_ids, "attn_mask_startend_row_indices": mask}
+        )
+
+        # 反推出的 cu_seqlens_q 供 loss stage 使用, 且逐元素等于手推边界。
+        self.assertIsNotNone(LanguageLoss._cu_seqlens_q_stash)
+        np.testing.assert_array_equal(
+            LanguageLoss._cu_seqlens_q_stash.numpy(),
+            np.array([0, 4, 8], dtype="int32"),
+        )
+        # 反推值不得重新进入 pipeline dict(它是唯一变长 tensor)。
+        self.assertNotIn("cu_seqlens_q", out)
+
 
 class TestGptEmbeddingErnie5(unittest.TestCase):
     """ernie5 (non-megatron) MTP embedding path, single-card (no SP/CP).

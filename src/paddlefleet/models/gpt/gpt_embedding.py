@@ -407,6 +407,27 @@ class GPTEmbedding(FleetLayer):
         if cu_seqlens_q is not None and not cu_seqlens_q.place.is_gpu_place():
             cu_seqlens_q = cu_seqlens_q.cuda()
 
+        # clear_every_step_cache=False 时 erndata 数据流不下发 cu_seqlens_q(它是
+        # pipeline dict 里唯一的变长 tensor, 复用 p2p 形状缓存会死锁)。这里从固定形状的
+        # flashmask 行(attn_mask_startend_row_indices)反推等价的 batch-flat doc 边界,
+        # 并记住是「反推」来的: 反推出的 cu_seqlens_q 不得再写回 preproc_output, 否则又
+        # 会把变长 tensor 塞进 p2p。
+        # 注意: erndata 路径 mask 恒为 [B,1,L,1] 单列(build_cu_seqlens 要求 shape[-1]==1);
+        # 2 列的 experimental_dataflow 布局会在此 loud 抛 ValueError, 不会静默错。
+        _cu_seqlens_q_recovered = False
+        if (
+            getattr(self.config, "use_erndata", False)
+            and cu_seqlens_q is None
+            and attn_mask_startend_row_indices is not None
+        ):
+            cu_seqlens_q = build_cu_seqlens(
+                attn_mask_startend_row_indices,
+                attn_mask_startend_row_indices.shape[0],
+                attn_mask_startend_row_indices.shape[2],
+                keep_single_segment=True,
+            ).astype("int32")
+            _cu_seqlens_q_recovered = True
+
         # Stash cu_seqlens_q for the loss layer (use_erndata
         # per-doc parity path). LanguageLoss.forward reads this class-level
         # slot to drive per-doc `paddle.roll` with EOS zero-masking, matching
@@ -938,7 +959,9 @@ class GPTEmbedding(FleetLayer):
             # Packed magic-send metadata is explicit pipeline state. Unlike the
             # legacy magic path, no process-global MagicInstance is involved.
             "mtp_full_input_ids": mtp_full_input_ids,
-            "cu_seqlens_q": cu_seqlens_q,
+            # 反推出的 cu_seqlens_q 不得写回 pipeline dict(见上方注释), 否则变长 tensor
+            # 又会跨 PP p2p。置 None 后由下方 None 清理逻辑删除该 key。
+            "cu_seqlens_q": None if _cu_seqlens_q_recovered else cu_seqlens_q,
         }
         # New dataflow: pass mtp_startend_row_indices_all and mtp_hidden_inputs_mask_all
         # through dict_args to MTP layer. They must both be present or both be absent.
