@@ -1289,6 +1289,20 @@ class InternalMedicineCallback(TrainerCallback):
         # the distributed env is fully up by then.
         self._is_writer = None
         self._log_path_ready = False
+        # Consumers of each aggregated record besides the jsonl (e.g. an
+        # experiment tracker). See add_sink.
+        self._sinks = []
+
+    def add_sink(self, fn):
+        """Forward every aggregated record to ``fn(args, state, metrics)``.
+
+        ``metrics`` is the same ``{key: float}`` dict that becomes one jsonl
+        row (without ``global_step``; read it from ``state``). It is called on
+        every rank after the cross-rank aggregation, so it costs no extra
+        collective; the sink picks the rank that reports. A sink that raises is
+        logged and skipped, never allowed to fail the training step.
+        """
+        self._sinks.append(fn)
 
     @staticmethod
     def _normalize_monitors(monitors) -> list:
@@ -1357,6 +1371,16 @@ class InternalMedicineCallback(TrainerCallback):
         if not self._setup_done:
             return
 
+        # Monitors that read the optimizer step itself (optim_health) wrap the
+        # optimizer instance, which does not exist yet when monitors are set up
+        # in on_train_begin. Attaching is idempotent, so this is a no-op after
+        # the first step.
+        optimizer = kwargs.get("optimizer")
+        for monitor in self._monitor_dict.values():
+            attach = getattr(monitor, "attach_optimizer", None)
+            if attach is not None:
+                attach(optimizer)
+
         for monitor in self._monitor_dict.values():
             finalize = getattr(monitor, "finalize_scaled_grad_metrics", None)
             if finalize is not None:
@@ -1389,6 +1413,31 @@ class InternalMedicineCallback(TrainerCallback):
         if aggregated:
             self._training_logs.reset()
             self._maybe_write_jsonl(state, aggregated)
+            self._notify_sinks(args, state, aggregated)
+
+    def _notify_sinks(self, args, state, aggregated):
+        if not self._sinks:
+            return
+        metrics = self._scalar_metrics(aggregated)
+        for sink in self._sinks:
+            try:
+                sink(args, state, metrics)
+            except Exception as e:
+                logger.warning(
+                    f"[InternalMedicine] sink {sink!r} failed at "
+                    f"global_step={getattr(state, 'global_step', None)}: {e!r}"
+                )
+
+    @staticmethod
+    def _scalar_metrics(aggregated):
+        """``{key: float}`` in key order; non-scalar entries are skipped."""
+        metrics = {}
+        for k in sorted(aggregated.keys()):
+            try:
+                metrics[k] = float(aggregated[k])
+            except (TypeError, ValueError):
+                continue
+        return metrics
 
     def _sampled_this_step(self):
         """Whether any monitor sampled during the step that just finished."""
@@ -1513,15 +1562,9 @@ class InternalMedicineCallback(TrainerCallback):
                     os.makedirs(d, exist_ok=True)
                 self._log_path_ready = True
             record = {"global_step": int(getattr(state, "global_step", 0))}
-            for k in sorted(aggregated.keys()):
-                v = aggregated[k]
-                # Only JSON-serializable scalars; cast tensors/numpy to float.
-                try:
-                    record[k] = float(v)
-                except (TypeError, ValueError):
-                    # Skip non-scalar entries silently — the viewer only
-                    # plots scalar series anyway.
-                    continue
+            # Only JSON-serializable scalars; non-scalar entries are skipped
+            # silently — the viewer only plots scalar series anyway.
+            record.update(self._scalar_metrics(aggregated))
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:

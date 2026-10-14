@@ -38,6 +38,7 @@ AVAILABLE_MONITORS = {
         "kda_health",
         "dsa_health",
         "grad_health",
+        "optim_health",
     ],
 }
 

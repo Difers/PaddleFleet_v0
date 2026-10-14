@@ -277,6 +277,12 @@ tests:
   - test_case: [tests/multi_card_tests/test_fsdp_zcc.py]
     products:
       - num_gpus: 2
+  # optim_health reduction: mp=2, pp=2, ep=2 -> sharding=2, moe_sharding=2, so
+  # every group the internal-medicine monitor reduces over is larger than one.
+  # Fewer cards still run the file, with a subset of those axes covered.
+  - test_case: [tests/multi_card_tests/internal_medicine/test_optim_health_reduction.py]
+    products:
+      - num_gpus: 8
   # default fallback for remaining multi_card_tests
   - test_case: [tests/multi_card_tests/pipeline_parallel/*.py]
     products:

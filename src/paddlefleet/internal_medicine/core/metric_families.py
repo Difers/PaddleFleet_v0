@@ -163,6 +163,30 @@ METRIC_TAXONOMY: dict[str, dict] = {
             ("match", "与稠密 attn 的一致性", r"^attn_"),
         ),
     },
+    "optim_health": {
+        # Keys are ``<param>_<metric>`` per layer and ``model/<param>/<metric>``
+        # outside the layers, so every pattern anchors on the metric suffix.
+        # `expert` must precede `grad` / `lr`: `grad_rel_min` and `eff_lr_max`
+        # are the per-expert spreads of the same two quantities.
+        "families": (
+            (
+                "expert",
+                "按专家分布",
+                r"(grad_rel_(min|p10|median|max)|eff_lr_(min|median|max)|zero_grad_experts)$",
+            ),
+            (
+                "lr",
+                "有效学习率",
+                r"(eff_lr|eff_lr_ratio|aus|aus_over_lr|(^|/)lr)$",
+            ),
+            (
+                "grad",
+                "权重梯度",
+                r"(grad_norm|grad_rel|grad_norm_(dense|expert|total))$",
+            ),
+            ("param", "参数范数", r"(param_norm|norm_drift)$"),
+        ),
+    },
 }
 
 
