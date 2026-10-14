@@ -31,6 +31,10 @@ from paddlefleet.transformers.gemma4_moe.configuration import Gemma4MoeConfig
 from paddlefleet.transformers.gemma4_moe.modeling import Gemma4MoeForCausalLM
 from paddlefleet.transformers.glm4_moe.configuration import Glm4MoeConfig
 from paddlefleet.transformers.glm4_moe.modeling import Glm4MoePreTrainedModel
+from paddlefleet.transformers.glm_moe_dsa.configuration import GlmMoeDsaConfig
+from paddlefleet.transformers.glm_moe_dsa.modeling import (
+    GlmMoeDsaPreTrainedModel,
+)
 from paddlefleet.transformers.kimi_k3.configuration import KimiK3TextConfig
 from paddlefleet.transformers.kimi_k3.modeling import KimiK3PretrainedModel
 from paddlefleet.transformers.minimax_m2.configuration import MiniMaxM2Config
@@ -113,6 +117,28 @@ class TestGlm4MoeAoaConfig(_AoaConfigMixin, unittest.TestCase):
                 num_nextn_predict_layers=1,
             ),
         )
+
+
+class TestGlmMoeDsaAoaConfig(_AoaConfigMixin, unittest.TestCase):
+    def test_default_maps_mla_norms(self):
+        # Official config.json files do not set use_qk_norm, so the default
+        # decides whether the MLA q_a/kv_a layernorm weights are loaded.
+        config = GlmMoeDsaConfig(
+            num_hidden_layers=2,
+            n_routed_experts=2,
+            first_k_dense_replace=1,
+            multi_latent_attention=True,
+        )
+        self._check(GlmMoeDsaPreTrainedModel, config)
+        for meth in ("_gen_aoa_config", "_gen_inv_aoa_config"):
+            stmts = getattr(GlmMoeDsaPreTrainedModel, meth)(config)[
+                "aoa_statements"
+            ]
+            for norm in ("q_a_layernorm", "kv_a_layernorm"):
+                self.assertTrue(
+                    any(f"self_attn.{norm}.weight" in s for s in stmts),
+                    f"{meth} does not map {norm}",
+                )
 
 
 class TestKimiK3AoaConfig(_AoaConfigMixin, unittest.TestCase):
