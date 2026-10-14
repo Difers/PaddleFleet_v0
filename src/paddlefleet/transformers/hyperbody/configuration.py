@@ -452,7 +452,12 @@ class HyperBodyConfig(PretrainedConfig):
         # ===================== GLOBAL: cross-seam token ids =====================
         image_token_id: int = CONTEXT_TOKEN,
         video_token_id: int = VIDEO_TOKEN_SENTINEL,
-        hyperbody_context_token_id: int = CONTEXT_TOKEN,
+        # ``hyperbody_context_token_id`` is the live <context> placeholder id
+        # (the decoder/encoder views and the packed query counter read it).
+        # When not given it falls back to ``image_token_id`` -- the field that
+        # drove the placeholder id before this knob existed -- so old configs
+        # that only set ``image_token_id`` keep their semantics.
+        hyperbody_context_token_id: int | None = None,
         # ===================== GLOBAL: dtype / init policy (plain) =====================
         bf16: bool = True,
         calculate_per_token_loss: bool = False,
@@ -513,7 +518,14 @@ class HyperBodyConfig(PretrainedConfig):
         # ---- global plain fields (set before super, mirroring old flat order) ----
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
-        self.hyperbody_context_token_id = hyperbody_context_token_id
+        # Resolve once here so every consumer reads a concrete int (the
+        # None-fallback keeps pre-knob ``image_token_id``-only configs live,
+        # and the resolved value round-trips through serialization).
+        self.hyperbody_context_token_id = (
+            hyperbody_context_token_id
+            if hyperbody_context_token_id is not None
+            else image_token_id
+        )
         self.bf16 = bf16
         self.calculate_per_token_loss = calculate_per_token_loss
         self.bias_activation_fusion = bias_activation_fusion

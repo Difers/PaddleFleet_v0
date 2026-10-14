@@ -366,12 +366,15 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
 
     def _infer_use_long_query(self, input_ids, cu_seqlens):
         short_q, long_q = self.config.hyperencoder_query_lengths
+        ctx_token = getattr(
+            self.config, "hyperbody_context_token_id", CONTEXT_TOKEN
+        )
         bounds = [int(x) for x in cu_seqlens.reshape([-1]).tolist()]
         tokens = input_ids.reshape([-1])
         flags = []
         for start, end in zip(bounds[:-1], bounds[1:]):
             query_count = int(
-                (tokens[start:end] == CONTEXT_TOKEN).astype("int32").sum()
+                (tokens[start:end] == ctx_token).astype("int32").sum()
             )
             if query_count == long_q:
                 flags.append(True)
@@ -1095,7 +1098,8 @@ def _build_decoder_view(config: HyperBodyConfig):
         getattr(config, "_attn_implementation", None) or "default"
     )
     view.multimodal_embedding = True
-    view.image_token_id = config.image_token_id
+    # The <context> placeholder id is hyperbody_context_token_id
+    view.image_token_id = config.hyperbody_context_token_id
     view.video_token_id = config.video_token_id
     # Packed decoder RoPE gate: when the encoder runs packed, the decoder is fed
     # a real packed [1, ΣS] layout, so RoPE must restart per segment. The shared
@@ -1212,6 +1216,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     view = HyperEncoderProvider.from_config(enc_cfg)
     view.language_hidden_size = decoder_hidden
     view._attn_implementation = "eager"
+    view.hyperbody_context_token_id = config.hyperbody_context_token_id
     return view
 
 
