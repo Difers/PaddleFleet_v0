@@ -53,7 +53,7 @@ function run_tools_test() {
 }
 
 
-CODESTYLE_APPROVERS="SigureMo risemeup1 swgu98"
+CODESTYLE_APPROVERS="swgu98"
 CODESTYLE_FILES=(
     "ci/hooks"
     "_typos.toml"
@@ -90,7 +90,7 @@ for FILE in "${MODELCONFIG_FILES[@]}"; do
 done
 
 
-CUSTOMOP_APPROVERS="risemeup1 From00"
+CUSTOMOP_APPROVERS="From00"
 CUSTOMOP_DIR="packages/paddlefleet_ops/src/paddlefleet_ops/_extensions"
 HAS_MODIFIED_CUSTOMOP=$(git diff --name-only "${DIFF_BASE}" HEAD -- | grep "^${CUSTOMOP_DIR}/" || true)
 if [ "${HAS_MODIFIED_CUSTOMOP}" != "" ] && [ "${PR_ID}" != "" ]; then
@@ -101,7 +101,7 @@ fi
 
 
 
-CHECKREQ_APPROVERS="risemeup1 swgu98"
+CHECKREQ_APPROVERS="swgu98"
 files=$(git diff --name-status "${DIFF_BASE}" HEAD --)
 while read -r status file; do
     if [[ "$status" == "A" ]] && [[ "$(basename "$file")" == "requirements.txt" ]]; then
@@ -111,21 +111,6 @@ while read -r status file; do
     fi
 done <<< "$files"
 
-
-PACKAGING_APPROVERS="risemeup1 SigureMo"
-PACKAGING_PATTERNS=(
-    "^packages/"
-    "^build_backend\.py$"
-    "^pyproject\.toml$"
-)
-for PATTERN in "${PACKAGING_PATTERNS[@]}"; do
-    HAS_MODIFIED=$(git diff --name-only "${DIFF_BASE}" HEAD -- | grep "${PATTERN}" || true)
-    if [ "${HAS_MODIFIED}" != "" ] && [ "${PR_ID}" != "" ]; then
-        echo_line="You must be approved by one of ${PACKAGING_APPROVERS} for changes in packaging-related files (${PATTERN}).\n"
-        APPROVER_LIST=(${PACKAGING_APPROVERS})
-        check_approval 1 "${APPROVER_LIST[@]}"
-    fi
-done
 
 PACKAGES_APPROVERS="sneaxiy"
 PACKAGES_PATTERNS=(
@@ -138,6 +123,40 @@ for PATTERN in "${PACKAGES_PATTERNS[@]}"; do
     if [ "${HAS_MODIFIED}" != "" ] && [ "${PR_ID}" != "" ]; then
         echo_line="You must be approved by ${PACKAGES_APPROVERS} for changes in packaging-related files (${PATTERN}).\n"
         APPROVER_LIST=(${PACKAGES_APPROVERS})
+        check_approval 1 "${APPROVER_LIST[@]}"
+    fi
+done
+
+
+TRAINER_APPROVERS="From00"
+TRAINER_FILES=(
+    "src/paddlefleet/trainer/training_args.py"
+    "src/paddlefleet/cli/hparams/"
+)
+for FILE in "${TRAINER_FILES[@]}"; do
+    HAS_MODIFIED=$(git diff --name-only "${DIFF_BASE}" HEAD -- | grep "^${FILE}" || true)
+    if [ "${HAS_MODIFIED}" != "" ] && [ "${PR_ID}" != "" ]; then
+        echo_line="You must be approved by one of ${TRAINER_APPROVERS} for changes in ${FILE}.\n"
+        APPROVER_LIST=(${TRAINER_APPROVERS})
+        check_approval 1 "${APPROVER_LIST[@]}"
+    fi
+done
+
+
+REQUIREMENTS_APPROVERS="From00"
+# NOTE: The repo root `requirements.txt` does not exist yet (dependencies are
+# declared in `pyproject.toml`, which is already guarded by CODESTYLE_FILES and
+# PACKAGES_PATTERNS above). This rule is kept as a forward-looking guard so that
+# a newly added root `requirements.txt` is gated, matching the intent of the
+# formers rule it was migrated from. It matches nothing today by design.
+REQUIREMENTS_FILES=(
+    "requirements.txt"
+)
+for FILE in "${REQUIREMENTS_FILES[@]}"; do
+    HAS_MODIFIED=$(git diff --name-only "${DIFF_BASE}" HEAD -- | grep "^${FILE}" || true)
+    if [ "${HAS_MODIFIED}" != "" ] && [ "${PR_ID}" != "" ]; then
+        echo_line="You must be approved by one of ${REQUIREMENTS_APPROVERS} for changes in ${FILE}.\n"
+        APPROVER_LIST=(${REQUIREMENTS_APPROVERS})
         check_approval 1 "${APPROVER_LIST[@]}"
     fi
 done

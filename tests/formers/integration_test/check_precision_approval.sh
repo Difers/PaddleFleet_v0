@@ -27,7 +27,7 @@ echo_list=()
 
 function check_approval(){
     person_num=`echo $@|awk '{for (i=2;i<=NF;i++)print $i}'`
-    APPROVALS=`echo ${approval_line}|python ${PADDLE_ROOT}/tests/integration_test/check_pr_approval.py $1 $person_num`
+    APPROVALS=`echo ${approval_line}|python ${PADDLE_ROOT}/formers/integration_test/check_pr_approval.py $1 $person_num`
     if [[ "${APPROVALS}" != "TRUE" && "${echo_line}" != "" ]]; then
         add_failed "${failed_num}. ${echo_line}"
     fi
@@ -47,20 +47,10 @@ function run_tools_test() {
 }
 
 
-PRECISION_APPROVERS1="XieYunshen From00 risemeup1 tianlef zjjlivein"
-echo_line="You must be approved by one of ${PRECISION_APPROVERS1} for changing precision.\n"
-APPROVER_LIST1=(${PRECISION_APPROVERS1})
-check_approval 1 "${APPROVER_LIST1[@]}"
-
-PRECISION_APPROVERS2="lugimzzz zjjlivein tianlef"
-echo_line="You must be approved by one of ${PRECISION_APPROVERS2} for changing precision.\n"
-APPROVER_LIST2=(${PRECISION_APPROVERS2})
-check_approval 1 "${APPROVER_LIST2[@]}"
-
-PRECISION_APPROVERS3="tianlef swgu98 zjjlivein"
-echo_line="You must be approved by one of ${PRECISION_APPROVERS3} for changing precision.\n"
-APPROVER_LIST3=(${PRECISION_APPROVERS3})
-check_approval 1 "${APPROVER_LIST3[@]}"
+PRECISION_APPROVERS="XieYunshen swgu98"
+echo_line="You must be approved by one of ${PRECISION_APPROVERS} for changing precision.\n"
+APPROVER_LIST=(${PRECISION_APPROVERS})
+check_approval 1 "${APPROVER_LIST[@]}"
 
 
 if [ -n "${echo_list}" ];then
