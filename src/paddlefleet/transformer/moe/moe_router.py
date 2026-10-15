@@ -870,7 +870,15 @@ class StandardMoERouter(nn.Layer):
             else:
                 all_probs = probs
             # [B, S, E]
-            if self.context_parallel_size > 1:
+            # A replicated region already holds the global sequence: gathering
+            # all_probs would duplicate it cp times, and the cp x on
+            # local_seq_len would inflate the denominator. Together they scale
+            # the per-rank aux loss to 1/cp, while the region's other dense grads
+            # are replicated (factor 1) and the grad reduce is a MEAN -- so that
+            # 1/cp makes the load-balancing gradient cp x too weak.
+            if self.context_parallel_size > 1 and not getattr(
+                self.config, "cp_replicated_sequence", False
+            ):
                 all_probs = all_probs.reshape(
                     [
                         -1,
@@ -935,6 +943,7 @@ class StandardMoERouter(nn.Layer):
             if (
                 get_context_parallel_world_size() > 1
                 and self.config.experimental_dataflow
+                and not getattr(self.config, "cp_replicated_sequence", False)
             ):
                 # In EB data flow, we need to gather input_ids here to get right denom.
                 input_ids = ContextParallelGatherOp.apply(

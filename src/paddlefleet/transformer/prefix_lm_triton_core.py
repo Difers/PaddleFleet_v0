@@ -139,16 +139,6 @@ class PrefixLMTritonCore(FleetLayer):
             getattr(config, "hyperencoder_triton_plan_cache_size", 64)
         )
 
-        if (
-            pg_collection is not None
-            and getattr(pg_collection, "cp", None) is not None
-        ):
-            cp = pg_collection.cp
-            if getattr(cp, "nranks", 1) > 1:
-                raise RuntimeError(
-                    "PrefixLMTritonCore does not support context parallel"
-                )
-
     def _resolve_layout(
         self, seq_total: int, packed_seq_params
     ) -> SegmentLayout:

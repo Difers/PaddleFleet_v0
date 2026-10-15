@@ -98,11 +98,14 @@ class TestInit(unittest.TestCase):
         self.assertEqual(core.bwd_stages, 1)
         self.assertEqual(core.plan_cache_size, 0)
 
-    def test_context_parallel_rejected(self):
+    def test_context_parallel_accepted(self):
+        # The encoder trunk runs replicated under CP (no CP impl of its own), so
+        # constructing with cp>1 must succeed and keep context_parallel_size=1
+        # (the "run un-split" contract the surrounding SelfAttention reads).
         cp = types.SimpleNamespace(nranks=2)
         pg = types.SimpleNamespace(cp=cp)
-        with self.assertRaises(RuntimeError):
-            PrefixLMTritonCore(_cfg(head_dim=8), pg_collection=pg)
+        core = PrefixLMTritonCore(_cfg(head_dim=8), pg_collection=pg)
+        self.assertEqual(core.context_parallel_size, 1)
 
     def test_context_parallel_size_one_ok(self):
         cp = types.SimpleNamespace(nranks=1)

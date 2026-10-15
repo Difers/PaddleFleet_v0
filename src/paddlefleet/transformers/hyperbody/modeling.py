@@ -1216,8 +1216,60 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     view = HyperEncoderProvider.from_config(enc_cfg)
     view.language_hidden_size = decoder_hidden
     view._attn_implementation = "eager"
+    # This region is replicated across CP: every CP rank holds the whole
+    # sequence, so its local sequence IS the global one. Anything that scales a
+    # per-rank statistic by cp -- the aux-loss denominator, its probs gather --
+    # is then off by cp.
+    view.cp_replicated_sequence = True
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
     return view
+
+
+def _is_moe_expert_param(p):
+    """Exactly the predicate `paddlefleet/trainer/trainer.py` uses for `is_expert`
+    (`color == "moe_expert"`), so the `expert_cp_replicated` mark can never be set
+    on a param the trainer does not treat as an expert.
+
+    The color is applied for routed experts whenever EP>1 (at construction time,
+    or later in `_color_expert_params` when `mtp_shared_last_layer` defers it), so
+    this selects exactly the MoE expert params. Do NOT widen this with
+    `is_moe_param`: the two trainers disagree on that case, and a marked param
+    that `trainer.py` does not treat as an expert would fall into the x-cp branch
+    while its mark is ignored (wrong by cp**2).
+    """
+    color = getattr(p, "color", None)
+    return isinstance(color, dict) and color.get("color") == "moe_expert"
+
+
+def _mark_encoder_region(model):
+    """Mark the encoder region for the CP grad scale.
+
+    - MoE expert params -> `expert_cp_replicated` (their grad is inflated by cp;
+      the trainer divides it by cp).
+    - everything else   -> `context_parallel_disable_scale_grad` (replicated
+      across CP ranks -> x1).
+
+    Inert at CP=1 (the scale is skipped entirely), so it is safe to run
+    unconditionally. The encoder region is every sequential layer whose name
+    prefix starts with "encoder".
+    """
+    from paddlefleet.context_parallel_utils import (
+        mark_context_parallel_parameter_disable_scale_grad,
+    )
+
+    prefixes = model.get_sequential_name_prefixes()
+    assert len(model.run_function) == len(prefixes), (
+        "layer/prefix count mismatch — PipelineLayer grouped the layers "
+        "(use_cudagraph=True?). The index alignment below would mis-mark."
+    )
+    for i, layer in enumerate(model.run_function):
+        if not prefixes.get(str(i), "").startswith("encoder"):
+            continue
+        for p in layer.parameters():
+            if _is_moe_expert_param(p):
+                p.expert_cp_replicated = True
+            else:
+                mark_context_parallel_parameter_disable_scale_grad(p)
 
 
 def build_hyperbody_unified_model(
@@ -1321,12 +1373,14 @@ def build_hyperbody_unified_model(
         extra_kwargs={"config": decoder_view, "tie_word_embeddings": False},
         sublayers_spec=sublayers_spec,
     )
-    return build_spec_layer(
+    model = build_spec_layer(
         root,
         loss_fn=LanguageLoss(decoder_view) if loss_fn is None else loss_fn,
         num_stages=num_stages,
         seg_method="layer:TransformerLayer|EmptyLayer",
     )
+    _mark_encoder_region(model)
+    return model
 
 
 # ======================================================================= #

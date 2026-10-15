@@ -740,6 +740,16 @@ class GPTEmbedding(FleetLayer):
 
             if self.multimodal_embedding:
                 if mtp_emb_res is None:
+                    # CP-slice the merged multimodal sequence. Must run AFTER
+                    # _merge_multimodal (needs full [B,S] + full image_embeds)
+                    # and BEFORE RoPE generation so get_rotary_seq_len sees the
+                    # local length. Placing it inside `if mtp_emb_res is None:`
+                    # makes double-slicing impossible: the MTP path already
+                    # slices per chunk. `to_cp_local` is the global->local
+                    # transform (identity at cp=1, and it picks the
+                    # cp_shard_source implementation); the SP scatter below runs
+                    # after it, on the other axis.
+                    decoder_input = to_cp_local(decoder_input, self.config)
                     # Scatter decoder_input to SP format [S/tp, B, H] after
                     # multimodal token replacement, since
                     # LanguageModelEmbedding's internal scatter was disabled to
