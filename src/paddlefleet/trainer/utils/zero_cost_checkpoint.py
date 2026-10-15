@@ -2974,19 +2974,31 @@ class DistInfoCollectorValidator:
         return True, None
 
 
+def _zcc_metadata_shards(ckpt_meta, key):
+    """The LocalTensorMetadata entries `ckpt_meta` records for `key`.
+
+    `saved_ckptmeta` all-gathers the per-rank descriptors, so this is every
+    rank's shard of `key`, not just the local one.
+    """
+    sdm = getattr(ckpt_meta, "state_dict_metadata", None)
+    if not sdm or key not in sdm:
+        return []
+    entry = sdm[key]
+    return list(entry) if isinstance(entry, (list, tuple)) else [entry]
+
+
 def _zcc_lookup_local_shape(ckpt_meta, key, numel):
     """Return the per-rank local_shape recorded in ckpt_meta for `key` whose
     element count matches `numel`, else None. Used to reshape grouped-GEMM
     optimizer tensors to the N-D shape their metadata declares, so the saved
     bytes and the recorded metadata stay consistent (fixes allgather SonicMoE
     experts whose sharded descriptor is N-D [E, io, 2, I_local] while the muon
-    fused buffer is flattened 2-D)."""
-    sdm = getattr(ckpt_meta, "state_dict_metadata", None)
-    if not sdm or key not in sdm:
-        return None
-    entry = sdm[key]
-    cands = entry if isinstance(entry, (list, tuple)) else [entry]
-    for m in cands:
+    fused buffer is flattened 2-D).
+
+    Only meaningful for a descriptor that stores the per-rank N-D block; see
+    `_zcc_declares_flattened` for the case this must not be applied to.
+    """
+    for m in _zcc_metadata_shards(ckpt_meta, key):
         ls = getattr(m, "local_shape", None)
         if ls is None:
             continue
@@ -2996,6 +3008,95 @@ def _zcc_lookup_local_shape(ckpt_meta, key, numel):
         if n == int(numel):
             return list(ls)
     return None
+
+
+def _zcc_declares_flattened(ckpt_meta, key):
+    """Whether `key` is stored as a flattened 1-D slice.
+
+    The descriptor decides this: a flattened one (element-wise sharding-v2
+    shard) stores exactly `flattened_range` elements as a 1-D tensor, however
+    many dimensions its `local_shape` has -- `local_shape` describes the
+    parameter the slice came out of, not the bytes. Everything else, a scalar
+    accumulator and an N-D block alike, stores `local_shape` itself.
+
+    Reshaping a flattened tensor to `local_shape` makes the saved bytes
+    disagree with the descriptor saved beside them, and the load side assigns
+    the file tensor straight into the optimizer slot (`paddle.assign` resizes
+    its destination), so the slot silently turns N-D and ShardingV2's merge
+    slices past its end on the next resume.
+
+    All shards of a key agree on this: the flavour follows from whether the
+    parameter is kept whole or split element-wise, which every rank decides
+    from the same `use_muon` / `use_hyperball` information.
+    """
+    return any(
+        getattr(m, "is_flattened", False)
+        for m in _zcc_metadata_shards(ckpt_meta, key)
+    )
+
+
+def _zcc_declared_shapes(ckpt_meta, key, param_slice_info=None):
+    """The shapes `key` may have on disk, one per recorded shard.
+
+    `ckpt_meta` is the all-rank gather, and flattened slice lengths
+    legitimately differ between ranks (an embedding can carry three distinct
+    lengths in one job), so for a flattened key `param_slice_info` -- this
+    rank's own slice, and what `_slice_padded_tensor` cut the tensor down to --
+    narrows the answer to this rank's length.
+
+    It only narrows. A length no descriptor corroborates is left to the
+    descriptors rather than overriding them, which keeps the cross-check
+    between the two independent paths this function exists to compare, and
+    keeps `param_slice_info` from answering for keys it does not describe: it
+    also holds an entry for each scalar accumulator, carrying the element
+    range of the *parameter* rather than the scalar's own length.
+    """
+    shapes = []
+    flattened = False
+    for m in _zcc_metadata_shards(ckpt_meta, key):
+        if getattr(m, "is_flattened", False):
+            begin, end = m.flattened_range
+            shapes.append((int(end) - int(begin),))
+            flattened = True
+        else:
+            shapes.append(tuple(int(s) for s in m.local_shape))
+    if flattened and param_slice_info and key in param_slice_info:
+        local_range = param_slice_info[key]
+        local_shape = (local_range.stop - local_range.start,)
+        if local_shape in shapes:
+            return [local_shape]
+    return shapes
+
+
+def _zcc_check_shapes_match_meta(
+    state_dict, ckpt_meta, tag, param_slice_info=None
+):
+    """Refuse to write bytes whose shape contradicts the metadata.
+
+    Here the descriptors and the tensors come from two independent paths --
+    descriptors cached at `_cache_meta_for_sharded_save` time from
+    `optimizer.sharded_state_dict()`, bytes read out of the fusion buffers at
+    save time -- so nothing structurally keeps the two in agreement. A
+    disagreement is invisible until a resume reads the checkpoint back, which
+    can be days later, so fail the save rather than log it.
+
+    Keys with no descriptor are skipped: `_save_ema_state` deliberately saves
+    tensors that FC metadata does not cover.
+    """
+    mismatched = []
+    for key, value in state_dict.items():
+        declared = _zcc_declared_shapes(ckpt_meta, key, param_slice_info)
+        if not declared:
+            continue
+        shape = tuple(int(s) for s in value.shape)
+        if shape not in declared:
+            mismatched.append(f"{key}: saving {shape}, declared {declared}")
+    if mismatched:
+        raise RuntimeError(
+            f"[ZCC worker] {tag}: {len(mismatched)} tensor(s) contradict the "
+            f"checkpoint metadata, the checkpoint would not be resumable:\n"
+            + "\n".join(mismatched[:16])
+        )
 
 
 def saved_ckptmeta(
@@ -3727,6 +3828,11 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                     state_dict, self.model_state_filter
                 )
                 logger.debug(f"model states length is {len(state_dict)}")
+                # No `param_slice_info`: it keys optimizer states, and model
+                # parameters are never stored as element-wise shards here.
+                _zcc_check_shapes_match_meta(
+                    state_dict, self.model_ckpt_meta, "model_state"
+                )
                 paddle.save(state_dict, self.model_states_path)
 
                 if self.device_id == 0:
@@ -3814,6 +3920,10 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                         struct_name is not None
                         and struct_name in self.grouped_gemm_params
                     ):
+                        if _zcc_declares_flattened(self.opt_ckpt_meta, k):
+                            # `_slice_padded_tensor` already produced the 1-D
+                            # slice the flattened descriptor declares.
+                            continue
                         origin_shape = v.shape
                         tgt = _zcc_lookup_local_shape(
                             self.opt_ckpt_meta, k, int(v.numel())
@@ -3832,6 +3942,12 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                         struct_name is not None
                         and struct_name in self.grouped_gemm_params
                     ):
+                        if _zcc_declares_flattened(
+                            self.master_weight_ckpt_meta, k
+                        ):
+                            # `_slice_padded_tensor` already produced the 1-D
+                            # slice the flattened descriptor declares.
+                            continue
                         origin_shape = v.shape
                         tgt = _zcc_lookup_local_shape(
                             self.master_weight_ckpt_meta, k, int(v.numel())
@@ -3847,6 +3963,18 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
 
             logger.debug(f"opt states length is {len(opt_state_dict)}")
             logger.debug(f"master weights length is {len(master_weights)}")
+            _zcc_check_shapes_match_meta(
+                opt_state_dict,
+                self.opt_ckpt_meta,
+                "optimizer_state",
+                self.param_slice_info,
+            )
+            _zcc_check_shapes_match_meta(
+                master_weights,
+                self.master_weight_ckpt_meta,
+                "master_weight",
+                self.param_slice_info,
+            )
             paddle.save(opt_state_dict, self.opt_state_path)
             paddle.save(master_weights, self.master_weight_path)
             if self.device_id == 0:
@@ -3927,6 +4055,12 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                         struct_name is not None
                         and struct_name in self.grouped_gemm_params
                     ):
+                        if _zcc_declares_flattened(
+                            self.ema_master_weight_ckpt_meta, k
+                        ):
+                            # `_slice_padded_tensor` already produced the 1-D
+                            # slice the flattened descriptor declares.
+                            continue
                         origin_shape = v.shape
                         tgt = _zcc_lookup_local_shape(
                             self.ema_master_weight_ckpt_meta, k, int(v.numel())
@@ -3962,6 +4096,12 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
             ema_save_dict.update(unmapped_model_params)
 
             logger.debug(f"ema states length is {len(ema_save_dict)}")
+            _zcc_check_shapes_match_meta(
+                ema_save_dict,
+                self._merge_ema_ckpt_meta(),
+                "ema_state",
+                self.param_slice_info,
+            )
             paddle.save(ema_save_dict, self.ema_name_path)
 
             # Save metadata
