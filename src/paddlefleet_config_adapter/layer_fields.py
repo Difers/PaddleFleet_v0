@@ -119,6 +119,54 @@ def _csa_family(ratio):
     return "CSA(2..127)"
 
 
+def _family_key(field, entry):
+    """The family an entry belongs to.
+
+    ``csa_compress_ratios`` lumps whole ranges into one family (every ratio in
+    ``2..127`` is CSA), so it needs :func:`_csa_family`; the other lists encode
+    the family directly in the value (``window_attn_skip_freq`` 0/1, a
+    ``layer_types`` name, ...).
+    """
+    return _csa_family(entry) if field.families else entry
+
+
+def min_layers_for_attention_families(model_config):
+    """Smallest ``num_hidden_layers`` that keeps every attention family.
+
+    Truncation keeps a prefix, so a family survives iff at least one of its
+    layers lands in that prefix -- the binding constraint is the *last* first
+    appearance across families.  Every list-valued layer field contributes: the
+    compress ratios (MLA / HCA / CSA / ...) *and* ``window_attn_skip_freq``
+    (sliding-window vs full attention), so a shrink never leaves the model with
+    only one of the families the source interleaves.  The MTP tail is sliced off
+    first: those entries are re-appended verbatim by
+    :func:`plan_layer_field_shrink`, so a family that only appears among them
+    imposes no floor on the decoder stack.
+
+    Returns 0 when no such field is a list, i.e. the model has no
+    attention-family requirement to honour.
+    """
+    if model_config is None:
+        return 0
+    mtp = effective_mtp_layers(model_config)
+    floor = 0
+    for field in LAYER_FIELDS:
+        key = next((a for a in field.aliases if a in model_config), None)
+        if key is None:
+            continue
+        value = model_config[key]
+        if not isinstance(value, list):
+            continue
+        tail = mtp if field.includes_mtp else 0
+        layer_part = value[: len(value) - tail] if tail else value
+        first_seen = {}
+        for index, entry in enumerate(layer_part):
+            first_seen.setdefault(_family_key(field, entry), index)
+        if first_seen:
+            floor = max(floor, max(first_seen.values()) + 1)
+    return floor
+
+
 def _shares_mtp_attention(model_config, mtp_layers):
     """Whether the MTP layer aliases the last decoder layer's attention.
 

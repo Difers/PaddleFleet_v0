@@ -202,7 +202,8 @@ def format_report(info, changelog):
         (
             "模式      ",
             f"{info['profile']}（{info['profile_flag']}），"
-            f"batch 策略 {info['batch_strategy']}",
+            f"batch 策略 {info['batch_strategy']}"
+            + ("，强制缩结构" if info.get("shrink_structure") else ""),
         ),
         (
             "机器规模  ",

@@ -42,6 +42,10 @@ from paddlefleet_config_adapter.constraints import (
     check_hardware,
     check_pp_shrink,
     ep_candidates,
+    min_aligned_width,
+    min_legal_layers,
+    min_routed_experts,
+    min_seq_length,
     min_shrink_cards,
     pp_candidates,
 )
@@ -58,6 +62,7 @@ from paddlefleet_config_adapter.io_writers import (
 from paddlefleet_config_adapter.layer_fields import (
     StaleMtpKeyError,
     effective_mtp_layers,
+    min_layers_for_attention_families,
     plan_layer_field_shrink,
     reject_stale_mtp_key,
 )
@@ -67,6 +72,7 @@ from paddlefleet_config_adapter.model_config_resolver import (
     resolve_model_config,
     rewrite_model_name_or_path,
 )
+from paddlefleet_config_adapter.planner import SHRINK_MAX_SEQ_LENGTH
 from paddlefleet_config_adapter.report import (
     LINE_WIDTH,
     ChangeLog,
@@ -148,12 +154,15 @@ class ConfigAdapterTestBase(unittest.TestCase):
         target_nodes,
         test_performance=False,
         test_accuracy=False,
+        shrink_structure=False,
         **kwargs,
     ):
         """Run one adaptation, returning ``(ok, message)``."""
         kwargs.setdefault("output_dir", self.output_dir)
         adapter = ConfigAdapter(
-            options=AdaptOptions(test_performance, test_accuracy),
+            options=AdaptOptions(
+                test_performance, test_accuracy, shrink_structure
+            ),
             target_nodes=target_nodes,
             **kwargs,
         )
@@ -197,6 +206,26 @@ class TestOptions(unittest.TestCase):
         self.assertTrue(options.inject_precision)
         self.assertEqual(options.batch_strategy, "scale_batch")
         self.assertEqual(options.label, "performance+accuracy")
+
+    def test_shrink_structure_needs_a_model_config(self):
+        # Even in the frozen default, forcing the structure down requires
+        # model_config.json (layer / expert counts live there).
+        self.assertFalse(AdaptOptions().needs_model_config)
+        self.assertTrue(
+            AdaptOptions(
+                test_accuracy=True, shrink_structure=True
+            ).needs_model_config
+        )
+
+    def test_shrink_structure_labels_and_flags(self):
+        options = AdaptOptions(test_accuracy=True, shrink_structure=True)
+        self.assertTrue(options.shrink_structure)
+        self.assertEqual(options.label, "accuracy+shrink-structure")
+        self.assertIn("--shrink-structure", options.flags)
+        # A plain accuracy run keeps its old label / flags.
+        plain = AdaptOptions(test_accuracy=True)
+        self.assertEqual(plain.label, "accuracy")
+        self.assertNotIn("--shrink-structure", plain.flags)
 
 
 class TestCandidates(unittest.TestCase):
@@ -1073,6 +1102,77 @@ class TestLayerFieldPlanning(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(changes, [])
 
+    def test_min_legal_layers_is_the_max_of_the_three_floors(self):
+        # pp*vpp segments, the dense prefix, and the attention families.
+        self.assertEqual(min_legal_layers(4, 2, 1, 0), 8)
+        self.assertEqual(min_legal_layers(2, 1, 0, 0), 2)
+        self.assertEqual(min_legal_layers(4, 1, 5, 3), 5)
+        self.assertEqual(min_legal_layers(4, 1, 1, 10), 10)
+
+    def test_min_routed_experts_matches_the_bash_formula(self):
+        # step = lcm(EP, n_group); need = max(ceil(topk*n_group/topk_group),
+        # topk, step); rounded up to a multiple of step.
+        self.assertEqual(min_routed_experts(8, 4, 2, 8), 16)
+        self.assertEqual(min_routed_experts(8, 4, 1, 8), 32)
+        self.assertEqual(min_routed_experts(16, 8, 4, 8), 16)
+        # The T6 shape: EP=2, n_group=6 -> lcm 6, top-k 8 -> 12.
+        self.assertEqual(min_routed_experts(2, 6, 6, 8), 12)
+        # top-k floor: a tiny grouping still needs at least top-k experts.
+        self.assertEqual(min_routed_experts(1, 1, 1, 8), 8)
+        self.assertEqual(min_routed_experts(1, 1, 1, 1), 1)
+
+    def test_min_aligned_width_shrinks_to_a_128_multiple(self):
+        # Shrink only: anything above the alignment collapses to it; already
+        # at or below the alignment is returned verbatim.
+        self.assertEqual(min_aligned_width(1792), 128)
+        self.assertEqual(min_aligned_width(1024), 128)
+        self.assertEqual(min_aligned_width(128), 128)
+        self.assertEqual(min_aligned_width(64), 64)
+        # A custom alignment (EP*128 for the intermediate-sharded dispatchers).
+        self.assertEqual(min_aligned_width(1792, 256), 256)
+        self.assertEqual(min_aligned_width(200, 256), 200)
+
+    def test_min_seq_length_aligns_to_lcm_and_the_window(self):
+        # CP=1 -> lcm(128,2)=128, floor 1024 already aligned.
+        self.assertEqual(min_seq_length(1, 128), 1024)
+        # CP=2 -> lcm(128,4)=128; still 1024.
+        self.assertEqual(min_seq_length(2, 128), 1024)
+        # A window above the 1024 floor raises the base; 2048 stays aligned.
+        self.assertEqual(min_seq_length(1, 2048), 2048)
+        # A window just above the floor rounds up to the next 128 multiple.
+        self.assertEqual(min_seq_length(1, 1100), 1152)
+        # No window declared -> treated as the 1024 floor.
+        self.assertEqual(min_seq_length(1, None), 1024)
+        # A large CP whose 2*CP exceeds 128 raises the alignment step:
+        # lcm(128, 200)=3200 -> ceil(1024/3200)*3200 = 3200.
+        self.assertEqual(min_seq_length(100, 128), 3200)
+
+    def test_min_layers_for_attention_families_uses_first_appearance(self):
+        # HCA(128) at 0, MLA(-2) at 7 -> the prefix must reach index 7.
+        config = {
+            "num_hidden_layers": 43,
+            "num_nextn_predict_layers": 1,
+            "csa_compress_ratios": [128] * 7 + [-2] + [128] * 35 + [-2],
+        }
+        self.assertEqual(min_layers_for_attention_families(config), 8)
+
+    def test_min_layers_for_attention_families_ignores_the_mtp_tail(self):
+        # The MTP entry is re-appended verbatim, so its family (only there)
+        # imposes no floor on the decoder stack.
+        config = {
+            "num_hidden_layers": 4,
+            "num_nextn_predict_layers": 1,
+            "csa_compress_ratios": [128, 128, 128, 128, -2],
+        }
+        self.assertEqual(min_layers_for_attention_families(config), 1)
+
+    def test_min_layers_for_attention_families_absent_field(self):
+        self.assertEqual(min_layers_for_attention_families({}), 0)
+        self.assertEqual(min_layers_for_attention_families(None), 0)
+        self.assertEqual(
+            min_layers_for_attention_families({"csa_compress_ratios": 4}), 0
+        )
+
 
 class TestDefaultAdaptation(ConfigAdapterTestBase):
     """No switch: dims frozen; shrinking EP/PP needs --test-accuracy."""
@@ -1268,6 +1368,348 @@ class TestDefaultAdaptation(ConfigAdapterTestBase):
         self.assertTrue(ok, message)
         # The value equals the source value, so nothing is logged for it.
         self.assertNotIn("max_steps", message)
+
+
+class TestStructureMinimize(ConfigAdapterTestBase):
+    """``--shrink-structure`` forces the structure to its legal floor."""
+
+    def test_off_by_default_is_byte_for_byte_unchanged(self):
+        # The switch defaults off, so an explicit False must reproduce a plain
+        # --test-accuracy run exactly (the regression guarantee).  Both runs
+        # share one output dir (wiped in between) so the embedded paths match.
+        # Width / sequence fields are present to prove they are also untouched.
+        self.write_yaml(SOURCE_YAML + "max_seq_length: 8192\n")
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "moe_intermediate_size": 1792,
+                "moe_latent_size": 1024,
+            }
+        )
+        rel = Path("model_config_separated") / "model_dir_adapted_8cards"
+        ok_a, _ = self.adapt(target_nodes=1, test_accuracy=True)
+        self.assertTrue(ok_a)
+        yaml_a = (self.output_dir / "source_adapted_8cards.yaml").read_bytes()
+        json_a = (self.output_dir / rel / "model_config.json").read_bytes()
+        shutil.rmtree(self.output_dir)
+
+        ok_b, _ = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=False
+        )
+        self.assertTrue(ok_b)
+        yaml_b = (self.output_dir / "source_adapted_8cards.yaml").read_bytes()
+        json_b = (self.output_dir / rel / "model_config.json").read_bytes()
+        self.assertEqual(yaml_a, yaml_b)
+        self.assertEqual(json_a, json_b)
+
+    def test_layers_experts_and_lists_shrink_together(self):
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "n_routed_experts": 1024,
+                "csa_compress_ratios": [128, 128, 128, -2] * 16 + [-2],
+                "window_attn_skip_freq": [0] * 65,
+                "layer_types": ["full_attention"] * 64,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        # PP=4, VPP=2 -> floor of 8 layers; both families fit in the first 4.
+        self.assertEqual(model_config["num_hidden_layers"], 8)
+        # EP=2, n_group defaults to 1, top-k 8 -> 8 experts.
+        self.assertEqual(model_config["n_routed_experts"], 8)
+        self.assertEqual(len(model_config["csa_compress_ratios"]), 9)
+        self.assertEqual(model_config["csa_compress_ratios"][-1], -2)
+        self.assertEqual(len(model_config["window_attn_skip_freq"]), 9)
+        self.assertEqual(len(model_config["layer_types"]), 8)
+        self.assertIn("强制缩结构", message)
+
+    def test_source_at_the_floor_is_not_grown(self):
+        # Case A (dims already fit 512 cards) with a structure already at its
+        # floor: nothing shrinks and a warning says so.
+        self.write_json(
+            {**MODEL_CONFIG, "num_hidden_layers": 16, "n_routed_experts": 64}
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(512)
+        self.assertEqual(model_config["num_hidden_layers"], 16)
+        self.assertEqual(model_config["n_routed_experts"], 64)
+        self.assertIn("已在下限", message)
+
+    def test_non_moe_shrinks_only_layers(self):
+        self.write_yaml(
+            SOURCE_YAML.replace(
+                "expert_model_parallel_size: 64",
+                "expert_model_parallel_size: 1",
+            )
+        )
+        self.write_json(
+            {
+                key: value
+                for key, value in MODEL_CONFIG.items()
+                if key not in ("n_routed_experts", "num_experts_per_tok")
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        # PP=8, VPP=2 -> 16 layers; no experts to touch.
+        self.assertEqual(model_config["num_hidden_layers"], 16)
+        self.assertNotIn("n_routed_experts", model_config)
+
+    def test_mtp_shared_last_layer_realigns_the_last_decoder_layer(self):
+        ratios = [128] * 7 + [-2] + [128] * 35 + [-2]
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "num_hidden_layers": 43,
+                "mtp_shared_last_layer": True,
+                "csa_compress_ratios": ratios,
+                "window_attn_skip_freq": [0] * 44,
+                "layer_types": ["full_attention"] * 43,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(512)
+        self.assertEqual(model_config["num_hidden_layers"], 16)
+        # A plain truncation would end [..., 128, -2]; the last decoder layer
+        # must share the MTP layer's attention type.
+        self.assertEqual(model_config["csa_compress_ratios"][-2:], [-2, -2])
+        self.assertIn("mtp_shared_last_layer", message)
+
+    def test_refuses_when_the_shrink_would_drop_a_family(self):
+        # HCA(128) survives only as the last kept layer, so realigning it to
+        # the shared MTP layer's MLA(-2) would erase the family.
+        ratios = [-2] * 15 + [128] + [-2] * 27 + [-2]
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "num_hidden_layers": 43,
+                "mtp_shared_last_layer": True,
+                "csa_compress_ratios": ratios,
+                "window_attn_skip_freq": [0] * 44,
+                "layer_types": ["full_attention"] * 43,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertFalse(ok)
+        self.assertIn("丢掉注意力类型", message)
+
+    def test_structure_shrink_drops_stale_checkpoint_refs(self):
+        # Dims stay frozen (Case A), but the layer / expert count drops, so a
+        # full-scale checkpoint no longer matches and must be unloaded.
+        self.write_yaml(
+            SOURCE_YAML + "resume_from_checkpoint: ./ckpt\nload_from_hf: true\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(512)
+        self.assertNotIn("resume_from_checkpoint", config)
+        self.assertFalse(config["load_from_hf"])
+        self.assertIn("强制缩结构", message)
+
+    def test_unchanged_structure_keeps_checkpoint_refs(self):
+        # Same Case A shape, but the structure is already at the floor, so no
+        # checkpoint reference may be dropped.
+        self.write_json(
+            {**MODEL_CONFIG, "num_hidden_layers": 16, "n_routed_experts": 64}
+        )
+        self.write_yaml(
+            SOURCE_YAML + "resume_from_checkpoint: ./ckpt\nload_from_hf: true\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(512)
+        self.assertEqual(config["resume_from_checkpoint"], "./ckpt")
+        self.assertTrue(config["load_from_hf"])
+
+
+class TestStructureMinimizeWidthAndSeq(ConfigAdapterTestBase):
+    """``--shrink-structure`` also shrinks MoE widths and max_seq_length."""
+
+    def test_moe_widths_shrink_to_128(self):
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "moe_intermediate_size": 1792,
+                "moe_latent_size": 1024,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        self.assertEqual(model_config["moe_intermediate_size"], 128)
+        self.assertEqual(model_config["moe_latent_size"], 128)
+
+    def test_latent_absent_shrinks_only_intermediate(self):
+        self.write_json({**MODEL_CONFIG, "moe_intermediate_size": 1792})
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        self.assertEqual(model_config["moe_intermediate_size"], 128)
+        self.assertNotIn("moe_latent_size", model_config)
+
+    def test_null_width_is_skipped_not_crashed(self):
+        # A declared-but-null width (MiniMax-M2 ships moe_latent_size: null)
+        # must be skipped, not fed to int() -- otherwise the whole command
+        # exits with a TypeError traceback instead of shrinking the rest.
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "moe_intermediate_size": 1792,
+                "moe_latent_size": None,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        self.assertEqual(model_config["moe_intermediate_size"], 128)
+        self.assertIsNone(model_config["moe_latent_size"])
+
+    def test_allgather_ep_raises_the_width_floor(self):
+        # EP shrinks 64 -> 2; the intermediate-sharded dispatcher lifts the
+        # moe_intermediate_size floor to EP*128 = 256 (latent stays plain 128).
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "moe_token_dispatcher_type": "allgather",
+                "moe_intermediate_size": 1792,
+                "moe_latent_size": 1024,
+            }
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        self.assertEqual(model_config["moe_intermediate_size"], 256)
+        self.assertEqual(model_config["moe_latent_size"], 128)
+
+    @unittest.skipUnless(
+        SHRINK_MAX_SEQ_LENGTH,
+        "max_seq_length 缩容暂时关闭（待数据集瘦身后开启）",
+    )
+    def test_max_seq_length_shrinks_to_the_floor(self):
+        self.write_yaml(
+            SOURCE_YAML + "max_seq_length: 8192\nonline_generate_data: true\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        self.assertEqual(config["max_seq_length"], 1024)
+        self.assertEqual(config["max_seq_length"] % 2, 0)  # % (2*cp), cp=1
+
+    def test_multimodal_patch_id_skips_the_seq_shrink(self):
+        self.write_yaml(
+            SOURCE_YAML
+            + "max_seq_length: 8192\nonline_generate_data: true\n"
+            + "image_patch_id: 100295\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        self.assertEqual(config["max_seq_length"], 8192)
+
+    @unittest.skipUnless(
+        SHRINK_MAX_SEQ_LENGTH,
+        "max_seq_length 缩容暂时关闭（待数据集瘦身后开启）",
+    )
+    def test_bypass_mm_treats_patch_ids_as_text_only(self):
+        # Patch ids present but ``use_v2_tokenizer_and_bypass_mm`` turns the
+        # multimodal token path off (ScalingLadder T6), so the sequence still
+        # shrinks.
+        self.write_yaml(
+            SOURCE_YAML
+            + "max_seq_length: 8192\nonline_generate_data: true\n"
+            + "image_patch_id: 100295\n"
+            + "use_v2_tokenizer_and_bypass_mm: true\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        self.assertEqual(config["max_seq_length"], 1024)
+
+    def test_scale_seq_length_pins_the_sequence(self):
+        # --scale-seq-length pins max_seq_length; the forced shrink must defer.
+        self.write_yaml(
+            SOURCE_YAML + "max_seq_length: 8192\nonline_generate_data: true\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=1,
+            test_accuracy=True,
+            shrink_structure=True,
+            scale_seq_length=4096,
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        self.assertEqual(config["max_seq_length"], 4096)
+
+    @unittest.skipUnless(
+        SHRINK_MAX_SEQ_LENGTH,
+        "max_seq_length 缩容暂时关闭（待数据集瘦身后开启）",
+    )
+    def test_seq_only_shrink_keeps_checkpoint_refs(self):
+        # Case A (dims frozen) with a structure already at the floor: only the
+        # sequence shrinks, so weight shapes are intact and the checkpoint
+        # reference must survive.
+        self.write_json(
+            {**MODEL_CONFIG, "num_hidden_layers": 16, "n_routed_experts": 64}
+        )
+        self.write_yaml(
+            SOURCE_YAML
+            + "max_seq_length: 8192\nonline_generate_data: true\n"
+            + "resume_from_checkpoint: ./ckpt\n"
+        )
+        ok, message = self.adapt(
+            target_nodes=64, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(512)
+        self.assertEqual(config["max_seq_length"], 1024)
+        self.assertEqual(config["resume_from_checkpoint"], "./ckpt")
+
+    @unittest.skipUnless(
+        SHRINK_MAX_SEQ_LENGTH,
+        "max_seq_length 缩容暂时关闭（待数据集瘦身后开启）",
+    )
+    def test_non_online_generate_data_warns_about_packed_datasets(self):
+        self.write_yaml(SOURCE_YAML + "max_seq_length: 8192\n")
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        self.assertEqual(config["max_seq_length"], 1024)
+        self.assertIn("预打包数据", message)
 
 
 class TestPerformanceSwitch(ConfigAdapterTestBase):
@@ -1718,6 +2160,34 @@ class TestCliErrorPaths(ConfigAdapterTestBase):
         )
         self.assertEqual(code, 1)
         self.assertIn("适配失败", out)
+
+    def test_shrink_structure_requires_test_accuracy(self):
+        code, out = self._run(
+            [
+                "--input",
+                str(self.yaml_path),
+                "--target-nodes",
+                "1",
+                "--shrink-structure",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("--test-accuracy", out)
+
+    def test_shrink_structure_rejects_test_performance(self):
+        code, out = self._run(
+            [
+                "--input",
+                str(self.yaml_path),
+                "--target-nodes",
+                "1",
+                "--test-accuracy",
+                "--test-performance",
+                "--shrink-structure",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("--test-performance", out)
 
     def test_python_m_entry_point(self):
         # `python -m paddlefleet_config_adapter` must reach the same main().
@@ -2292,6 +2762,36 @@ class TestCli(ConfigAdapterTestBase):
         text = patch.read_text(encoding="utf-8")
         self.assertIn("pipeline_model_parallel_size", text)
         self.assertIn("model_config.json", text)
+
+    def test_shrink_structure_shows_up_in_the_report(self):
+        self.write_yaml(
+            SOURCE_YAML + "max_seq_length: 8192\nonline_generate_data: true\n"
+        )
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "moe_intermediate_size": 1792,
+                "moe_latent_size": 1024,
+            }
+        )
+        code, out = self._run(
+            [
+                "--input",
+                str(self.yaml_path),
+                "--target-nodes",
+                "64",
+                "--test-accuracy",
+                "--shrink-structure",
+                "--output-dir",
+                str(self.output_dir),
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("accuracy+shrink-structure", out)
+        self.assertIn("强制缩结构", out)
+        self.assertIn("moe_intermediate_size", out)
+        if SHRINK_MAX_SEQ_LENGTH:
+            self.assertIn("max_seq_length", out)
 
 
 class TestScaleSeqLength(ConfigAdapterTestBase):

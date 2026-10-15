@@ -59,15 +59,26 @@ import re
 from .constraints import (
     MIN_PARALLEL_DEGREE,
     MIN_PP_FOR_VPP,
+    WIDTH_ALIGN,
+    align_layers,
     check_ep_shrink,
     check_hardware,
     check_pp_shrink,
     ep_candidates,
+    min_aligned_width,
+    min_legal_layers,
+    min_routed_experts,
+    min_seq_length,
     min_shrink_cards,
     pp_candidates,
 )
 from .field_spec import describe_missing, resolve_fields
-from .layer_fields import effective_mtp_layers, plan_layer_field_shrink
+from .layer_fields import (
+    LAYER_FIELDS,
+    effective_mtp_layers,
+    min_layers_for_attention_families,
+    plan_layer_field_shrink,
+)
 from .plan import ParallelismPlan
 from .topology import TopologyValidator
 
@@ -76,6 +87,19 @@ from .topology import TopologyValidator
 _CONSTRAINT_RE = re.compile(r"C[1-5]\s*不满足")
 
 VPP_FIELD = "virtual_pipeline_model_parallel_size"
+
+#: YAML / model_config keys for the sequence-length shrink.  ``core.SEQ_FIELD``
+#: is the same literal, but core imports planner (not the reverse), so the
+#: constant is redeclared here rather than imported back.
+SEQ_FIELD = "max_seq_length"
+WINDOW_FIELD = "csa_window_size"
+
+#: 是否在 --shrink-structure 下把 max_seq_length 缩到下限。
+#: 暂时关闭：缩短 max_seq_length 会按更小的窗口把语料切成更多 part（seq 缩 8x ->
+#: 数据序列 part 数约涨 64x），导致启动期 data_seq_build_index 从十几秒暴涨到近 20
+#: 分钟，反而拖慢整轮 FC 测试。在没有同步缩小数据集之前先不缩序列长度；之后做数据集
+#: 瘦身优化时再把它打开。层数/专家数/MoE 宽度等结构瘦身不受影响，照常进行。
+SHRINK_MAX_SEQ_LENGTH = False
 
 #: How many candidate rejections the diagnostic prints, and how many of those
 #: slots are reserved for communication-group reasons.  C4 ("sharding % CP")
@@ -134,6 +158,281 @@ def enforce_vpp_limit(config, plan):
     if int(vpp) <= 1:
         return
     plan.yaml_changes.append((VPP_FIELD, 1, _vpp_off_reason(vpp, plan.pp)))
+
+
+STRUCTURE_YAML_KEYS = ("num_empty_layers_add_in_tail", VPP_FIELD)
+
+
+def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
+    """Force the model structure down to its legal floor, in place.
+
+    Runs AFTER :func:`plan_parallelism`, on the plan's *final* dims, so the
+    floors use the PP / VPP / EP the shrink (or freeze) actually landed on.
+    Only invoked under ``--shrink-structure``: the caller leaves the default
+    path untouched, so a run without the switch is byte-for-byte unchanged.
+
+    Four structural axes are pushed to their floor, never grown:
+
+    * ``num_hidden_layers`` -> ``max(pp*vpp, first_k_dense_replace,``
+      ``attention-family floor)`` (see :func:`~.constraints.min_legal_layers`);
+    * routed experts -> :func:`~.constraints.min_routed_experts` for the final
+      EP / grouping;
+    * MoE widths (``moe_intermediate_size`` and, when latent MoE is on,
+      ``moe_latent_size``) -> the smallest 128-aligned value
+      (:func:`~.constraints.min_aligned_width`);
+    * ``max_seq_length`` -> :func:`~.constraints.min_seq_length` for the final
+      CP and sliding window, unless the config is truly multimodal or the user
+      pinned the length (``protected_yaml_keys``).  **目前由模块常量
+      ``SHRINK_MAX_SEQ_LENGTH`` 关闭**（缩序列长度会使数据序列 part 数暴涨、拖慢
+      启动），其余三条结构轴照常缩。
+
+    ``protected_yaml_keys`` is the set of YAML keys the user already pinned
+    (via ``--set`` or ``--scale-seq-length``); the sequence shrink skips any
+    key it finds there.  It defaults to empty for backward compatibility.
+
+    Writes are merged into the plan *by key*: any planner write for the same
+    target (layer count, expert count, a per-layer list, VPP or the empty
+    tail) is dropped and replaced, so the two decisions never fight.  A target
+    this step does not touch keeps whatever the planner queued.  Returns
+    ``error_or_None``.
+    """
+    if model_config is None:
+        return (
+            "强制缩结构需要读取 model_config.json，但本次运行拿不到"
+            "（model_name_or_path 指向的配置缺失或无法解析）"
+        )
+
+    resolved, missing = resolve_fields(model_config)
+    if "num_hidden_layers" in missing:
+        return describe_missing(
+            "num_hidden_layers", missing["num_hidden_layers"]
+        )
+
+    layout, err = ShrinkPlanner._pipeline_layout(
+        config, resolved, missing, model_config
+    )
+    if err:
+        return err
+
+    # Final values the plan already decided (later writes win over earlier).
+    final_yaml = {key: value for key, value, _reason in plan.yaml_changes}
+    final_json = {key: value for key, value, _reason in plan.json_changes}
+
+    pp = int(plan.pp)
+    vpp = int(final_yaml.get(VPP_FIELD, layout["vpp"]) or 1)
+    tail = int(
+        final_yaml.get("num_empty_layers_add_in_tail", layout["tail"]) or 0
+    )
+    cur_layers = int(final_json.get(layout["layers_key"], layout["layers"]))
+
+    new_yaml_changes = []
+    new_json_changes = []
+    drop_json_keys = set()
+
+    # ---- layers ---------------------------------------------------------
+    family_min = min_layers_for_attention_families(model_config)
+    layers_min = min_legal_layers(pp, vpp, layout["first_k"], family_min)
+    if layers_min < cur_layers:
+        if pp * vpp == 1:
+            # A single segment: head + layers + tail is a multiple of 1 whatever
+            # the tail is, so there is nothing to realign.  ``align_layers``
+            # would refuse here -- its ``pp_new < MIN_PARALLEL_DEGREE`` guard
+            # exists for PP shrinking, not for a source already at PP=1.
+            vpp_new, tail_new = vpp, tail
+        else:
+            vpp_new, tail_new = align_layers(
+                layers_min,
+                layout["head"],
+                pp,
+                vpp,
+                min_tail=layout["min_tail"],
+            )
+            if vpp_new is None:
+                return (
+                    f"强制缩结构：层数缩到 {layers_min} 后无法对齐到 "
+                    f"PP={pp} × VPP={vpp}"
+                )
+        layer_changes, err = plan_layer_field_shrink(
+            model_config, layout["layers"], layers_min, layout["mtp"]
+        )
+        if err:
+            return err
+        new_json_changes.append(
+            (
+                layout["layers_key"],
+                layers_min,
+                f"强制缩结构：层数缩到合法下限 {layers_min}"
+                f"（= max(PP×VPP={pp}×{vpp}, first_k={layout['first_k']}, "
+                f"注意力家族下限={family_min})），{cur_layers} -> {layers_min}",
+            )
+        )
+        new_json_changes.extend(layer_changes)
+        drop_json_keys.add(layout["layers_key"])
+        for field in LAYER_FIELDS:
+            key = next((a for a in field.aliases if a in model_config), None)
+            if key is not None:
+                drop_json_keys.add(key)
+        if vpp_new != vpp:
+            new_yaml_changes.append(
+                (
+                    VPP_FIELD,
+                    vpp_new,
+                    f"强制缩结构后重新对齐 VPP {vpp} -> {vpp_new}",
+                )
+            )
+        if tail_new != tail:
+            new_yaml_changes.append(
+                (
+                    "num_empty_layers_add_in_tail",
+                    tail_new,
+                    f"强制缩结构后调整尾部空层，把总层数对齐到 PP×VPP："
+                    f"{tail} -> {tail_new}",
+                )
+            )
+
+    # ---- routed experts -------------------------------------------------
+    num_experts = (
+        resolved["num_experts"].value if "num_experts" in resolved else None
+    )
+    topk = (
+        resolved["num_experts_per_tok"].value
+        if "num_experts_per_tok" in resolved
+        else None
+    )
+    if num_experts is not None and topk is not None:
+        experts_key = resolved["num_experts"].writeback_key
+        n_group = int(model_config.get("n_group", 1) or 1)
+        topk_group = int(model_config.get("topk_group", n_group) or n_group)
+        experts_min = min_routed_experts(plan.ep, n_group, topk_group, topk)
+        cur_experts = int(final_json.get(experts_key, num_experts))
+        if experts_min < cur_experts:
+            new_json_changes.append(
+                (
+                    experts_key,
+                    experts_min,
+                    f"强制缩结构：路由专家数缩到合法下限 {experts_min}"
+                    f"（EP={plan.ep}, n_group={n_group}, "
+                    f"topk_group={topk_group}, top-k={topk}），"
+                    f"{cur_experts} -> {experts_min}",
+                )
+            )
+            drop_json_keys.add(experts_key)
+
+    # ---- MoE widths -----------------------------------------------------
+    # Pure architectural widths: shrinking them only rescales weight shapes
+    # (and the derived shared-expert width), with no dependent identity field.
+    # The 128 floor keeps the fp8 / DeepGEMM / MoonEP block-scale tiles legal.
+    dispatcher = str(model_config.get("moe_token_dispatcher_type") or "")
+    intermediate_sharding = dispatcher in ("allgather", "ringmoe")
+    # moe_intermediate_size: with intermediate-dim sharding the floor rises to
+    # EP*128, which satisfies both ``% EP == 0`` and (under fp8) the
+    # ``(//EP) % 128 == 0`` rule.  deepep / hybridep slice whole experts, so
+    # the plain 128 alignment is enough there.
+    moe_width_align = (
+        WIDTH_ALIGN * plan.ep
+        if (intermediate_sharding and plan.ep > 1)
+        else WIDTH_ALIGN
+    )
+    for key, field_align in (
+        ("moe_intermediate_size", moe_width_align),
+        ("moe_latent_size", WIDTH_ALIGN),
+    ):
+        if key not in model_config:
+            continue
+        raw_width = final_json.get(key, model_config[key])
+        # Guard against a field that is declared but not a usable width:
+        # ``moe_latent_size: null`` (MiniMax-M2 default) or a list-valued
+        # ``moe_intermediate_size`` (ernie). Skip it rather than let int()
+        # raise and escape the module's (False, 中文原因) contract.
+        if not isinstance(raw_width, int) or isinstance(raw_width, bool):
+            continue
+        cur_width = raw_width
+        if cur_width <= 0:
+            continue
+        floor = min_aligned_width(cur_width, field_align)
+        if floor < cur_width:
+            new_json_changes.append(
+                (
+                    key,
+                    floor,
+                    f"强制缩结构：{key} 缩到 128 对齐下限 {floor}"
+                    f"（align={field_align}），{cur_width} -> {floor}",
+                )
+            )
+            drop_json_keys.add(key)
+
+    # ---- max_seq_length -------------------------------------------------
+    # Attention / sequence compute scales with the sequence length.  Shrink it
+    # unless the config is truly multimodal (patch ids present) or the user
+    # already pinned the length.  ``use_v2_tokenizer_and_bypass_mm`` turns the
+    # multimodal token path off, so a config carrying patch ids purely as
+    # reserved vocab (e.g. ScalingLadder T6) is still text-only and safe to
+    # shrink.
+    cur_seq = config.get(SEQ_FIELD)
+    patch_keys = ("image_patch_id", "video_patch_id", "audio_patch_id")
+    bypass_mm = bool(
+        config.get("use_v2_tokenizer_and_bypass_mm")
+        or model_config.get("use_v2_tokenizer_and_bypass_mm")
+    )
+    is_multimodal = (not bypass_mm) and any(
+        config.get(k) is not None for k in patch_keys
+    )
+    if (
+        SHRINK_MAX_SEQ_LENGTH
+        and not is_multimodal
+        and SEQ_FIELD not in protected_yaml_keys
+        and isinstance(cur_seq, int)
+        and cur_seq > 0
+    ):
+        window = config.get(WINDOW_FIELD)
+        if not isinstance(window, int):
+            window = model_config.get(WINDOW_FIELD)
+        floor = min_seq_length(
+            plan.cp, window if isinstance(window, int) else None
+        )
+        if floor < cur_seq:
+            new_yaml_changes.append(
+                (
+                    SEQ_FIELD,
+                    floor,
+                    f"强制缩结构：序列长度缩到下限 {floor}"
+                    f"（对齐 lcm(128, 2×CP={plan.cp})，不低于 "
+                    f"csa_window_size），{cur_seq} -> {floor}",
+                )
+            )
+            if not config.get("online_generate_data"):
+                plan.warnings.append(
+                    "强制缩结构：改写 max_seq_length，但该配置不是 "
+                    "online_generate_data；预打包数据集按固定序列长度 "
+                    "tokenize，改长度后可能读不进来"
+                )
+
+    if not new_yaml_changes and not new_json_changes:
+        plan.warnings.append(
+            "强制缩结构：模型结构已在下限"
+            "（层数/专家数/宽度都无可再缩），未做改动"
+        )
+        return None
+
+    # Merge by key: replace only the targets this step rewrote, so unrelated
+    # planner writes (e.g. a VPP / tail the planner already set) survive.
+    plan.json_changes = [
+        item for item in plan.json_changes if item[0] not in drop_json_keys
+    ]
+    plan.json_changes.extend(new_json_changes)
+    replaced_yaml = {key for key, _value, _reason in new_yaml_changes}
+    plan.yaml_changes = [
+        item for item in plan.yaml_changes if item[0] not in replaced_yaml
+    ]
+    plan.yaml_changes.extend(new_yaml_changes)
+
+    # Only weight-shape changes (layers / experts / widths, all JSON) make the
+    # original checkpoint stale.  A pure max_seq_length shrink leaves every
+    # weight shape intact, so it must not drop the checkpoint reference.
+    if new_json_changes:
+        plan.structure_shrunk = True
+    plan.note = (plan.note + "；" if plan.note else "") + "强制缩结构到合法下限"
+    return None
 
 
 def plan_frozen(dims, target_cards, cards_per_node, frozen_by_performance=True):

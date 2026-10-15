@@ -115,6 +115,14 @@ def build_parser():
         "并且是唯一允许缩小 EP/PP（改模型结构）的模式",
     )
     parser.add_argument(
+        "--shrink-structure",
+        action="store_true",
+        help="在既定并行度之上，额外把模型结构（路由专家数 / 隐藏层数 / "
+        "逐层列表 / MoE 宽度）强制缩到合法下限，进一步压低 CI 计算量。必须与 "
+        "--test-accuracy 一起用，且不能与 --test-performance 同用；"
+        "reshard case 请勿使用（各 stage 模型结构必须一致）",
+    )
+    parser.add_argument(
         "--output-dir",
         default="./adapted_configs",
         help="输出目录（默认 ./adapted_configs）；--in-place 时忽略",
@@ -250,9 +258,25 @@ def main(argv=None):
         print("错误：--target-nodes 必须 >= 1", file=sys.stderr)
         return 1
 
+    if args.shrink_structure and not args.test_accuracy:
+        print(
+            "错误：--shrink-structure 必须与 --test-accuracy 一起使用"
+            "（缩结构属于模型结构变更，只在精度测试模式下允许）",
+            file=sys.stderr,
+        )
+        return 1
+    if args.shrink_structure and args.test_performance:
+        print(
+            "错误：--shrink-structure 与 --test-performance 互斥"
+            "（测速要求模型结构与源作业一致，缩结构会改变计算量）",
+            file=sys.stderr,
+        )
+        return 1
+
     options = AdaptOptions(
         test_performance=args.test_performance,
         test_accuracy=args.test_accuracy,
+        shrink_structure=args.shrink_structure,
     )
 
     before_yaml = before_json = None

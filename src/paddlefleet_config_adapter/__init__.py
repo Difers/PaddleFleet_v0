@@ -47,7 +47,12 @@ from .cli import build_parser, main, parse_overrides
 from .core import ConfigAdapter
 from .options import AdaptOptions
 from .plan import ParallelismPlan
-from .planner import ShrinkPlanner, plan_frozen, plan_parallelism
+from .planner import (
+    ShrinkPlanner,
+    plan_frozen,
+    plan_parallelism,
+    plan_structure_minimize,
+)
 from .precision import PRECISION_SWITCHES, plan_precision_switches
 from .sharding_shrink import (
     DEFAULT_SHRINK_FACTOR,
@@ -73,4 +78,5 @@ __all__ = [
     "plan_parallelism",
     "plan_precision_switches",
     "plan_sharding_shrink_switches",
+    "plan_structure_minimize",
 ]

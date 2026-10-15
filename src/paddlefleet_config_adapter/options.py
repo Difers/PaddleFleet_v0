@@ -41,9 +41,19 @@ from __future__ import annotations
 class AdaptOptions:
     """Derived behaviour of the two test switches."""
 
-    def __init__(self, test_performance=False, test_accuracy=False):
+    def __init__(
+        self,
+        test_performance=False,
+        test_accuracy=False,
+        shrink_structure=False,
+    ):
         self.test_performance = bool(test_performance)
         self.test_accuracy = bool(test_accuracy)
+        # --shrink-structure: on top of whatever the parallelism planner did,
+        # force the model structure (routed experts + hidden layers + per-layer
+        # lists) down to its legal floor. Requires --test-accuracy and is
+        # mutually exclusive with --test-performance (see cli.main).
+        self.shrink_structure = bool(shrink_structure)
 
     @property
     def freeze_parallel(self):
@@ -78,18 +88,26 @@ class AdaptOptions:
     @property
     def needs_model_config(self):
         """True when planning may have to read ``model_config.json``."""
-        return not self.freeze_parallel or self.inject_precision
+        return (
+            not self.freeze_parallel
+            or self.inject_precision
+            or self.shrink_structure
+        )
 
     @property
     def label(self):
         """Short name used in the report and the generated file header."""
         if self.test_performance and self.test_accuracy:
-            return "performance+accuracy"
-        if self.test_performance:
-            return "performance"
-        if self.test_accuracy:
-            return "accuracy"
-        return "default"
+            base = "performance+accuracy"
+        elif self.test_performance:
+            base = "performance"
+        elif self.test_accuracy:
+            base = "accuracy"
+        else:
+            base = "default"
+        if self.shrink_structure:
+            return base + "+shrink-structure"
+        return base
 
     @property
     def flags(self):
@@ -99,4 +117,6 @@ class AdaptOptions:
             given.append("--test-performance")
         if self.test_accuracy:
             given.append("--test-accuracy")
+        if self.shrink_structure:
+            given.append("--shrink-structure")
         return " ".join(given) if given else "未指定测试维度"

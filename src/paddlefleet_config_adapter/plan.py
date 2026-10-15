@@ -28,6 +28,10 @@ class ParallelismPlan:
             companion ``model_config.json``.
         warnings: user-facing warnings raised while planning.
         note: one-line description of what the plan did, for the report.
+        structure_shrunk: set by :func:`~.planner.plan_structure_minimize`
+            when ``--shrink-structure`` actually reduced the layer or expert
+            count, so the pipeline can drop checkpoint references even though
+            the parallel dims did not move.
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class ParallelismPlan:
         self.json_changes = list(json_changes or [])
         self.warnings = list(warnings or [])
         self.note = note
+        self.structure_shrunk = False
 
     def dims(self):
         """Return ``(tp, pp, ep, cp, sep)``."""

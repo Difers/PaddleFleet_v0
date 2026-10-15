@@ -34,6 +34,7 @@ All functions here are pure: no I/O, no mutation of the arguments.
 from __future__ import annotations
 
 from .topology import min_valid_cards
+from .utils import lcm
 
 DEFAULT_MIN_HIDDEN_LAYERS = 4
 
@@ -165,6 +166,92 @@ def align_layers(layers_new, head, pp_new, vpp_orig, min_tail=0):
     if best is None:
         return None, None
     return best
+
+
+def min_legal_layers(pp, vpp, first_k_dense_replace, family_min_layers):
+    """Smallest legal ``num_hidden_layers`` for the final parallelism.
+
+    The framework segments ``head + layers + tail`` into ``pp * vpp`` virtual
+    stages, so the layer count must be at least ``pp * vpp`` (one layer per
+    stage).  The dense-only prefix (``first_k_dense_replace``) has to fit
+    inside the stack, and each attention family the source used must keep at
+    least one layer -- a truncation keeps a prefix, so the binding family
+    constraint is the *last* first-appearance among them
+    (``family_min_layers``, computed by
+    :func:`~.layer_fields.min_layers_for_attention_families`).
+
+    This is a floor for the explicit ``--shrink-structure`` switch; it is not
+    the soft ``DEFAULT_MIN_HIDDEN_LAYERS`` recommendation, which only shapes a
+    warning.
+    """
+    return max(
+        int(pp) * int(vpp),
+        int(first_k_dense_replace),
+        int(family_min_layers),
+    )
+
+
+def min_routed_experts(ep, n_group, topk_group, num_experts_per_tok):
+    """Smallest legal routed-expert count for the final EP / grouping.
+
+    Used only by the explicit ``--shrink-structure`` switch.  The framework
+    requires:
+
+    * ``E % EP == 0`` -- every EP rank holds the same number of experts;
+    * ``E % n_group == 0`` -- the experts split evenly into routing groups;
+    * ``(E / n_group) * topk_group >= num_experts_per_tok`` -- the selected
+      groups can supply the top-k experts;
+    * ``E >= num_experts_per_tok`` -- a single group must hold enough.
+
+    The result is the smallest multiple of ``lcm(EP, n_group)`` that satisfies
+    all four.
+    """
+    ep = max(int(ep), 1)
+    n_group = max(int(n_group), 1)
+    topk_group = max(int(topk_group), 1)
+    topk = max(int(num_experts_per_tok), 1)
+    step = lcm(ep, n_group)
+    need = max(-(-topk * n_group // topk_group), topk, step)
+    return (-(-need // step)) * step
+
+
+#: Width alignment demanded by the fp8 e4m3 / DeepGEMM / MoonEP kernels: every
+#: shrunk MoE width must stay a multiple of this (block-scale tile size).
+WIDTH_ALIGN = 128
+
+#: Conservative lower bound for ``max_seq_length`` under ``--shrink-structure``.
+SEQ_LENGTH_FLOOR = 1024
+
+#: Sequence-length alignment for flash / fp8 kernels.
+SEQ_ALIGN = 128
+
+
+def min_aligned_width(width, align=WIDTH_ALIGN):
+    """Smallest multiple of ``align`` at or below ``width`` (shrink only).
+
+    Pushes a MoE width down to the smallest legal ``align`` multiple.  When
+    ``width`` is already ``<= align`` it is returned unchanged -- the floor
+    never grows a width, so a config already at (or below) the alignment keeps
+    its value.
+    """
+    width = int(width)
+    align = max(int(align), 1)
+    if width <= align:
+        return width
+    return align
+
+
+def min_seq_length(cp, csa_window_size):
+    """Smallest legal ``max_seq_length`` for this CP / sliding window.
+
+    The floor is ``max(SEQ_LENGTH_FLOOR, csa_window_size)`` (local KV must
+    cover the window) rounded up to ``lcm(SEQ_ALIGN, 2*CP)`` so it satisfies
+    both the flash / fp8 128-alignment and the zigzag CP split
+    (``seq % (2*cp) == 0``).
+    """
+    base = max(SEQ_LENGTH_FLOOR, int(csa_window_size or 0))
+    step = lcm(SEQ_ALIGN, 2 * max(int(cp), 1))
+    return (-(-base // step)) * step
 
 
 def min_shrink_cards(tp, pp, ep, cp, sep, cards_per_node):

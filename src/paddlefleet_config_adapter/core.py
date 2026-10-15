@@ -47,7 +47,7 @@ from .model_config_resolver import (
     resolve_model_config,
     rewrite_model_name_or_path,
 )
-from .planner import plan_parallelism
+from .planner import plan_parallelism, plan_structure_minimize
 from .precision import plan_precision_switches
 from .report import ChangeLog, format_header, format_report
 from .sharding_shrink import plan_sharding_shrink_switches
@@ -260,6 +260,20 @@ class ConfigAdapter:
                 f"--set fa_version=<版本> 改写或手动删除该字段"
             )
 
+        # --shrink-structure: on top of the plan's parallel-dimension shrink,
+        # force the model structure to its legal floor. Runs before the JSON
+        # writes are applied, so it can rewrite plan.json_changes in place;
+        # a no-op (and never reached) without the switch.
+        if self.options.shrink_structure:
+            err = plan_structure_minimize(
+                config,
+                model_config,
+                plan,
+                protected_yaml_keys=self.yaml_overrides,
+            )
+            if err:
+                return False, f"{input_path.name}: {err}"
+
         for key, value, reason in plan.json_changes:
             log.record(
                 "json",
@@ -302,7 +316,13 @@ class ConfigAdapter:
         if err:
             return False, f"{input_path.name}: {err}"
 
-        self._drop_stale_checkpoint_refs(config, log, dims_before, dims_after)
+        self._drop_stale_checkpoint_refs(
+            config,
+            log,
+            dims_before,
+            dims_after,
+            structure_shrunk=plan.structure_shrunk,
+        )
 
         # Nothing has touched the filesystem up to this point: every rewrite
         # above happened in memory, so a validation failure leaves both source
@@ -871,7 +891,9 @@ class ConfigAdapter:
             )
         return None
 
-    def _drop_stale_checkpoint_refs(self, config, log, dims_before, dims_after):
+    def _drop_stale_checkpoint_refs(
+        self, config, log, dims_before, dims_after, structure_shrunk=False
+    ):
         """Drop checkpoint references once the model structure has shrunk.
 
         Shrinking EP rescales ``n_routed_experts`` and shrinking PP rescales
@@ -881,16 +903,22 @@ class ConfigAdapter:
         plausible), but gradients blow up to NaN on the very first step.
         Dropping the reference falls back to random init, which is the only
         well-defined starting point for a shrunk smoke test.
+
+        ``structure_shrunk`` covers ``--shrink-structure``: it can reduce the
+        layer / expert count without moving PP or EP, which the dim comparison
+        below would otherwise miss.
         """
         tp_b, pp_b, ep_b, cp_b, sep_b = dims_before
         tp_a, pp_a, ep_a, cp_a, sep_a = dims_after
-        if ep_a >= ep_b and pp_a >= pp_b:
+        if ep_a >= ep_b and pp_a >= pp_b and not structure_shrunk:
             return
         shrunk = []
         if ep_a < ep_b:
             shrunk.append(f"EP {ep_b}->{ep_a}（专家数等比缩减）")
         if pp_a < pp_b:
             shrunk.append(f"PP {pp_b}->{pp_a}（层数等比缩减）")
+        if structure_shrunk:
+            shrunk.append("强制缩结构（层数/专家数/宽度缩到合法下限）")
         reason = (
             f"{'、'.join(shrunk)}后模型结构与原 checkpoint 不再匹配，"
             f"加载会得到权重错乱的模型（首步梯度即 NaN）；"
@@ -1000,6 +1028,7 @@ class ConfigAdapter:
             "output": str(output),
             "profile": self.options.label,
             "profile_flag": self.options.flags,
+            "shrink_structure": self.options.shrink_structure,
             "batch_strategy": self.options.batch_strategy,
             "orig_cards_label": orig_cards if orig_cards else "UNKNOWN",
             "orig_nodes_label": orig_nodes_label,
