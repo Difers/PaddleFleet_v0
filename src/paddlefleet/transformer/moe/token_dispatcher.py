@@ -3025,6 +3025,38 @@ def _prefetch_tok_ag_fp8(tok_fp8, group):
     }
 
 
+# Memoized answer of :func:`_sync_free_metadata_ignores_counts`.
+_SYNC_FREE_METADATA_IGNORES_COUNTS: bool | None = None
+
+
+def _sync_free_metadata_ignores_counts() -> bool:
+    """Whether ``sync_free_sizing`` metadata never reads ``tokens_per_expert``.
+
+    ``run_sonic_moe`` forwards the counts only to the metadata builder, which
+    under ``sync_free_sizing`` sizes its outputs from the shape bound. Its
+    fused CUDA path then never dereferences them, so the caller may pass
+    ``tokens_per_expert=None``; its eager fallback still host-prefix-sums
+    them, so that path needs them even when the sizing is sync-free.
+    ``deepep_metadata._HAS_TOPK_CUDA_KERNEL`` is what selects between the two,
+    which is why it is the flag read here.
+
+    Returns ``False`` whenever that cannot be established, which keeps the
+    counts being computed and passed as before.
+    """
+    global _SYNC_FREE_METADATA_IGNORES_COUNTS
+    if _SYNC_FREE_METADATA_IGNORES_COUNTS is None:
+        try:
+            from paddlefleet_ops.sonicmoe.ernie_compat import deepep_metadata
+
+            has_cuda_kernel = bool(
+                getattr(deepep_metadata, "_HAS_TOPK_CUDA_KERNEL", False)
+            )
+        except Exception:
+            has_cuda_kernel = False
+        _SYNC_FREE_METADATA_IGNORES_COUNTS = has_cuda_kernel
+    return _SYNC_FREE_METADATA_IGNORES_COUNTS
+
+
 class RingMoETokenDispatcher(AllGatherTokenDispatcher):
     """Two-level ring dispatcher for intermediate-sharded experts.
 
@@ -3350,6 +3382,13 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             tokens_per_expert_histogram_triton,
         )
 
+        # The ring always asks the expert op for `sync_free_sizing`, under
+        # which the fused metadata kernel sizes its outputs from the shape
+        # bound and never reads the per-expert counts. Where that is the case
+        # the per-round histogram is dead work on the calc stream, so skip it
+        # and let the expert op take `tokens_per_expert=None`.
+        need_hist = not _sync_free_metadata_ignores_counts()
+
         local_idx, local_w = mask_cast_routing_w(
             topk_indices.detach(), topk_weights, probs_dtype
         )
@@ -3607,8 +3646,12 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                             seg_pair, rt_group
                         )
                     g_idx, g_w = _routing_unpair(gathered_pair, k_topk, w_dtype)
-                    hist = tokens_per_expert_histogram_triton(
-                        g_idx, self.num_experts
+                    hist = (
+                        tokens_per_expert_histogram_triton(
+                            g_idx, self.num_experts
+                        )
+                        if need_hist
+                        else None
                     )
 
                     def _do_gemm():
@@ -3840,13 +3883,30 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 if remote_ag_issued:
                     _issue_remote_out_gathers()
                 g_se = None
-                if se_bwf is not None:
+
+                def _run_se_bwd():
+                    # Shared-expert backward: independent of the ring chain,
+                    # so it can be enqueued wherever it covers most comm.
+                    nonlocal g_se
+                    if se_bwf is None:
+                        return
                     se_grads = se_bwf(*g_se_out)
                     g_se = (
                         se_grads[0]
                         if isinstance(se_grads, (tuple, list))
                         else se_grads
                     )
+
+                # The output gathers above are already ordered on the comm
+                # side and the home round's expert backward covers the inter
+                # one, while the final reverse hop at the end of this function
+                # has no compute left after it. Moving the shared expert there
+                # trades a covered gather for a covered hop. Only safe when
+                # the remote gathers were issued without waiting; otherwise
+                # the wait below is what the shared expert has to cover.
+                se_late = remote_ag_issued
+                if not se_late:
+                    _run_se_bwd()
                 if not remote_ag_issued:
                     g_all_task.wait()
                     _issue_remote_out_gathers()
@@ -3900,15 +3960,24 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     out, task = _reduce_scatter_async(src_buf, pair_inter_group)
                     rt_rs.update({"out": out, "task": task, "src": src_buf})
 
-                def _rt_rs_finish():
+                def _rt_rs_finish(overlap=None):
                     # Finish with the intra ReduceScatter, giving the remote
                     # rounds' contribution to the home router-weight grad.
+                    # `overlap` is enqueued after the transfer is issued and
+                    # before it is waited on: issuing a collective orders it
+                    # after the calc stream's current tail, so compute
+                    # enqueued first would serialize the transfer behind it
+                    # instead of hiding it.
                     if not rt_rs:
+                        if overlap is not None:
+                            overlap()
                         return None
                     rt_rs["task"].wait()
                     local_grad, t = _reduce_scatter_async(
                         rt_rs.pop("out"), rt_group
                     )
+                    if overlap is not None:
+                        overlap()
                     t.wait()
                     rt_rs.clear()
                     return _w_of(local_grad)
@@ -4028,9 +4097,16 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     last_w_rev = _raw_inter_shift_async(
                         last_w_src, pair_inter_group, src, dst, last_w_hop
                     )
-                # Pre-gather: the remote rounds' weight grads, finished under
-                # the hops just issued.
-                g_w_pregather = _rt_rs_finish() if pair_pregather else None
+                # The hops are in flight and every expert backward is done, so
+                # this is the one place in the backward with nothing left to
+                # cover a cross-node transfer. The shared expert, when held
+                # back for exactly that, is enqueued inside `_rt_rs_finish`
+                # so it also covers the router-grad ReduceScatter of the
+                # pre-gather (which must stay fp32, so overlapping it is the
+                # only thing left to do with it).
+                g_w_pregather = _rt_rs_finish(
+                    overlap=_run_se_bwd if se_late else None
+                )
                 self._drain([last_tok_hop, last_w_hop])
                 for g_w_extra in (last_w_rev, g_w_pregather):
                     if g_w_extra is not None:
