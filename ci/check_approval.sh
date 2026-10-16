@@ -162,6 +162,14 @@ for FILE in "${REQUIREMENTS_FILES[@]}"; do
 done
 
 
+LARGEPR_APPROVERS="sneaxiy"
+if [ "${PR_ID}" != "" ] && { [ "${git_files:-0}" -gt 20 ] || [ "${git_count:-0}" -gt 1000 ]; }; then
+    echo_line="You must be approved by ${LARGEPR_APPROVERS} for PRs that change more than 20 files or add more than 1000 lines.\n"
+    APPROVER_LIST=(${LARGEPR_APPROVERS})
+    check_approval 1 "${APPROVER_LIST[@]}"
+fi
+
+
 if [ -n "${echo_list}" ];then
   echo "****************"
   echo -e "${echo_list[@]}"
