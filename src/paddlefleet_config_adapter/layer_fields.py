@@ -44,6 +44,8 @@ from __future__ import annotations
 
 from collections import namedtuple
 
+from .field_spec import nested_find, nested_get
+
 # includes_mtp: the expected length counts the trailing MTP layers.
 # families: entries encode an attention family whose presence must survive.
 LayerField = namedtuple("LayerField", ["aliases", "includes_mtp", "families"])
@@ -60,6 +62,23 @@ LAYER_FIELDS = (
     LayerField(("layer_types",), includes_mtp=False, families=False),
     LayerField(("moe_layer_freq",), includes_mtp=False, families=False),
 )
+
+
+def _locate_layer_field(model_config, aliases):
+    """``(value, dotted_path)`` for the first alias present, searched with the
+    SAME scope as :func:`field_spec.resolve_fields` (top level first, then each
+    ``STRUCTURE_SECTIONS`` sub-config); ``(None, None)`` if absent.
+
+    Per-layer lists must be located in the same scope the layer *count* is, or a
+    HyperBody run would shrink ``decoder_config.num_hidden_layers`` while leaving
+    the sibling ``decoder_config.moe_layer_freq`` at full length -- a config that
+    then dies in ``decoder_layer_specs`` with ``moe_layer_freq length != ...``.
+    """
+    for alias in aliases:
+        value, path = nested_find(model_config, alias)
+        if path is not None:
+            return value, path
+    return None, None
 
 
 class StaleMtpKeyError(ValueError):
@@ -81,11 +100,11 @@ def reject_stale_mtp_key(model_config):
     """
     if model_config is None:
         return
-    if not model_config.get("mtp_num_layers"):
+    if not nested_get(model_config, "mtp_num_layers"):
         return
     raise StaleMtpKeyError(
         "model_config.json still sets the removed `mtp_num_layers` "
-        f"(={model_config.get('mtp_num_layers')!r}). Use "
+        f"(={nested_get(model_config, 'mtp_num_layers')!r}). Use "
         "`num_nextn_predict_layers` instead: it is the only field the MTP "
         "consumers read. TransformerConfig rejects a non-zero "
         "`mtp_num_layers` outright, so this config cannot start training "
@@ -102,7 +121,7 @@ def effective_mtp_layers(model_config):
     if model_config is None:
         return 0
     reject_stale_mtp_key(model_config)
-    return int(model_config.get("num_nextn_predict_layers") or 0)
+    return int(nested_get(model_config, "num_nextn_predict_layers") or 0)
 
 
 def _csa_family(ratio):
@@ -151,10 +170,9 @@ def min_layers_for_attention_families(model_config):
     mtp = effective_mtp_layers(model_config)
     floor = 0
     for field in LAYER_FIELDS:
-        key = next((a for a in field.aliases if a in model_config), None)
-        if key is None:
+        value, _path = _locate_layer_field(model_config, field.aliases)
+        if value is None:
             continue
-        value = model_config[key]
         if not isinstance(value, list):
             continue
         tail = mtp if field.includes_mtp else 0
@@ -180,7 +198,9 @@ def _shares_mtp_attention(model_config, mtp_layers):
     HCA/CSA expose different parameters, and the mismatched broadcast hangs the
     job instead of raising.
     """
-    return bool(model_config.get("mtp_shared_last_layer")) and mtp_layers > 0
+    return bool(nested_get(model_config, "mtp_shared_last_layer")) and (
+        mtp_layers > 0
+    )
 
 
 def plan_layer_field_shrink(model_config, layers_old, layers_new, mtp_layers):
@@ -198,10 +218,9 @@ def plan_layer_field_shrink(model_config, layers_old, layers_new, mtp_layers):
     shares_mtp = _shares_mtp_attention(model_config, mtp_layers)
 
     for field in LAYER_FIELDS:
-        key = next((a for a in field.aliases if a in model_config), None)
+        value, key = _locate_layer_field(model_config, field.aliases)
         if key is None:
             continue
-        value = model_config[key]
         # Scalar forms (e.g. an int window_attn_skip_freq) are layer-count
         # independent and need no rewrite.
         if not isinstance(value, list):

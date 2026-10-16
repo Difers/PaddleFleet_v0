@@ -72,9 +72,16 @@ from .constraints import (
     min_shrink_cards,
     pp_candidates,
 )
-from .field_spec import describe_missing, resolve_fields
+from .field_spec import (
+    describe_missing,
+    nested_find,
+    nested_get,
+    resolve_encoder_fields,
+    resolve_fields,
+)
 from .layer_fields import (
     LAYER_FIELDS,
+    _locate_layer_field,
     effective_mtp_layers,
     min_layers_for_attention_families,
     plan_layer_field_shrink,
@@ -118,6 +125,26 @@ def _vpp_off_reason(vpp_old, pp):
         f"（virtual pipeline must run under pp degree > 2），"
         f"VPP {vpp_old} -> 1"
     )
+
+
+def _encoder_ep_legal(enc_experts, enc_topk, ep_new):
+    """Is the (un-shrunk) HyperEncoder expert pool legal under ``ep_new``?
+
+    HyperBody runs its encoder tower on the SAME global EP as the decoder. EP
+    adaptation keeps the encoder's expert count fixed on purpose (see the
+    field_spec module doc and :func:`plan_structure_minimize`): the encoder pool
+    is small, so shrinking it with EP would only raise the smallest feasible EP
+    and limit how far cards can be reduced. The one thing we must still check is
+    that the shared EP keeps the fixed pool legal --
+    ``HyperEncoderProvider._check_divisibility`` asserts ``n_routed_experts %
+    ep == 0`` and the router needs at least top-k experts.
+
+    ``enc_experts is None`` means there is no ``encoder_config`` (every
+    non-HyperBody model), so the check is vacuously true.
+    """
+    if enc_experts is None:
+        return True
+    return enc_experts % ep_new == 0 and enc_experts >= (enc_topk or 1)
 
 
 def plan_parallelism(
@@ -269,7 +296,10 @@ def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
         new_json_changes.extend(layer_changes)
         drop_json_keys.add(layout["layers_key"])
         for field in LAYER_FIELDS:
-            key = next((a for a in field.aliases if a in model_config), None)
+            # Same nested scope as plan_layer_field_shrink: drop the per-layer
+            # key by its real (possibly decoder_config.*) path so a user --set
+            # protection and the merge-by-key dedup both match.
+            _value, key = _locate_layer_field(model_config, field.aliases)
             if key is not None:
                 drop_json_keys.add(key)
         if vpp_new != vpp:
@@ -301,8 +331,12 @@ def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
     )
     if num_experts is not None and topk is not None:
         experts_key = resolved["num_experts"].writeback_key
-        n_group = int(model_config.get("n_group", 1) or 1)
-        topk_group = int(model_config.get("topk_group", n_group) or n_group)
+        # n_group / topk_group are not in FIELD_SPECS; read them flat-or-nested
+        # (HyperBody keeps them under decoder_config) with the same precedence.
+        n_group = int(nested_get(model_config, "n_group", 1) or 1)
+        topk_group = int(
+            nested_get(model_config, "topk_group", n_group) or n_group
+        )
         experts_min = min_routed_experts(plan.ep, n_group, topk_group, topk)
         cur_experts = int(final_json.get(experts_key, num_experts))
         if experts_min < cur_experts:
@@ -322,7 +356,9 @@ def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
     # Pure architectural widths: shrinking them only rescales weight shapes
     # (and the derived shared-expert width), with no dependent identity field.
     # The 128 floor keeps the fp8 / DeepGEMM / MoonEP block-scale tiles legal.
-    dispatcher = str(model_config.get("moe_token_dispatcher_type") or "")
+    dispatcher = str(
+        nested_get(model_config, "moe_token_dispatcher_type") or ""
+    )
     intermediate_sharding = dispatcher in ("allgather", "ringmoe")
     # moe_intermediate_size: with intermediate-dim sharding the floor rises to
     # EP*128, which satisfies both ``% EP == 0`` and (under fp8) the
@@ -337,9 +373,13 @@ def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
         ("moe_intermediate_size", moe_width_align),
         ("moe_latent_size", WIDTH_ALIGN),
     ):
-        if key not in model_config:
+        # Flat-or-nested: HyperBody keeps moe_intermediate_size under
+        # decoder_config while moe_latent_size stays top level, so resolve each
+        # key's own path and write the shrink back to that exact location.
+        raw_width, width_path = nested_find(model_config, key)
+        if width_path is None:
             continue
-        raw_width = final_json.get(key, model_config[key])
+        raw_width = final_json.get(width_path, raw_width)
         # Guard against a field that is declared but not a usable width:
         # ``moe_latent_size: null`` (MiniMax-M2 default) or a list-valued
         # ``moe_intermediate_size`` (ernie). Skip it rather than let int()
@@ -353,13 +393,79 @@ def plan_structure_minimize(config, model_config, plan, protected_yaml_keys=()):
         if floor < cur_width:
             new_json_changes.append(
                 (
-                    key,
+                    width_path,
                     floor,
                     f"强制缩结构：{key} 缩到 128 对齐下限 {floor}"
                     f"（align={field_align}），{cur_width} -> {floor}",
                 )
             )
-            drop_json_keys.add(key)
+            drop_json_keys.add(width_path)
+
+    # ---- HyperEncoder (encoder_config) ----------------------------------
+    # Policy split for the HyperEncoder tower (see field_spec module doc):
+    #   * EP ADAPTATION never shrinks the encoder -- it only *validates* that
+    #     the fixed encoder expert pool stays legal under the shared global EP
+    #     (ShrinkPlanner._encoder_ep_rejection); shrinking the encoder's small
+    #     pool there would only tighten the min-EP and so limit how far cards
+    #     can be reduced.
+    #   * --shrink-structure (this function) DOES actively shrink the encoder,
+    #     because a CI run whose whole point is to be tiny should not keep the
+    #     encoder's full expert count + MoE width resident.  The encoder shares
+    #     the decoder's final EP (plan.ep), and has no per-layer list fields, so
+    #     this is a self-contained experts + MoE-width floor.  The encoder's own
+    #     num_hidden_layers is intentionally left untouched: the HyperEncoder is
+    #     not pipeline-split and its minimum legal depth is not asserted anywhere
+    #     we could verify, so shrinking it is deferred rather than guessed.
+    enc_resolved, _enc_missing = resolve_encoder_fields(model_config)
+    if "num_experts" in enc_resolved and "num_experts_per_tok" in enc_resolved:
+        enc_section = model_config.get("encoder_config", {})
+        enc_experts = enc_resolved["num_experts"].value
+        enc_topk = enc_resolved["num_experts_per_tok"].value
+        enc_experts_key = enc_resolved["num_experts"].writeback_key
+        enc_n_group = int(enc_section.get("n_group", 1) or 1)
+        enc_topk_group = int(
+            enc_section.get("topk_group", enc_n_group) or enc_n_group
+        )
+        enc_experts_min = min_routed_experts(
+            plan.ep, enc_n_group, enc_topk_group, enc_topk
+        )
+        cur_enc_experts = int(final_json.get(enc_experts_key, enc_experts))
+        if enc_experts_min < cur_enc_experts:
+            new_json_changes.append(
+                (
+                    enc_experts_key,
+                    enc_experts_min,
+                    f"强制缩结构：HyperEncoder 路由专家数缩到合法下限 "
+                    f"{enc_experts_min}（共享 EP={plan.ep}, "
+                    f"n_group={enc_n_group}, topk_group={enc_topk_group}, "
+                    f"top-k={enc_topk}），{cur_enc_experts} -> {enc_experts_min}",
+                )
+            )
+            drop_json_keys.add(enc_experts_key)
+        enc_width, enc_width_path = nested_find(
+            enc_section, "moe_intermediate_size"
+        )
+        # enc_section is the encoder sub-dict, so nested_find returns a bare key
+        # ("moe_intermediate_size"); re-prefix it to the full encoder path.
+        if (
+            enc_width_path is not None
+            and isinstance(enc_width, int)
+            and not isinstance(enc_width, bool)
+            and enc_width > 0
+        ):
+            enc_width_key = f"encoder_config.{enc_width_path}"
+            cur_enc_width = final_json.get(enc_width_key, enc_width)
+            enc_floor = min_aligned_width(cur_enc_width, WIDTH_ALIGN)
+            if enc_floor < cur_enc_width:
+                new_json_changes.append(
+                    (
+                        enc_width_key,
+                        enc_floor,
+                        f"强制缩结构：HyperEncoder moe_intermediate_size 缩到 "
+                        f"128 对齐下限 {enc_floor}，{cur_enc_width} -> {enc_floor}",
+                    )
+                )
+                drop_json_keys.add(enc_width_key)
 
     # ---- max_seq_length -------------------------------------------------
     # Attention / sequence compute scales with the sequence length.  Shrink it
@@ -533,6 +639,22 @@ class ShrinkPlanner:
             if "num_experts" in resolved
             else "n_routed_experts"
         )
+        # HyperEncoder expert pool, resolved from encoder_config only. Used to
+        # VALIDATE (never shrink) every candidate EP: the encoder shares the
+        # decoder's global EP, so an ep_new that does not divide the fixed
+        # encoder pool would crash HyperEncoderProvider at build time. No
+        # encoder_config -> enc_experts stays None -> _encoder_ep_legal passes.
+        enc_resolved, _enc_missing = resolve_encoder_fields(model_config)
+        enc_experts = (
+            enc_resolved["num_experts"].value
+            if "num_experts" in enc_resolved
+            else None
+        )
+        enc_topk = (
+            enc_resolved["num_experts_per_tok"].value
+            if "num_experts_per_tok" in enc_resolved
+            else None
+        )
         # MoE detection is structural: EP > 1 means expert parallelism is on,
         # regardless of any use_moe flag (MiniMax only sets EP + the flag).
         can_shrink_ep = (
@@ -556,6 +678,14 @@ class ShrinkPlanner:
                 if not ok:
                     rejections.append(
                         f"EP {ep} -> {ep_new}：{_first_constraint(why)}"
+                    )
+                    continue
+                if not _encoder_ep_legal(enc_experts, enc_topk, ep_new):
+                    rejections.append(
+                        f"EP {ep} -> {ep_new}：HyperEncoder 专家池 "
+                        f"{enc_experts} 在该 EP 下不合法"
+                        f"（% EP != 0 或 < top-k={enc_topk}）；"
+                        f"EP 适配不缩 encoder"
                     )
                     continue
                 pool.append((ep_new, experts_new))
@@ -617,6 +747,7 @@ class ShrinkPlanner:
                     target_cards,
                     rejections,
                     model_config,
+                    encoder=(enc_experts, enc_topk),
                 )
                 if plan is not None:
                     return plan, None
@@ -802,6 +933,7 @@ class ShrinkPlanner:
         target_cards,
         rejections,
         model_config,
+        encoder=(None, None),
     ):
         """Tier 3: shrink EP and PP together. Returns a plan or ``None``.
 
@@ -816,9 +948,14 @@ class ShrinkPlanner:
         ``num_hidden_layers`` -- and with it every per-layer list, the VPP
         degree and the empty tail -- so a shallower pipeline cut is worth a
         deeper expert cut.
+
+        ``encoder`` is the fixed HyperEncoder ``(experts, top-k)`` pool; like
+        the EP-only tier, a candidate EP that would make it illegal is rejected
+        (the encoder is validated, never shrunk, during EP adaptation).
         """
         tp, pp, ep, cp, sep = dims
         num_experts, topk, experts_key = moe
+        enc_experts, enc_topk = encoder
 
         pool = []
         for ep_new in ep_candidates(ep, tp, sep):
@@ -826,6 +963,12 @@ class ShrinkPlanner:
                 ep, ep_new, num_experts, topk
             )
             if not ok:
+                continue
+            if not _encoder_ep_legal(enc_experts, enc_topk, ep_new):
+                rejections.append(
+                    f"EP {ep} -> {ep_new}：HyperEncoder 专家池 "
+                    f"{enc_experts} 在该 EP 下不合法；EP 适配不缩 encoder"
+                )
                 continue
             for pp_new in pp_candidates(pp):
                 ok, why, meta = check_pp_shrink(

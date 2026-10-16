@@ -16,12 +16,19 @@
 
 All document mutation and serialization lives here so the rest of the package
 only decides *what* to set, never *how* it is written.  ``apply_config_map``
-semantics for both writers, given a flat ``{key: value}`` map:
+semantics for both writers, given a ``{key: value}`` map:
 
 * key already present -> overwritten in place (ruamel keeps the original
   position, comments and quote style);
 * key missing -> appended as a new field;
 * key listed in ``protected`` -> left untouched.
+
+A ``key`` may be a *dotted path* (``decoder_config.n_routed_experts``) to reach
+a value nested inside a sub-mapping -- HyperBody keeps the decoder/encoder
+geometry under ``decoder_config`` / ``encoder_config``.  A plain, dot-free key
+(every flat model, and every user ``--set`` without a dot) is written at the top
+level exactly as before, so the nesting support is transparent to existing
+callers.
 """
 
 from __future__ import annotations
@@ -79,20 +86,42 @@ def detect_map_indent(document, default=DEFAULT_MAP_INDENT):
     return max(steps, key=lambda step: (steps[step], -step))
 
 
+def _resolve_container(document, key):
+    """Walk a dotted ``key`` to ``(container, leaf_key)`` for get/set.
+
+    ``decoder_config.n_routed_experts`` descends into the ``decoder_config``
+    sub-mapping and returns ``(decoder_config, "n_routed_experts")``.  A plain
+    key, or one whose head segment is not an existing sub-mapping, is treated as
+    a flat top-level key -- so a legitimate top-level key that happens to carry a
+    dot still round-trips, and every pre-nesting caller is unchanged.
+    """
+    if "." in key:
+        head, _, tail = key.partition(".")
+        sub = document.get(head) if hasattr(document, "get") else None
+        if isinstance(sub, dict):
+            return _resolve_container(sub, tail)
+    return document, key
+
+
 def _apply(document, config_map, protected=None):
-    """Merge ``config_map`` into ``document`` in place, returning the diff."""
+    """Merge ``config_map`` into ``document`` in place, returning the diff.
+
+    ``protected`` is matched against the *full* (possibly dotted) key, so a
+    user ``--set json:decoder_config.x=..`` shields that exact nested target.
+    """
     protected = set(protected or ())
     changes = []
     for key, value in config_map.items():
         if key in protected:
             continue
-        if key in document:
-            old = document[key]
+        container, leaf = _resolve_container(document, key)
+        if leaf in container:
+            old = container[leaf]
             if old != value:
                 changes.append(("modified", key, old, value))
         else:
             changes.append(("added", key, None, value))
-        document[key] = value
+        container[leaf] = value
     return changes
 
 

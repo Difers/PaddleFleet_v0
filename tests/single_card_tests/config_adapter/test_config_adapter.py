@@ -50,8 +50,13 @@ from paddlefleet_config_adapter.constraints import (
     pp_candidates,
 )
 from paddlefleet_config_adapter.field_spec import (
+    ENCODER_SECTION,
     FIELD_SPECS,
+    STRUCTURE_SECTIONS,
     describe_missing,
+    nested_find,
+    nested_get,
+    resolve_encoder_fields,
     resolve_fields,
 )
 from paddlefleet_config_adapter.io_writers import (
@@ -804,6 +809,92 @@ class TestFieldSpec(unittest.TestCase):
         message = describe_missing("num_experts", FIELD_SPECS["num_experts"])
         self.assertIn("n_routed_experts", message)
         self.assertIn("--set json:", message)
+
+
+class TestNestedFieldSpec(unittest.TestCase):
+    """HyperBody nests the structural fields under decoder_config / encoder_config."""
+
+    HYPERBODY = {
+        "num_nextn_predict_layers": 1,
+        "moe_token_dispatcher_type": "deepep",
+        "decoder_config": {
+            "num_hidden_layers": 43,
+            "n_routed_experts": 512,
+            "num_experts_per_tok": 10,
+            "first_k_dense_replace": 1,
+            "moe_intermediate_size": 2048,
+            "n_group": 1,
+            "topk_group": 1,
+        },
+        "encoder_config": {
+            "num_hidden_layers": 12,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 6,
+            "first_k_dense_replace": 1,
+            "moe_intermediate_size": 896,
+        },
+    }
+
+    def test_decoder_fields_resolve_from_decoder_config(self):
+        resolved, missing = resolve_fields(self.HYPERBODY)
+        self.assertEqual(missing, {})
+        # Nested value is read, and the write-back path points back into the
+        # exact sub-mapping -- not a stray top-level key the loader ignores.
+        self.assertEqual(resolved["num_experts"].value, 512)
+        self.assertEqual(
+            resolved["num_experts"].writeback_key,
+            "decoder_config.n_routed_experts",
+        )
+        self.assertEqual(resolved["num_hidden_layers"].value, 43)
+        self.assertEqual(
+            resolved["num_hidden_layers"].writeback_key,
+            "decoder_config.num_hidden_layers",
+        )
+        # A field that really is top level keeps a plain, dot-free key.
+        self.assertEqual(
+            resolved["num_nextn_predict_layers"].writeback_key,
+            "num_nextn_predict_layers",
+        )
+
+    def test_decoder_scope_never_picks_up_the_encoder_copy(self):
+        # Only encoder_config carries the experts; the decoder scope must still
+        # report it missing rather than silently resolve the encoder's value.
+        resolved, missing = resolve_fields(
+            {
+                "num_hidden_layers": 8,
+                "encoder_config": {"n_routed_experts": 64},
+            }
+        )
+        self.assertIn("num_experts", missing)
+        self.assertNotIn("num_experts", resolved)
+
+    def test_resolve_encoder_fields_targets_encoder_config(self):
+        resolved, missing = resolve_encoder_fields(self.HYPERBODY)
+        self.assertEqual(resolved["num_experts"].value, 64)
+        self.assertEqual(
+            resolved["num_experts"].writeback_key,
+            "encoder_config.n_routed_experts",
+        )
+        self.assertEqual(resolved["num_experts_per_tok"].value, 6)
+
+    def test_resolve_encoder_fields_is_a_noop_without_encoder(self):
+        resolved, missing = resolve_encoder_fields({"n_routed_experts": 8})
+        self.assertEqual(resolved, {})
+        self.assertEqual(missing, {})
+
+    def test_nested_find_and_get_follow_top_level_first(self):
+        # moe_token_dispatcher_type lives top level, n_group under decoder_config.
+        value, path = nested_find(self.HYPERBODY, "moe_token_dispatcher_type")
+        self.assertEqual((value, path), ("deepep", "moe_token_dispatcher_type"))
+        value, path = nested_find(self.HYPERBODY, "n_group")
+        self.assertEqual((value, path), (1, "decoder_config.n_group"))
+        self.assertIsNone(nested_find(self.HYPERBODY, "does_not_exist")[1])
+        self.assertEqual(nested_get(self.HYPERBODY, "n_group", 7), 1)
+        self.assertEqual(nested_get(self.HYPERBODY, "absent", 7), 7)
+
+    def test_structure_sections_excludes_the_encoder(self):
+        # Guard the invariant the decoder scope relies on.
+        self.assertNotIn(ENCODER_SECTION, STRUCTURE_SECTIONS)
 
 
 class TestModelConfigResolution(unittest.TestCase):
@@ -3034,6 +3125,128 @@ max_steps: 100
         out = self.load_output_yaml(8)
         self.assertEqual(out["max_seq_length"], 16384)
         self.assertEqual(out["context_parallel_size"], 2)
+
+
+class TestDottedPathWrite(unittest.TestCase):
+    """io_writers resolves a dotted key into the nested mapping it names."""
+
+    def test_apply_writes_into_the_nested_sub_mapping(self):
+        doc = {"decoder_config": {"n_routed_experts": 512}, "flat": 1}
+        changes = JsonWriter().apply_config_map(
+            doc, {"decoder_config.n_routed_experts": 8, "flat": 2}
+        )
+        self.assertEqual(doc["decoder_config"]["n_routed_experts"], 8)
+        self.assertEqual(doc["flat"], 2)
+        # No stray top-level key is invented for the nested target.
+        self.assertNotIn("decoder_config.n_routed_experts", doc)
+        self.assertIn(
+            ("modified", "decoder_config.n_routed_experts", 512, 8), changes
+        )
+
+    def test_protected_matches_the_full_dotted_key(self):
+        doc = {"decoder_config": {"n_routed_experts": 512}}
+        changes = JsonWriter().apply_config_map(
+            doc,
+            {"decoder_config.n_routed_experts": 8},
+            protected={"decoder_config.n_routed_experts"},
+        )
+        self.assertEqual(doc["decoder_config"]["n_routed_experts"], 512)
+        self.assertEqual(changes, [])
+
+
+# HyperBody-shaped source: PP/EP in the YAML, structure nested in the JSON.
+HYPERBODY_MODEL_CONFIG = {
+    "model_type": "hyperbody",
+    "num_nextn_predict_layers": 1,
+    "moe_token_dispatcher_type": "deepep",
+    "multimax_modules": ["lm_head"],
+    "decoder_config": {
+        "num_hidden_layers": 64,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "first_k_dense_replace": 1,
+        "moe_intermediate_size": 2048,
+        "n_group": 1,
+        "topk_group": 1,
+        # Materialized per-layer list (HyperBodyDecoderConfig always writes it).
+        # It lives in the SAME sub-config as the layer count, so a PP shrink
+        # must trim it there too or decoder_layer_specs rejects the length.
+        "moe_layer_freq": [0] + [1] * 63,
+    },
+    "encoder_config": {
+        "num_hidden_layers": 12,
+        "n_routed_experts": 64,
+        "num_experts_per_tok": 6,
+        "first_k_dense_replace": 1,
+        "moe_intermediate_size": 896,
+    },
+}
+
+
+class TestHyperBodyNestedAdaptation(ConfigAdapterTestBase):
+    """End-to-end adaptation of a config whose structure is nested."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_json(HYPERBODY_MODEL_CONFIG)
+
+    def test_ep_shrink_reads_and_writes_the_decoder_config(self):
+        ok, message = self.adapt(target_nodes=1, test_accuracy=True)
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(8)
+        model_config = self.load_output_json(8)
+
+        # Same topology math as the flat case: EP 64 -> 2, PP 8 -> 4.
+        self.assertEqual(config["expert_model_parallel_size"], 2)
+        self.assertEqual(config["pipeline_model_parallel_size"], 4)
+        # The experts / layers write-backs land INSIDE decoder_config, and no
+        # stray top-level copy is created.
+        self.assertEqual(model_config["decoder_config"]["n_routed_experts"], 8)
+        self.assertEqual(
+            model_config["decoder_config"]["num_hidden_layers"], 32
+        )
+        self.assertNotIn("n_routed_experts", model_config)
+        self.assertNotIn("num_hidden_layers", model_config)
+        # The per-layer list nested beside the layer count is trimmed to match
+        # the shrunk num_hidden_layers (else the model dies in
+        # decoder_layer_specs with "moe_layer_freq length 64 != 32").
+        self.assertEqual(
+            len(model_config["decoder_config"]["moe_layer_freq"]), 32
+        )
+        # EP adaptation validates but NEVER shrinks the encoder tower.
+        self.assertEqual(model_config["encoder_config"]["n_routed_experts"], 64)
+        self.assertEqual(
+            model_config["encoder_config"]["moe_intermediate_size"], 896
+        )
+
+    def test_shrink_structure_also_shrinks_the_encoder(self):
+        ok, message = self.adapt(
+            target_nodes=1, test_accuracy=True, shrink_structure=True
+        )
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        # Decoder MoE width floored to the 128-aligned minimum (nested).
+        self.assertEqual(
+            model_config["decoder_config"]["moe_intermediate_size"], 128
+        )
+        # Encoder is actively shrunk under --shrink-structure: experts to the
+        # min legal count for the shared EP (plan.ep == 2), width to 128.
+        self.assertEqual(model_config["encoder_config"]["n_routed_experts"], 6)
+        self.assertEqual(
+            model_config["encoder_config"]["moe_intermediate_size"], 128
+        )
+
+    def test_encoder_illegal_under_a_candidate_ep_is_rejected(self):
+        # An encoder pool that no reachable EP divides blocks the shrink and the
+        # diagnostic names the encoder as the reason (encoder is never shrunk to
+        # rescue EP adaptation).
+        cfg = json.loads(json.dumps(HYPERBODY_MODEL_CONFIG))
+        cfg["encoder_config"]["n_routed_experts"] = 7
+        cfg["encoder_config"]["num_experts_per_tok"] = 1
+        self.write_json(cfg)
+        ok, message = self.adapt(target_nodes=1, test_accuracy=True)
+        self.assertFalse(ok, message)
+        self.assertIn("HyperEncoder", message)
 
 
 if __name__ == "__main__":
