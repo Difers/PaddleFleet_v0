@@ -91,7 +91,7 @@ tests:
   - test_case: [tests/multi_card_tests/moe/test_allgather_dispatcher_ep.py]
     products:
       - num_gpus: 2
-  # G=2 and N=4 under the default 8-card runner, covering both ring levels.
+  # Two-level RingMoE on 8 GPUs: G=2/N=4 and G=4/N=2, bf16 and fp8.
   - test_case: [tests/multi_card_tests/moe/test_ring_dispatcher_two_level.py]
     products:
       - num_gpus: 8

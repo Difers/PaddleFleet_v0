@@ -331,14 +331,12 @@ class MoELayer(nn.Layer):
         self.sequence_parallel = config.sequence_parallel
         self.tensor_model_parallel_size = config.tensor_model_parallel_size
         self.moe_token_dispatcher_type = config.moe_token_dispatcher_type
-        # 'allgather' and 'ringmoe' are independent dispatchers sharing one
-        # expert layout: every rank holds all experts, each sharded along its
-        # intermediate dim (I // EP). Expert construction, config validation,
-        # num_experts_per_device and the checkpoint shard declarations key off
-        # that layout, not the dispatcher identity. Mirrors
-        # GroupedMLPExpert.intermediate_ep_sharded; keep the two in sync.
-        # moe_token_dispatcher_type itself is never rewritten, so every layer
-        # and checkpoint-layout decision still sees what was configured.
+        # 'allgather' and 'ringmoe' share one expert layout: every rank holds
+        # all experts, each sharded along its intermediate dim (I // EP).
+        # Expert construction, config validation, num_experts_per_device and
+        # the checkpoint shard declarations key off this layout rather than
+        # the dispatcher. Keep in sync with
+        # GroupedMLPExpert.intermediate_ep_sharded.
         self.use_ring_moe = self.moe_token_dispatcher_type == "ringmoe"
         self.use_intermediate_ep_sharding = self.moe_token_dispatcher_type in (
             "allgather",
@@ -806,12 +804,10 @@ class MoELayer(nn.Layer):
                     getattr(self, "grouped_gemm_experts", None),
                     "set_calls_per_micro_batch",
                 ):
-                    # The ring runs the expert once per round, so the expert's
-                    # fp8 weight-release counter (which counts forward() calls
-                    # against accumulate_steps) would fire N times too early and
-                    # drop the fp8 weights mid-step. No-op on the bf16 path.
-                    # Only SonicMoEExpert tracks this, and ringmoe already
-                    # requires using_sonic_moe, so the guard is defensive.
+                    # The ring calls the expert once per round (N times per
+                    # micro-batch). Tell the expert so its fp8 weight-release
+                    # counter, which counts forward() calls, does not free the
+                    # fp8 weights mid-step.
                     self.grouped_gemm_experts.set_calls_per_micro_batch(
                         self.token_dispatcher.N
                     )
@@ -1156,9 +1152,9 @@ class MoELayer(nn.Layer):
     ):
         """Combine expert outputs back to the local token shard.
 
-        For the 'allgather' and 'alltoall' dispatchers: ``token_combine``
-        issues the reverse communication, then ``combine_postprocess``
-        finalizes it.
+        For the 'allgather', 'ringmoe' and 'alltoall' dispatchers:
+        ``token_combine`` issues the reverse communication, then
+        ``combine_postprocess`` finalizes it.
 
         For other dispatchers (deepep / hybridep): delegates to
         ``_comm_manager.combine`` directly, which already returns the restored
@@ -1202,34 +1198,23 @@ class MoELayer(nn.Layer):
         return self.unpermute(expert_outs)
 
     def _maybe_pre_allgather_overlap(self, hidden_states: paddle.Tensor):
-        """Pre-issue round 0's token AllGather on the comm stream, before the gate.
+        """Start the token AllGather on the comm stream before the gate runs.
 
-        Two branches, by dispatcher:
-          * 'allgather': runs only with ``moe_allgather_gate_overlap`` and EP>1;
-            pre-issues the flat EP token gather, consumed by
-            ``dispatch_preprocess``.
-          * 'ringmoe': runs for EVERY forward (EP>1), NOT gated on
-            ``moe_allgather_gate_overlap`` -- the prefetched intra gather is the
-            ring's single, always-on token-gather path, so ``pre_gate_token_ag``
-            must issue round 0's gather here for both fp8 and bf16.
-        Only the tokens can be prefetched; the routing idx/weight AllGathers need
-        the gate output.
+        * 'allgather': only with ``moe_allgather_gate_overlap`` and EP > 1;
+          the gathered tokens are consumed by ``dispatch_preprocess``.
+        * 'ringmoe': always when EP > 1. ``pre_gate_token_ag`` is the ring's
+          only token-gather entry point (it also issues the first remote
+          round's hop and gather), so it must run on every forward.
 
-        For latent MoE, ``fc1_latent_proj`` is hoisted here so the AllGather runs
-        in latent space; ``_project_to_latent`` reuses it via
-        ``self._latent_hidden``.
+        Only tokens can be gathered early; routing indices and weights depend
+        on the gate output. For latent MoE, ``fc1_latent_proj`` is applied
+        here so the gather runs in latent space; ``_project_to_latent`` reuses
+        the result via ``self._latent_hidden``.
         """
         if (
             self.expert_model_parallel_size > 1
             and self.moe_token_dispatcher_type == "ringmoe"
         ):
-            # RingMoE always prefetches round 0's intra token AllGather onto its
-            # own comm stream ahead of the gate: it is the ring's only
-            # token-gather path (ring_forward has no inline fallback), so this is
-            # unconditional for ringmoe rather than gated on
-            # moe_allgather_gate_overlap. Mirrors the allgather branch below for
-            # the latent projection; the handle is consumed as round 0's prefetch
-            # in ring_forward.
             if self.use_latent_moe:
                 self._latent_hidden = deferrable_linear_bare(
                     self.config,
@@ -1268,10 +1253,10 @@ class MoELayer(nn.Layer):
         Shared by the 'allgather' and 'ringmoe' dispatchers: every expert is
         sharded along its intermediate dim across the EP group, so every rank
         holds all experts.  Requires SonicMoE fused kernels; fp8 dispatch
-        quantization is handled by ``AllGatherTokenDispatcher``
-        (see ``_quantize_and_pack_fp8``) and fp8 expert compute by
-        ``run_sonic_moe``.  Messages name the configured dispatcher so the
-        offending yaml key is obvious.
+        quantization is done by the dispatcher (``_quantize_and_pack_fp8``
+        for 'allgather', ``_FP8TokenQuant`` in ``pre_gate_token_ag`` for
+        'ringmoe') and fp8 expert compute by ``run_sonic_moe``.  Messages
+        name the configured dispatcher so the offending yaml key is obvious.
         """
         dispatcher = self.moe_token_dispatcher_type
         if not self.using_sonic_moe:
@@ -1619,17 +1604,17 @@ class MoELayer(nn.Layer):
         topk_indices: paddle.Tensor | None = None,
         combine_overlap_handle: dict | None = None,
     ):
-        """MoE forward on the two-level ring dispatcher (bf16 + SonicMoE).
+        """MoE forward through the two-level RingMoE dispatcher.
 
-        Standalone path: instead of the flat dispatch/compute/combine pipeline it
-        drives ``RingMoETokenDispatcher.ring_forward`` around the SonicMoE expert
-        GEMM. The latent projection is applied here, as in ``fusion_moe_forward``,
-        so the ring runs in latent space; the output is projected back after.
+        Instead of separate dispatch / expert / combine steps, the whole
+        exchange and the SonicMoE expert GEMMs run inside
+        ``RingMoETokenDispatcher.ring_forward``. With latent MoE the ring runs
+        in latent space and the output is projected back afterwards.
 
-        ``combine_overlap_handle``, when given, is consumed at the tail of
-        ``ring_forward``: the shared-expert subgraph runs on the calc stream while
-        the final inter-node ReduceScatter is in flight, and its result is written
-        back into the handle as ``fn_out`` for the caller to add in.
+        If ``combine_overlap_handle`` is given, ``ring_forward`` runs the
+        shared expert on the calc stream while the last intra ReduceScatter
+        and the inter-node combine all-to-all are in flight, and stores the
+        result as ``fn_out``.
         """
         if not self.using_sonic_moe:
             raise ValueError(
@@ -1639,8 +1624,8 @@ class MoELayer(nn.Layer):
 
         should_log_balance = framework._dygraph_tracer()._has_grad
         if should_log_balance and global_moe_balance_training_logs_enabled():
-            # The ring never materializes the flat global index list, so ask the
-            # dispatcher for the EP-summed histogram instead.
+            # The ring never builds the global index list; ask the dispatcher
+            # for the EP-summed histogram instead.
             log_moe_balance(
                 self.layer_number,
                 self.moe_group,
@@ -1649,11 +1634,8 @@ class MoELayer(nn.Layer):
                 is_mtp_layer=self.is_mtp_layer,
             )
 
-        # One scope for the whole ring: it interleaves the rounds' collectives
-        # with their GEMMs, so there is no point where dispatch ends and combine
-        # begins. Compare against dispatch + fusion_mlp + combine on the other
-        # dispatchers. ``fusion_mlp`` is timed inside ring_forward, so
-        # ringmoe - fusion_mlp is the ring's exposed communication.
+        # A single profile scope: the ring interleaves its collectives with
+        # the expert GEMMs, so dispatch and combine cannot be timed apart.
         with profile("ringmoe"):
             hidden_states = self.token_dispatcher.ring_forward(
                 hidden_states,
@@ -2002,9 +1984,10 @@ class MoELayer(nn.Layer):
             _hs_router_path = _hs_dispatcher_path = hidden_states
         _log_moe_md5(hidden_states, "moe_input", layer_idx)
 
-        self._maybe_pre_allgather_overlap(hidden_states)
         gate_input = self._prepare_gate_input(_hs_router_path, residual)
         gate_input = inspect_tensor("moe_gate_input", layer_idx, gate_input)
+
+        self._maybe_pre_allgather_overlap(hidden_states)
 
         (
             capacity,

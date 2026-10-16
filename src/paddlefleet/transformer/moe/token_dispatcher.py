@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
 from .fp8_utils import FP8_ALIGN, _w4a8_quant_pack_for_hybridep_dispatch
@@ -66,6 +65,9 @@ from .moonep import (
     moonep_dispatch,
     moonep_runtime_weights,
 )
+
+# ProcessGroup-level SUM op for direct ``process_group.*`` collective calls.
+_PG_REDUCE_SUM = framework.core.ReduceOp.SUM
 
 HAVE_HYBRID_EP = False
 HYBRID_EP_LOAD_CACHED_KERNELS = True
@@ -1597,30 +1599,22 @@ class AllToAllTokenDispatcher(nn.Layer):
 
 
 class _RouterAllGather(paddle.autograd.PyLayer):
-    """AllGather for router topk weights, used by the allgather dispatcher.
-    (RingMoE gathers idx and weights together as one fused routing pair.)
+    """AllGather of router tensors over ``group``, on the calc stream.
 
-    Forward:  [T_local, K] --AllGather(EP)--> [T_global, K]  (identical on all ranks)
-    Backward: [T_global, K] --ReduceScatter(EP, SUM)--> [T_local, K]
+    Forward:  ``[T_local, K]`` -> AllGather -> ``[T_global, K]``.
+    Backward: ``[T_global, K]`` -> ReduceScatter(SUM) -> ``[T_local, K]``.
 
-    Every EP rank holds an intermediate-dim shard of every expert and computes a
-    partial expert output for ALL global tokens using the same all-gathered
-    router weights.  Each rank therefore produces its own partial gradient for
-    the shared weight tensor; the backward must sum these partials (reduce) and
-    return each rank its own token segment (scatter).  A plain scatter would keep
-    only the origin rank's partial and discard the rest, under-training the
-    router.
+    Every rank of ``group`` computes partial expert outputs for all gathered
+    tokens, so each holds a partial gradient for every token; backward must
+    sum the partials across ranks, not just slice out the local segment.
     """
 
     @staticmethod
     def forward(ctx, input, group):
         ctx.group = group
         ctx.input_shape = list(input.shape)
-        # The router-weight gather stays on the CALC stream, not the comm
-        # stream: the token/index gathers already occupy the comm stream, so
-        # queuing this small gather behind them would serialize it and add
-        # dispatch latency. On calc it overlaps the in-flight comm-stream
-        # gathers instead. Backward (reduce-scatter) is unaffected.
+        # Kept on the calc stream so it does not queue behind the token
+        # gathers already occupying the comm stream.
         return _calc_stream_all_gather(input, group)
 
     @staticmethod
@@ -1634,8 +1628,8 @@ class _RouterAllGather(paddle.autograd.PyLayer):
         global_shape = [local_shape[0] * group.nranks, *local_shape[1:]]
         if list(grad.shape) != global_shape:
             expected_numel = 1
-            for _d in global_shape:
-                expected_numel *= _d
+            for dim in global_shape:
+                expected_numel *= dim
             if int(grad.numel()) != expected_numel:
                 raise ValueError(
                     "_RouterAllGather.backward: incoming grad has "
@@ -1647,6 +1641,40 @@ class _RouterAllGather(paddle.autograd.PyLayer):
         out = reduce_scatter_group(grad.contiguous(), group=group)
         if list(out.shape) != local_shape:
             out = out.reshape(local_shape)
+        return out
+
+
+class _RouterPreAllGather(paddle.autograd.PyLayer):
+    """Consume a routing-pair AllGather pre-issued on the comm stream.
+
+    Counterpart of :class:`_RouterAllGather` whose gather was issued ahead by
+    :func:`_prefetch_routing_ag`, so it overlaps compute instead of blocking the
+    calc stream. Forward waits the task and returns the gathered pair; backward
+    reduce-scatters the grad on the comm stream and waits it. ``handle`` is a
+    plain dict, so backward returns a single grad for ``local_pair``.
+    """
+
+    @staticmethod
+    def forward(ctx, local_pair, handle):
+        handle["task"].wait()
+        ctx.group = handle["group"]
+        ctx.local_shape = handle["local_shape"]
+        out = handle["output"]
+        handle["output"] = None
+        handle["task"] = None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        group = ctx.group
+        if group is None or group.nranks == 1:
+            if list(grad.shape) != ctx.local_shape:
+                grad = grad.reshape(ctx.local_shape)
+            return grad
+        out, task = _reduce_scatter_async(grad.contiguous(), group)
+        task.wait()
+        if list(out.shape) != ctx.local_shape:
+            out = out.reshape(ctx.local_shape)
         return out
 
 
@@ -1737,9 +1765,14 @@ class _PreAllGatherFP8Result(paddle.autograd.PyLayer):
         return grad_input
 
 
-def _reduce_scatter_async(input, group):
+def _reduce_scatter_async(input, group, out=None):
     """Async ReduceScatter (SUM, axis 0) on the comm stream.
-    Returns (output, task)."""
+
+    ``out`` optionally supplies the destination buffer, which must have shape
+    ``[rows // nranks, *input.shape[1:]]`` and the input dtype; this lets the
+    caller scatter directly into a slice of a larger buffer. Returns
+    ``(output, task)``.
+    """
     input = input.contiguous()
     out_shape = list(input.shape)
     if out_shape[0] % group.nranks != 0:
@@ -1748,32 +1781,28 @@ def _reduce_scatter_async(input, group):
             f"nranks {group.nranks}"
         )
     out_shape[0] //= group.nranks
-    output = paddle.empty(shape=out_shape, dtype=input.dtype)
-    task = paddle.distributed.stream.reduce_scatter(
-        output,
-        input,
-        op=paddle.distributed.ReduceOp.SUM,
-        group=group,
-        sync_op=False,
-        use_calc_stream=False,
+    output = (
+        paddle.empty(shape=out_shape, dtype=input.dtype) if out is None else out
+    )
+    # Calls the ProcessGroup directly (async, comm stream) to skip the
+    # per-call Python checks of the ``paddle.distributed.stream`` wrappers.
+    task = group.process_group.reduce_scatter_tensor(
+        output, input, _PG_REDUCE_SUM, False
     )
     return output, task
 
 
 def _all_gather_async(input, group):
     """Async AllGather (axis 0) on the comm stream.
-    Returns (output, task)."""
+
+    Returns ``(output, task)``.
+    """
     input = input.contiguous()
     out_shape = list(input.shape)
     out_shape[0] *= group.nranks
     output = paddle.empty(shape=out_shape, dtype=input.dtype)
-    task = paddle.distributed.stream.all_gather(
-        output,
-        input,
-        group=group,
-        sync_op=False,
-        use_calc_stream=False,
-    )
+    # Direct ProcessGroup call, as in `_reduce_scatter_async`.
+    task = group.process_group.all_gather_into_tensor(output, input, False)
     return output, task
 
 
@@ -2022,68 +2051,42 @@ class _AllGatherCombineNoOverlap(paddle.autograd.PyLayer):
 
 
 def _raw_inter_shift_async(x, group, dst, src, handle):
-    """Async value-only cyclic ring shift; caller drains ``handle`` (via
-    :meth:`RingMoETokenDispatcher._drain`) before reading the result.
+    """Async cyclic ring shift of ``x``: send to ``dst``, receive from ``src``.
 
-    Non-blocking value-only cyclic ring shift: send this rank's rows to ``dst``,
-    receive ``src``'s, and build no autograd node -- every hop's reverse is
-    hand-driven in ``_bwd``. Issuing it ahead of the round-0 GEMM is what lets
-    the round 0 -> 1 routing hop hide under the compute. The reverse is this
-    same function with ``dst``/``src`` swapped.
+    Value-only (no autograd node); the reverse is the same call with ``dst``
+    and ``src`` swapped, driven by the ring's hand-written backward. The task
+    is stored in ``handle["task"]`` and must be drained before the result is
+    read.
     """
-    n = group.nranks
+    nranks = group.nranks
     rows = x.shape[0]
-    in_split = [0] * n
+    in_split = [0] * nranks
     in_split[dst] = rows
-    out_split = [0] * n
+    out_split = [0] * nranks
     out_split[src] = rows
     out = paddle.empty(x.shape, dtype=x.dtype)
-    handle["task"] = paddle.distributed.stream.alltoall_single(
-        out,
-        x.contiguous(),
-        out_split_sizes=out_split,
-        in_split_sizes=in_split,
-        group=group,
-        sync_op=False,
-        use_calc_stream=False,
+    # Direct ProcessGroup call, as in `_reduce_scatter_async`.
+    handle["task"] = group.process_group.all_to_all_single(
+        out, x.contiguous(), out_split, in_split, False
     )
     return out
 
 
 def _raw_fp8_shift_async(data, scale, group, dst, src, handle):
-    """Value-only cyclic fp8 token hop (data+scale), async, no autograd node.
+    """Async cyclic ring shift of an fp8 token (data and block scale).
 
-    The fp8 sibling of :func:`_raw_inter_shift_async`: the token travels as raw
-    bytes plus its block scale, for the explicit N-round driver's hops (round
-    0 -> 1 from ``pre_gate_token_ag``, rounds >= 1 in the loop). The reverse is
-    hand-driven in ``_bwd`` -- shift the bf16 data-grad back with
-    :func:`_raw_inter_shift_async`, swapping dst/src; the block scale carries no
-    gradient. Two async all-to-all ops (data, scale) land in ``handle['tasks']``
-    so the caller drains them after the next GEMM is enqueued. Returns
+    fp8 counterpart of :func:`_raw_inter_shift_async`, issuing one all-to-all
+    per tensor; both tasks are stored in ``handle["tasks"]``. Value-only: the
+    backward shifts the bf16 data grad back with
+    :func:`_raw_inter_shift_async`, and the scale carries no gradient. Returns
     ``(data_out, scale_out)``.
     """
-    n = group.nranks
     tasks = []
     outs = []
-    for t in (data, scale):
-        rows = t.shape[0]
-        in_split = [0] * n
-        in_split[dst] = rows
-        out_split = [0] * n
-        out_split[src] = rows
-        out = paddle.empty(t.shape, dtype=t.dtype)
-        tasks.append(
-            paddle.distributed.stream.alltoall_single(
-                out,
-                t.contiguous(),
-                out_split_sizes=out_split,
-                in_split_sizes=in_split,
-                group=group,
-                sync_op=False,
-                use_calc_stream=False,
-            )
-        )
-        outs.append(out)
+    for tensor in (data, scale):
+        handle_one = {}
+        outs.append(_raw_inter_shift_async(tensor, group, dst, src, handle_one))
+        tasks.append(handle_one["task"])
     handle["tasks"] = tasks
     return outs[0], outs[1]
 
@@ -2096,16 +2099,12 @@ _BYTE_CARRIER_DTYPES = (
 
 
 class _ByteGradCapture(paddle.autograd.PyLayer):
-    """FakeClone for a byte-carrier leaf (uint8 / fp8) whose gradient is bf16.
+    """Alias of a byte-carrier (uint8/fp8) leaf that captures its bf16 grad.
 
-    Autograd casts a gradient to its leaf's dtype on the way in, which would
-    turn the bf16 grad into uint8 (garbage values, and a later accumulation of
-    two such grads is unsupported). The grad is therefore stashed in ``box``
-    here and the leaf receives none.
-
-    Ring-local: only RingMoE feeds fp8/uint8 tensors through ``_manual_backward``
-    as autograd leaves, so this and ``_manual_backward`` live here instead of in
-    the shared ``moe_utils.manual_backward``.
+    Autograd would cast an incoming grad to the leaf's dtype, corrupting a bf16
+    grad on a uint8/fp8 leaf. Instead the grad is accumulated into
+    ``box["grad"]`` and the leaf itself receives none. The alias shares the
+    input's storage when it is contiguous and is a clone otherwise.
     """
 
     @staticmethod
@@ -2125,42 +2124,42 @@ class _ByteGradCapture(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is not None:
-            prev = ctx.box.get("grad")
+            prev_grad = ctx.box.get("grad")
             ctx.box["grad"] = (
-                grad_output if prev is None else prev + grad_output
+                grad_output if prev_grad is None else prev_grad + grad_output
             )
 
 
 def _manual_backward(f: Callable, is_first_fwd: bool, *args: Any):
-    """Ring-local ``manual_backward``: same as ``moe_utils.manual_backward`` but
-    routes uint8/fp8 byte-carrier leaves through ``_ByteGradCapture`` (grad-box)
-    so they receive a bf16 gradient instead of a dtype-cast garbage grad. Kept
-    here rather than in the shared util because only RingMoE feeds byte-carrier
-    tensors through as autograd leaves.
+    """``moe_utils.manual_backward`` with support for byte-carrier leaves.
+
+    Same contract (returns ``(bwd_fn, outputs)``), but uint8/fp8 tensor inputs
+    that require grad go through :class:`_ByteGradCapture`, so ``bwd_fn``
+    returns their bf16 grads instead of dtype-cast ones.
     """
     tracer = framework._dygraph_tracer()
-    orig = tracer._has_grad
+    orig_has_grad = tracer._has_grad
     if not is_first_fwd:
         tracer._has_grad = True
 
     detached_args = detach_and_requires_grad_(*args)
     grad_boxes = [
         {}
-        if is_tensor(a)
-        and not a.stop_gradient
-        and a.dtype in _BYTE_CARRIER_DTYPES
+        if is_tensor(arg)
+        and not arg.stop_gradient
+        and arg.dtype in _BYTE_CARRIER_DTYPES
         else None
-        for a in detached_args
+        for arg in detached_args
     ]
     detached_args_clone = [
         (
-            _ByteGradCapture.apply(a, box)
+            _ByteGradCapture.apply(arg, box)
             if box is not None
-            else FakeClone.apply(a)
+            else FakeClone.apply(arg)
         )
-        if is_tensor(a)
-        else a
-        for a, box in zip(detached_args, grad_boxes)
+        if is_tensor(arg)
+        else arg
+        for arg, box in zip(detached_args, grad_boxes)
     ]
     out = f(*detached_args_clone)
     if isinstance(out, list):
@@ -2169,78 +2168,44 @@ def _manual_backward(f: Callable, is_first_fwd: bool, *args: Any):
         out = (out,)
 
     if is_first_fwd:
-        tracer._has_grad = orig
+        tracer._has_grad = orig_has_grad
         return None, out
 
     out_cached = [FakeClone.apply(o) for o in out if o is not None]
     for o in out_cached:
         o._clear_dataptr()
-    tracer._has_grad = orig
+    tracer._has_grad = orig_has_grad
 
-    def bwd_f(*grad):
+    def bwd_f(*grads):
         nonlocal out_cached, detached_args, f
-        grad = [g for g in grad if g is not None]
-        assert grad and out_cached, (len(grad), len(out_cached))
-        grad, out_cached = zip(
-            *[(g, o) for g, o in zip(grad, out_cached) if not o.stop_gradient]
+        grads = [g for g in grads if g is not None]
+        assert grads and out_cached, (len(grads), len(out_cached))
+        grads, out_cached = zip(
+            *[(g, o) for g, o in zip(grads, out_cached) if not o.stop_gradient]
         )
-        assert len(grad) == len(out_cached), (len(grad), len(out_cached), f)
-        paddle.autograd.backward(out_cached, grad)
+        assert len(grads) == len(out_cached), (len(grads), len(out_cached), f)
+        paddle.autograd.backward(out_cached, grads)
         return tuple(
-            box.get("grad") if box is not None else t.grad
-            for t, box in zip(detached_args, grad_boxes)
-            if is_tensor(t)
+            box.get("grad") if box is not None else leaf.grad
+            for leaf, box in zip(detached_args, grad_boxes)
+            if is_tensor(leaf)
         )
 
     return bwd_f, out
 
 
-class _MaskDroppedLanes(paddle.autograd.PyLayer):
-    """Zero the router weights on dropped (``idx < 0``) lanes, hard-selecting a
-    literal 0 in BOTH forward and backward.
-
-    Semantically ``paddle.where(keep, w, 0)`` with grad ``where(keep, g, 0)``,
-    but run as a PyLayer so no ``WhereGradNode`` ever enters the traced graph.
-    Two footguns this threads between:
-
-    * A traced ``paddle.where`` here segfaults: with the ring op sitting between
-      this mask and ``.backward()``, ``WhereGradKernel<float>`` dereferences a
-      freed float tensor (``DenseTensor::data<float>()``) -- reproduced at N==2
-      and N>2 alike.
-    * A plain 0/1 mask-multiply (``w * keep``) avoids where_grad but is NOT
-      equivalent: ``x * 0`` keeps a non-finite lane alive (``Inf * 0 == NaN``)
-      in forward AND backward, which leaked NaNs into the router gradient and
-      blew up training.
-
-    Inside this boundary ``paddle.where`` runs only as a plain forward kernel
-    (no grad node), so it is both NaN-safe (selects a literal 0) and
-    where_grad-free. ``keep`` is a stop-gradient bool mask, so its grad is None.
-    """
-
-    @staticmethod
-    def forward(ctx, w, keep):
-        ctx.save_for_backward(keep)
-        return paddle.where(keep, w, paddle.zeros_like(w))
-
-    @staticmethod
-    def backward(ctx, g):
-        (keep,) = ctx.saved_tensor()
-        return paddle.where(keep, g, paddle.zeros_like(g)), None
-
-
 class _RingRoundsExplicit(paddle.autograd.PyLayer):
-    """Single ring op whose backward is a hand-written schedule, not an engine replay.
+    """Ring forward as a single op with a hand-scheduled backward.
 
-    ``plan`` runs the forward and returns ``(out, bwd)`` where ``bwd(*out_grads)``
-    produces one grad per ``diff_leaf`` in order. The forward runs the ordinary
-    ring collectives (same math as plain autograd would); only the backward
-    driver is ours, so it hand-overlaps a round's reverse collectives with an
-    adjacent round's expert GEMM. See ``RingMoETokenDispatcher.ring_forward``
-    for how the plan is built.
+    ``plan(*diff_leaves)`` runs the forward and returns ``(out, bwd)``, where
+    ``bwd(*out_grads)`` returns one grad per entry of ``diff_leaves``. Driving
+    the backward by hand lets each round's reverse collectives overlap an
+    adjacent round's expert backward. ``relax_dtype`` disables grad dtype
+    consistency and materialization for byte-carrier leaves.
     """
 
     @staticmethod
-    def forward(ctx, *diff_leaves, plan, is_first_fwd, relax_dtype):
+    def forward(ctx, *diff_leaves, plan, relax_dtype):
         if relax_dtype:
             ctx.set_grad_in_dtype_consistent(False)
             ctx.set_materialize_grads(False)
@@ -2254,29 +2219,21 @@ class _RingRoundsExplicit(paddle.autograd.PyLayer):
 
 @paddle.no_grad()
 def _tokens_per_expert_histogram(indices, num_experts):
-    """Count tokens per expert WITHOUT any GPU->CPU synchronization.
+    """Count tokens per expert without a device-to-host synchronization.
 
-    ``indices`` is the [..., K] routing tensor that may contain ``-1`` for
-    padding tokens.  The result is an int32 ``[num_experts]`` histogram.
-
-    This replaces ``masked_select`` + ``bincount``: ``masked_select`` produces a
-    *variable-length* output (its size is data-dependent), which forces Paddle
-    to copy the element count back to the CPU, stalling the host.  ``bincount``
-    likewise must resolve ``max(input)+1`` on the CPU to size its output.  Both
-    serialize the pipeline.
-
-    Instead we build a fixed-size one-hot histogram: padding (-1) is sent to a
-    sink column ``== num_experts`` so it is dropped, and every other value is in
-    ``[0, num_experts)``.  All shapes are known a priori, so no host sync occurs.
-    Numerically identical to ``bincount(masked_select(indices, indices>=0),
-    minlength=num_experts)``.
+    ``indices`` is a ``[..., K]`` routing tensor where ``-1`` marks a dropped
+    slot. Returns an int32 ``[num_experts]`` histogram equal to
+    ``bincount(indices[indices >= 0], minlength=num_experts)``. Dropped and
+    out-of-range slots go to an extra sink bin that is sliced off (as in the
+    Triton kernel), so every shape is static and no host sync is needed
+    (unlike ``masked_select``/``bincount``). The ring dispatcher uses the
+    Triton kernel ``tokens_per_expert_histogram_triton`` instead; this eager
+    version serves the other dispatchers.
     """
     flat = indices.reshape([-1]).cast("int64")
     sink = paddle.full_like(flat, num_experts)
-    clamped = paddle.where(flat >= 0, flat, sink)
-    # scatter(overwrite=False) accumulates updates[i] into counts[clamped[i]]
-    # via atomic add — fixed-shape [num_experts + 1] output, no host sync,
-    # and O(T*K + E) temp memory instead of O(T*K*E) from a full one-hot.
+    clamped = paddle.where((flat >= 0) & (flat < num_experts), flat, sink)
+    # Non-overwriting scatter accumulates a 1 per slot into its expert's bin.
     counts = paddle.zeros([num_experts + 1], dtype="int32")
     ones = paddle.ones([flat.shape[0]], dtype="int32")
     counts = paddle.scatter(counts, clamped, ones, overwrite=False)
@@ -2612,57 +2569,73 @@ class AllGatherTokenDispatcher(nn.Layer):
 
 _RING_SUBGROUP_CACHE: dict = {}
 
-# Intra-node GPU count (G) the ring splits on. Fixed rather than detected: the
-# split has to match the real NVLink domain, and over-estimating it silently
-# routes inter-node traffic as if it were intra-node, which shows up as an
-# unexplained slowdown instead of an error. Set to the NVLink domain size of
-# the target machines.
+# Number of GPUs per node (G) used to split the EP group into intra-node and
+# inter-node levels. Fixed rather than detected: it must match the NVLink
+# domain size, and an overestimate would silently treat inter-node links as
+# intra-node.
 _RING_GPUS_PER_NODE = 8
 
-# Warn only once if the gather-ahead ordering can't be installed (_order_after).
+# Ensures the "_order_after unavailable" warning is logged only once.
 _ORDER_AFTER_WARNED = False
+
+# (id(dst_group), id(src_group)) -> (dst_stream, src_stream, event, dst_group,
+# src_group). Caches the stream lookup and event creation off the per-round
+# issue path. Reusing one event is safe because ``wait_event`` captures the
+# event's state at call time; the group references keep the ids in the key
+# from being reused.
+_ORDER_AFTER_CACHE: dict = {}
 
 
 def _order_after(dst_group, src_group):
-    """Order ``dst_group``'s comm stream after everything on ``src_group``'s.
+    """Make ``dst_group``'s comm stream wait for all work on ``src_group``'s.
 
-    A comm->comm dependency. Unlike ``task.wait()``, which makes the calc stream
-    wait (and so also pins any compute enqueued after it), this touches only the
-    two communication streams. Both are created lazily together with the group's
-    NCCL comm on its first collective, so ``get_stream`` raises until then --
-    treat that as "nothing to order against yet" and report it, so the caller can
-    fall back to issuing the gather the ordinary way.
+    A comm-to-comm dependency: unlike ``task.wait()``, the calc stream is not
+    blocked. A group's comm stream only exists after its first collective, so
+    if either stream is unavailable this logs a warning once and returns False
+    so the caller can fall back to a calc-side wait. Returns True on success.
     """
+    key = (id(dst_group), id(src_group))
+    cached = _ORDER_AFTER_CACHE.get(key)
+    if cached is not None:
+        dst_stream, src_stream, event = cached[:3]
+        event.record(src_stream)
+        dst_stream.wait_event(event)
+        return True
+
     from paddle import framework as _framework
 
     place = _framework._current_expected_place()
     try:
-        dst_s = dst_group.process_group.get_stream(place)
-        src_s = src_group.process_group.get_stream(place)
+        dst_stream = dst_group.process_group.get_stream(place)
+        src_stream = src_group.process_group.get_stream(place)
     except Exception as exc:
         global _ORDER_AFTER_WARNED
         if not _ORDER_AFTER_WARNED:
             logger.warning(
-                "RingMoE gather-ahead disabled: no comm stream yet for one of "
-                "the groups (%s). The group needs one collective before "
-                "get_stream works -- see the warm-up in _build_ring_subgroups.",
+                "RingMoE comm-side ordering unavailable: no comm stream yet "
+                "for one of the groups (%s); callers fall back to a wait. The "
+                "group needs one collective before get_stream works -- see "
+                "the warm-up in _build_ring_subgroups.",
                 exc,
             )
             _ORDER_AFTER_WARNED = True
         return False
-    dst_s.wait_stream(src_s)
+    dst_stream.wait_stream(src_stream)
+    _ORDER_AFTER_CACHE[key] = (
+        dst_stream,
+        src_stream,
+        framework.core.CUDAEvent(),
+        dst_group,
+        src_group,
+    )
     return True
 
 
 def _calc_stream_all_gather(input, group):
-    """Degenerate-safe AllGather over ``group``, on the calc stream.
+    """Synchronous axis-0 AllGather on the calc stream.
 
-    Not ring-specific -- used by ``_RouterAllGather`` (flat allgather) and the
-    ring PyLayers alike. Semantics identical to
-    :func:`all_gather_group` (axis-0 concat, result ready on the calc stream for
-    the very next op), with the degenerate single-rank group short-circuited to a
-    clone. The output is a plain tensor, so the enclosing PyLayer's backward
-    (ReduceScatter) is unchanged.
+    Same as :func:`all_gather_group`, but also accepts ``group=None``, which
+    returns a clone of ``input``.
     """
     if group is None or group.nranks == 1:
         return input.clone()
@@ -2672,18 +2645,17 @@ def _calc_stream_all_gather(input, group):
 def _build_ring_subgroups(moe_group, gpus_per_node: int = _RING_GPUS_PER_NODE):
     """Split the EP group into intra-node and inter-node sub-groups.
 
-    Assumes EP ranks are node-contiguous: the first G EP ranks live on one
-    machine, the next G on the next, etc. ``G = min(gpus_per_node, EP)``, so an
-    EP group that fits inside one machine collapses to the intra level only.
-    Returns ``(G, N, intra_group, inter_group, ...)``; a level's group is None
-    when degenerate (size 1).
+    Assumes EP ranks are node-contiguous, with ``G = min(gpus_per_node, EP)``
+    ranks per node and ``N = EP // G`` nodes. Returns ``(G, N, intra_group,
+    inter_group, intra_rs_group, intra_ag_group, intra_rt_group,
+    inter_cb_group)``; groups are None where the level has size 1 or this rank
+    is not a member. Results are cached per (EP ranks, G).
 
-    ``new_group`` and ``all_gather_object`` are world collectives, so every rank
-    must reach this in the same order. Each rank contributes its own EP group's
-    partition via ``all_gather_object``; the merged set is deduplicated and
-    sorted so all ranks build identical groups in identical order. Ranks owning
-    no MoE layer never reach here, which is why production pre-creates the groups
-    via ``init_ring_subgroups`` at build time.
+    ``all_gather_object`` and ``new_group`` are world collectives, so every
+    rank must call this in the same order. Each rank contributes its own EP
+    group's partition and the union is deduplicated and sorted, so all ranks
+    create identical groups in identical order. Ranks without MoE layers would
+    not reach this lazily, hence :func:`init_ring_subgroups`.
     """
     ep_ranks = list(moe_group.ranks)
     ep_size = len(ep_ranks)
@@ -2715,54 +2687,55 @@ def _build_ring_subgroups(moe_group, gpus_per_node: int = _RING_GPUS_PER_NODE):
     )
 
     def _unique_sorted(kind: str):
-        seen, out = set(), []
+        seen, rank_lists = set(), []
         for proposal in gathered:
-            for lst in proposal[kind]:
-                k = tuple(sorted(lst))
-                if len(k) > 1 and k not in seen:
-                    seen.add(k)
-                    out.append(list(k))
-        out.sort()
-        return out
+            for rank_list in proposal[kind]:
+                ranks_key = tuple(sorted(rank_list))
+                if len(ranks_key) > 1 and ranks_key not in seen:
+                    seen.add(ranks_key)
+                    rank_lists.append(list(ranks_key))
+        rank_lists.sort()
+        return rank_lists
 
     global_rank = paddle.distributed.get_rank()
     intra_group = inter_group = intra_rs_group = intra_ag_group = (
         intra_rt_group
-    ) = None
-    for lst in _unique_sorted("intra"):
-        g = paddle.distributed.new_group(ranks=lst)
-        # Three more plain groups over the SAME intra ranks, each with its own
-        # NCCL comm/stream: the output ReduceScatter (rsg), the token
-        # gather-ahead (agg) and the routing gather-ahead (rtg). They must never
-        # share the token-AllGather's comm, or a round's collective serializes
-        # behind the next round's on that stream and the overlap is lost. Always
-        # built on every rank (never env-gated) to keep the world-collective
-        # new_group count consistent.
-        rsg = paddle.distributed.new_group(ranks=lst)
-        agg = paddle.distributed.new_group(ranks=lst)
-        rtg = paddle.distributed.new_group(ranks=lst)
-        if global_rank in lst:
-            intra_group = g
-            intra_rs_group = rsg
-            intra_ag_group = agg
-            intra_rt_group = rtg
-    for lst in _unique_sorted("inter"):
-        g = paddle.distributed.new_group(ranks=lst)
-        if global_rank in lst:
-            inter_group = g
+    ) = inter_cb_group = None
+    for rank_list in _unique_sorted("intra"):
+        sub_group = paddle.distributed.new_group(ranks=rank_list)
+        # Extra groups over the same ranks give the output ReduceScatter and
+        # the routing gather-ahead their own communicators and streams, so
+        # they do not serialize behind the token AllGather. The token
+        # gather-ahead reuses the intra group. Created on every rank
+        # unconditionally to keep the world-collective sequence identical.
+        rs_group = paddle.distributed.new_group(ranks=rank_list)
+        ag_group = sub_group
+        rt_group = paddle.distributed.new_group(ranks=rank_list)
+        if global_rank in rank_list:
+            intra_group = sub_group
+            intra_rs_group = rs_group
+            intra_ag_group = ag_group
+            intra_rt_group = rt_group
+    for rank_list in _unique_sorted("inter"):
+        sub_group = paddle.distributed.new_group(ranks=rank_list)
+        # Separate communicator for the first call's routing pre-gather (and
+        # its backward ReduceScatter) and the weight-grad hops, so they
+        # run beside the token hops on the inter group's stream instead of
+        # queueing behind them. Created unconditionally, as above.
+        cb_group = paddle.distributed.new_group(ranks=rank_list)
+        if global_rank in rank_list:
+            inter_group = sub_group
+            inter_cb_group = cb_group
 
-    # Force the prefetch groups' NCCL comms (and with them their streams) into
-    # existence now. Paddle creates both lazily on a group's first collective,
-    # and these groups' only users are the gather-aheads, which need
-    # ``get_stream`` to work BEFORE they issue anything -- so without a warm-up
-    # the cross-stream ordering silently never installs and the optimization
-    # turns itself off. Symmetric across the group's ranks, so it cannot hang.
-    for _g in (intra_ag_group, intra_rt_group):
-        if _g is not None:
-            _warm = paddle.zeros([1], dtype="float32")
-            paddle.distributed.all_reduce(_warm, group=_g)
+    # Communicators and their streams are created lazily on the first
+    # collective, but `_order_after` needs these groups' streams before they
+    # issue anything. Run one all_reduce on each now; every member does the
+    # same, so this cannot hang.
+    for warm_group in (intra_ag_group, intra_rt_group, inter_cb_group):
+        if warm_group is not None:
+            warm_buf = paddle.zeros([1], dtype="float32")
+            paddle.distributed.all_reduce(warm_buf, group=warm_group)
 
-    # One-time confirmation of the topology this rank ended up with.
     logger.info("RingMoE ring topology: G=%d N=%d", G, N)
 
     result = (
@@ -2773,20 +2746,21 @@ def _build_ring_subgroups(moe_group, gpus_per_node: int = _RING_GPUS_PER_NODE):
         intra_rs_group,
         intra_ag_group,
         intra_rt_group,
+        inter_cb_group,
     )
     _RING_SUBGROUP_CACHE[key] = result
     return result
 
 
 def init_ring_subgroups(moe_group=None, gpus_per_node: int | None = None):
-    """Pre-create the RingMoE sub-groups on every rank, once, at build time.
+    """Create the RingMoE sub-groups on every rank ahead of time.
 
-    Building them lazily in ``RingMoETokenDispatcher.__init__`` would deadlock:
-    the creation path is a *world* collective, but a dispatcher only exists on
-    ranks whose PP stage owns a MoE layer, so a MoE-free stage would skip the
-    collective while MoE-bearing stages block forever. The model builder calls
-    this on every rank instead, so the groups are cached before any dispatcher
-    is built. Idempotent, and a no-op when EP is degenerate.
+    Group creation is a world collective, but dispatchers only exist on
+    pipeline stages that own a MoE layer; creating the groups lazily there
+    would deadlock. The model builder calls this on every rank so the groups
+    are cached before any dispatcher is built. Idempotent; returns the
+    :func:`_build_ring_subgroups` tuple, or None without a multi-rank EP
+    group.
     """
     if gpus_per_node is None:
         gpus_per_node = _RING_GPUS_PER_NODE
@@ -2802,16 +2776,13 @@ def init_ring_subgroups(moe_group=None, gpus_per_node: int | None = None):
 
 
 class _FP8TokenQuant(paddle.autograd.PyLayer):
-    """Quantize the local token ONCE; hand back the fp8 data and scale as-is.
+    """Quantize the local token once to fp8 data and block scale.
 
-    The ring's single quantization. Data and scale come back as two separate
-    uint8 views (not concatenated -- fusing them cost a full token-payload copy
-    to save only one collective). These byte tensors, not a bf16 copy, are what
-    the ring passes around: hops forward them verbatim and intra gathers read
-    them directly, so no round re-quantizes. Autograd runs on the uint8 carrier
-    directly; backward is straight-through (quantization is identity in reverse,
-    the scale carries no gradient). ``meta`` receives ``nsb``/``sdt`` for the
-    gathers to interpret the scale buffer.
+    Both are returned as uint8 views; the ring moves these bytes through
+    every hop and intra gather, so no round re-quantizes. ``meta`` receives
+    ``nsb`` (scale blocks per row) and ``sdt`` (scale dtype) to reinterpret
+    the scale bytes. Backward is straight-through: the bf16 grad is the token
+    grad, and the scale has no gradient.
     """
 
     @staticmethod
@@ -2835,70 +2806,57 @@ class _FP8TokenQuant(paddle.autograd.PyLayer):
 
     @staticmethod
     def backward(ctx, grad, grad_scale=None):
-        del grad_scale  # the block scale is not differentiable
+        del grad_scale
         if grad is None:
             return None
-        # Straight-through: the incoming grad is already the bf16 gradient of the
-        # local token (summed by autograd over the gather and the next hop).
+        # The incoming grad is already the bf16 grad of the local token,
+        # accumulated by autograd over all its consumers.
         return grad.astype(ctx.tok_dtype).reshape(ctx.tok_shape)
 
 
 def _fp8_pair(data, scale, meta):
-    """Wrap the fp8 data/scale pair in the dict the intra gathers expect.
+    """Bundle fp8 token data and scale for :func:`_prefetch_tok_ag_fp8`.
 
-    No slicing and no copy -- data and scale have been separate tensors since
-    :class:`_FP8TokenQuant`, so this is pure bookkeeping and is safe to call on
-    buffers whose all-to-all is still in flight (the reader just has to be
-    ordered after that hop on the communication side).
+    Pure bookkeeping with no copy, so it is safe on buffers whose transfer is
+    still in flight as long as the reader is ordered after that transfer.
     """
     return {
         "data": data,
         "scale": scale,
         "sdt": meta["sdt"],
         "nsb": meta["nsb"],
-        "H": data.shape[1],
     }
 
 
-def _combine_a2a_issue(partials, group, handle):
-    """Start the all-to-all half of the final inter-node combine.
+def _combine_a2a_issue(partials, group, handle, send=None):
+    """Issue the all-to-all half of the inter-node combine.
 
-    ``ReduceScatter == all-to-all + local reduce``, and splitting the two buys
-    three things here, all of them free:
+    The combine is a ReduceScatter split into an all-to-all plus a local sum:
+    the home chunk ``partials[rank]`` is never sent, and work enqueued before
+    the sum overlaps the transfer. The caller later adds the received chunks
+    to the home chunk.
 
-    * The concat goes away. The monolithic ReduceScatter needed every partial
-      laid out in one ``[N*T, H]`` buffer, i.e. a full copy of the combine
-      payload on the critical path. The all-to-all only needs the chunks that
-      actually travel, so the home chunk is never copied and for ``N==2`` there
-      is no concat at all.
-    * Only the traveling chunks are sent. The home chunk stays where it is and is
-      added locally.
-    * The transfer starts before the reduce, so whatever the caller enqueues in
-      between (the shared expert) overlaps it.
-
-    Numerically this is the same as before: for ``N==2`` NCCL's bf16
-    ReduceScatter is one bf16 add per element, and so is the local sum the
-    driver's ``_bwd`` does when it finishes the combine.
-
-    Raw and value-only -- the ring op's ``_bwd`` owns the gradient (a
-    hand-driven inter-node AllGather).
+    ``send`` optionally holds the peer chunks prebuilt in ascending rank
+    order; otherwise it is built from ``partials`` (only shapes are read
+    from the home entry). Value-only: the ring backward handles the grad.
+    The task, receive buffer and layout are stored in ``handle``.
     """
-    n, r0 = group.nranks, group.rank
+    nranks, rank = group.nranks, group.rank
     T = partials[0].shape[0]
-    peers = [d for d in range(n) if d != r0]
-    # alltoall_single splits the input by rank order, so the send buffer has to
-    # be the traveling chunks in ascending rank order. With one peer that is a
-    # single existing tensor -- no copy.
-    send = (
-        partials[peers[0]]
-        if len(peers) == 1
-        else paddle.concat([partials[d] for d in peers], axis=0)
-    )
-    in_split = [0] * n
-    out_split = [0] * n
-    for d in peers:
-        in_split[d] = T
-        out_split[d] = T
+    peers = [peer for peer in range(nranks) if peer != rank]
+    # alltoall_single splits by rank order, so peer chunks go in ascending
+    # rank order.
+    if send is None:
+        send = (
+            partials[peers[0]]
+            if len(peers) == 1
+            else paddle.concat([partials[peer] for peer in peers], axis=0)
+        )
+    in_split = [0] * nranks
+    out_split = [0] * nranks
+    for peer in peers:
+        in_split[peer] = T
+        out_split[peer] = T
     recv = paddle.empty(
         [T * len(peers), *partials[0].shape[1:]], dtype=partials[0].dtype
     )
@@ -2912,29 +2870,31 @@ def _combine_a2a_issue(partials, group, handle):
         use_calc_stream=False,
     )
     handle.update(
-        {"task": task, "recv": recv, "peers": peers, "T": T, "r0": r0, "n": n}
+        {
+            "task": task,
+            "recv": recv,
+            "peers": peers,
+            "T": T,
+            "r0": rank,
+            "n": nranks,
+        }
     )
 
 
 def _routing_pair(idx, w):
-    """Pack routing indices and router weights into ONE float32 tensor.
+    """Pack routing indices and router weights into one float32 tensor.
 
-    ``[T, K] int32`` and ``[T, K] probs_dtype`` become ``[T, 2K] float32``, so the
-    hop and the intra gather each move one tensor instead of two. Both payloads
-    are tiny, so the concat is cheap -- unlike the token, where fusing cost a
-    multi-MB copy and was undone.
-
-    float32 is chosen so nothing is lost either way: a bf16 (or fp32) weight
-    round-trips through float32 exactly, and expert ids are integers far below
-    2^24. And because this is built from ordinary ``concat``/``cast`` ops, the
-    gradient of ``w`` flows back through them natively -- no carrier tricks, no
-    byte views.
+    ``[T, K]`` indices and ``[T, K]`` weights become ``[T, 2K]`` float32, so
+    each hop and gather moves a single tensor. The packing is lossless: bf16
+    and fp32 weights round-trip through float32 exactly, and expert ids are
+    far below 2^24. Built from ``concat``/``cast``, so the grad of ``w`` flows
+    through normally.
     """
     return paddle.concat([idx.astype("float32"), w.astype("float32")], axis=1)
 
 
 def _routing_unpair(pair, k, w_dtype):
-    """Split a ``[..., 2K] float32`` routing pair back into ``(idx, w)``."""
+    """Split a ``[rows, 2K]`` float32 routing pair back into ``(idx, w)``."""
     idx = pair[:, :k].astype("int32")
     w = pair[:, k:]
     if w.dtype != w_dtype:
@@ -2942,17 +2902,13 @@ def _routing_unpair(pair, k, w_dtype):
     return idx, w
 
 
-def _prefetch_pair_ag(pair, group):
-    """Pre-issue the intra AllGather of the fused routing pair.
+def _prefetch_intra_ag(pair, group):
+    """Pre-issue an async intra AllGather of a non-fp8 token on the comm stream.
 
-    On the calc stream the routing gathers are dead serial time in front of the
-    expert call. Issued here on the comm stream instead, early enough to hide
-    under the GEMM. Unlike the token the hop wrote straight into a plain tensor,
-    so this is an ordinary collective -- the caller only has to order it after
-    that hop (see :func:`_order_after`).
-
-    Returns a handle, or None for a degenerate group (caller falls back to the
-    inline calc-stream gather).
+    The gather overlaps compute; :func:`_pre_ag_pair_value` consumes it
+    value-only. The caller orders it after any producing hop with
+    :func:`_order_after`. Returns a handle, or None for a single-rank group
+    (unreachable here: the ring requires ``G > 1``).
     """
     if group is None or group.nranks == 1:
         return None
@@ -2965,20 +2921,38 @@ def _prefetch_pair_ag(pair, group):
     }
 
 
-def _pre_ag_fp8_value(handle):
-    """Value-only consume of a prefetched fp8 token AllGather (no autograd node).
+def _prefetch_routing_ag(pair, group):
+    """Pre-issue the routing-pair intra AllGather on the comm stream.
 
-    Waits the two async tasks and views the gathered fp8 data + scale, but the
-    gathered fp8
-    token becomes a manual_backward leaf of the round segment so its reverse
-    ReduceScatter can be hand-driven (async, overlapped) in ``_bwd`` instead of
-    running on the calc stream inside the segment. Returns
-    ``(data_e4m3, scale, group)``; ``group`` is the intra group to
-    reduce-scatter the (bf16) gathered grad over.
+    Issued early so the gather overlaps compute instead of blocking the calc
+    stream; when it follows a routing hop the caller orders it after that hop
+    with :func:`_order_after`. Consumed by :class:`_RouterPreAllGather`.
+    Returns a handle, or None for a single-rank group (the caller then uses
+    :class:`_RouterAllGather` inline).
+    """
+    if group is None or group.nranks == 1:
+        return None
+    out, task = _all_gather_async(pair, group)
+    return {
+        "output": out,
+        "task": task,
+        "group": group,
+        "local_shape": list(pair.shape),
+    }
+
+
+def _pre_ag_fp8_value(handle):
+    """Wait for a prefetched fp8 token AllGather and return its result.
+
+    Value-only (no autograd node): the caller uses the gathered token as a
+    manual-backward leaf and drives the reverse ReduceScatter itself. Clears
+    the handle's buffers and tasks. Returns ``(data, scale, group)``: e4m3
+    data, the ``[T_global, nsb]`` scale in ``sdt``, and the intra group to
+    reduce-scatter the bf16 grad over.
     """
     handle["data_task"].wait()
     handle["scale_task"].wait()
-    grp = handle["group"]
+    gather_group = handle["group"]
     T_global = handle["data_buf"].shape[0]
     data = handle["data_buf"].view("float8_e4m3fn")
     scale = (
@@ -2990,32 +2964,30 @@ def _pre_ag_fp8_value(handle):
     handle["scale_buf"] = None
     handle["data_task"] = None
     handle["scale_task"] = None
-    return data, scale, grp
+    return data, scale, gather_group
 
 
 def _pre_ag_pair_value(handle):
-    """Value-only consume of a prefetched AllGather (no autograd node).
+    """Wait for a :func:`_prefetch_intra_ag` gather; returns ``(out, group)``.
 
-    Value-only consume of a prefetched intra AllGather (forward-AG / backward-RS
-    dual): the gathered tensor becomes a manual_backward leaf so its reverse
-    ReduceScatter is hand-driven in ``_bwd``. Returns ``(gathered, group)``.
+    Non-fp8 counterpart of :func:`_pre_ag_fp8_value`: value-only, and clears
+    the handle.
     """
     handle["task"].wait()
-    grp = handle["group"]
+    gather_group = handle["group"]
     out = handle["out"]
     handle["out"] = None
     handle["task"] = None
-    return out, grp
+    return out, gather_group
 
 
 def _prefetch_tok_ag_fp8(tok_fp8, group):
-    """Pre-issue the intra AllGather of an ALREADY fp8 token.
+    """Pre-issue the intra AllGather of an already-quantized fp8 token.
 
-    Used by the quantize-once ring: a shifted token arrives pre-quantized, so
-    this skips the quantization and just issues the two async intra AllGathers
-    of the fp8 data and the int32 scale. Bit-identical to quantizing bf16 then
-    gathering -- the forwarded fp8 equals what this rank would have quantized
-    from the (round-invariant) bf16 token. Consumed by :func:`_pre_ag_fp8_value`.
+    ``tok_fp8`` is a dict from :func:`_fp8_pair`; its data and scale go out
+    as two async AllGathers on the comm stream. Consumed by
+    :func:`_pre_ag_fp8_value`. Returns a handle, or None for a single-rank
+    group.
     """
     if group is None or group.nranks == 1:
         return None
@@ -3056,20 +3028,24 @@ def _prefetch_tok_ag_fp8(tok_fp8, group):
 class RingMoETokenDispatcher(AllGatherTokenDispatcher):
     """Two-level ring dispatcher for intermediate-sharded experts.
 
-    Mathematically identical to :class:`AllGatherTokenDispatcher`: every rank
-    holds all experts sharded along the intermediate dim, and a token's output
-    is the sum of every I-shard's down-proj contribution. Only the shape of the
-    global gather/reduce differs. Instead of one flat AllGather/ReduceScatter
-    over the whole EP group, tokens rotate through the N nodes while each node
-    applies its own I-shard via intra-node AllGather/ReduceScatter over its G
-    GPUs, so bulk traffic stays intra-node and only the token rows cross the
-    network per hop.
+    Computes the same result as :class:`AllGatherTokenDispatcher`: every rank
+    holds an intermediate-dim shard of every expert, and a token's output is
+    the sum of all shards' contributions. Instead of one AllGather and
+    ReduceScatter over the whole EP group, the ``N`` nodes take turns: each
+    round, every node runs intra-node AllGather -> expert GEMM -> intra-node
+    ReduceScatter over its ``G`` GPUs on one node's tokens, while the next
+    round's tokens and routing arrive by single-peer inter-node hops. An
+    inter-node all-to-all then returns each node the partial sums for its own
+    tokens. Bulk traffic thus stays intra-node, and each hop overlaps a GEMM.
 
-    ``MoELayer`` drives :meth:`ring_forward` directly instead of the flat
-    dispatch/compute/combine pipeline; the inherited AllGather methods
-    (checkpoint IO, ``token_combine``, ...) keep the two paths interchangeable
-    everywhere else. Numerical equivalence against the ``allgather`` dispatcher
-    is the intended correctness check.
+    The first call runs rounds ``0..N-1`` in order. Later calls run the
+    remote rounds ``1..N-1`` first and the home round ``0`` last, so round
+    1's hop and gather overlap the router and the combine all-to-all
+    overlaps the home round's GEMM.
+
+    ``MoELayer`` calls :meth:`ring_forward` instead of the
+    dispatch/compute/combine pipeline; the inherited methods keep the
+    dispatcher interchangeable with the flat one everywhere else.
     """
 
     def __init__(
@@ -3087,36 +3063,37 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             fp8_dispatch=fp8_dispatch,
             use_ue8m0=use_ue8m0,
         )
-        # ``use_ue8m0`` is deliberately not special-cased here. The flat
-        # AllGatherTokenDispatcher stores it and never reads it either: fp8
-        # *dispatch* quantization always goes through _quantize_and_pack_fp8
-        # with an int32 scale, and the flag applies to other fp8 machinery
-        # (weights) instead. The ring reuses that exact helper, so it is in the
-        # same position as the flat path -- rejecting the combination would
-        # block a config allgather runs fine.
+        # ``use_ue8m0`` needs no handling: as in the flat dispatcher, token
+        # quantization always uses an int32 block scale.
         self.fp8_dispatch = fp8_dispatch
-        # ring_forward validates the inter-node token layout on its first step.
+        # Set by the first ring_forward, which checks that token counts match
+        # across the inter group; gates the remote-first pre-gate.
         self._equal_tokens_checked = False
-        # Handle for round 0's token AllGather, pre-issued before the gate by
-        # pre_gate_token_ag and consumed as round 0's handle in the fold.
-        # MoELayer issues it for every ringmoe forward (not gated on
-        # moe_allgather_gate_overlap), so on the two-level ring it is always set;
-        # None only on the degenerate single-node ring (no intra level).
+        # Home round's token AllGather, issued by pre_gate_token_ag.
         self._gate_pf_handle = None
-        # Packed token + in-flight round-0 hop from pre_gate_token_ag; consumed
-        # (and cleared) by ring_forward. None only on the degenerate ring.
+        # Token pack from pre_gate_token_ag, consumed by ring_forward.
         self._gate_pack = None
-        # Build the 2-level ring topology on a fixed per-node GPU count
-        # (``_RING_GPUS_PER_NODE``). RingMoE only
-        # makes sense when EP spans MORE than one node (N>1): with N==1 the ring
-        # degenerates to a single intra-node AllGather == the flat 'allgather'
-        # dispatcher. Reject that (and single-GPU/no-EP) at construction with a
-        # clear message instead of silently running a degenerate path.
-        assert moe_group is not None and moe_group.nranks > 1, (
-            "RingMoETokenDispatcher needs a real EP group (nranks>1); got "
-            f"nranks={None if moe_group is None else moe_group.nranks}. Use "
-            "moe_token_dispatcher_type='allgather' for single-GPU / no-EP."
-        )
+        # A real EP group is required; the multi-node (N > 1) and intra-node
+        # (G > 1) checks follow once the sub-groups are built. All three are
+        # raised rather than asserted so they survive ``python -O``.
+        if moe_group is None or moe_group.nranks <= 1:
+            raise RuntimeError(
+                "RingMoETokenDispatcher needs a real EP group (nranks>1); got "
+                f"nranks={None if moe_group is None else moe_group.nranks}. "
+                "Use moe_token_dispatcher_type='allgather' for single-GPU / "
+                "no-EP."
+            )
+        # The routing mask/cast and per-round histogram are Triton kernels.
+        # They and this check are imported lazily: importing any triton_ops
+        # submodule runs the package __init__, which imports triton, and
+        # other dispatchers must stay usable without it.
+        from paddlefleet.triton_ops.utils import is_triton_available
+
+        if not is_triton_available():
+            raise RuntimeError(
+                "RingMoETokenDispatcher requires Triton (a CUDA build of "
+                "Paddle and the triton package)."
+            )
         (
             self.G,
             self.N,
@@ -3125,20 +3102,17 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             self.intra_rs_group,
             self.intra_ag_group,
             self.intra_rt_group,
+            self.inter_cb_group,
         ) = _build_ring_subgroups(moe_group, _RING_GPUS_PER_NODE)
-        assert self.N > 1, (
-            f"RingMoETokenDispatcher requires EP to span >1 node (got N={self.N}, "
-            f"G={self.G}). With N==1 the two-level ring is just a single "
-            "intra-node AllGather -- set moe_token_dispatcher_type='allgather' "
-            "for single-node EP (expert_model_parallel_size <= "
-            f"{_RING_GPUS_PER_NODE})."
-        )
-        # RingMoE is a genuinely TWO-level ring: it needs BOTH a real intra-node
-        # level (G>1) and a real inter-node level (N>1). The inter-only
-        # degenerate topology (G==1: one GPU per node group, so there is no intra
-        # level to AllGather over) is NOT supported -- fail loudly here instead
-        # of silently taking a passthrough degenerate path. A real raise (not an
-        # assert) so the invariant also holds under ``python -O``.
+        if self.N <= 1:
+            raise RuntimeError(
+                "RingMoETokenDispatcher requires EP to span >1 node (got "
+                f"N={self.N}, G={self.G}). With N==1 the two-level ring is "
+                "just a single intra-node AllGather -- set "
+                "moe_token_dispatcher_type='allgather' for single-node EP "
+                f"(expert_model_parallel_size <= {_RING_GPUS_PER_NODE})."
+            )
+        # The ring also needs an intra-node level.
         if self.G <= 1 or self.intra_group is None:
             raise RuntimeError(
                 "RingMoETokenDispatcher requires a two-level ring with a real "
@@ -3148,29 +3122,32 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             )
 
     def _drain_stale_pregate(self):
-        """Wait out and drop any pre-gate prefetch a previous forward left behind.
+        """Wait out and drop pre-gate collectives left by an aborted forward.
 
-        ``pre_gate_token_ag`` issues collectives whose only consumer is
-        ``ring_forward``; if that never ran (an exception in the gate, say), their
-        tasks are still in flight and own their output buffers. Waiting before the
-        slots are overwritten keeps the next forward's collectives from racing
-        them. Failures are logged rather than raised: there is nothing left to
-        recover, and raising here would mask whatever aborted the previous
-        forward.
+        If ``ring_forward`` never consumed them, their tasks still own their
+        output buffers; waiting before the slots are reused keeps the next
+        forward from racing them. Wait failures are only logged, so they do
+        not mask the error that aborted the previous forward.
         """
 
-        def _tasks_of(h):
-            # fp8 token gather -> data_task/scale_task; plain gather and
-            # _raw_inter_shift_async -> task; _raw_fp8_shift_async -> tasks list.
-            if not h:
+        def _tasks_of(handle):
+            # fp8 gathers use data_task/scale_task, others task or tasks.
+            if not handle:
                 return ()
-            out = [h.get("data_task"), h.get("scale_task"), h.get("task")]
-            out.extend(h.get("tasks") or ())
+            out = [
+                handle.get("data_task"),
+                handle.get("scale_task"),
+                handle.get("task"),
+            ]
+            out.extend(handle.get("tasks") or ())
             return out
 
         pending = list(_tasks_of(self._gate_pf_handle))
-        if self._gate_pack is not None:
-            pending.extend(_tasks_of(self._gate_pack.get("h_shift")))
+        stale_remote = (self._gate_pack or {}).get("remote")
+        if stale_remote:
+            pending += list(_tasks_of(stale_remote["h"])) + list(
+                _tasks_of(stale_remote["pf"])
+            )
         self._gate_pf_handle = None
         self._gate_pack = None
         for task in pending:
@@ -3186,104 +3163,102 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 )
 
     def pre_gate_token_ag(self, tokens):
-        """Pack the token ONCE and start round 0's collectives, before the gate.
+        """Pack the local token and start the home round's gather.
 
-        Called by MoELayer for every ringmoe forward (NOT gated on
-        ``moe_allgather_gate_overlap``), with the same tensor
-        ``_project_to_latent`` will hand to :meth:`ring_forward` (it caches it as
-        ``_latent_hidden``), so the pack done here is the one the whole ring uses
-        -- autograd stays connected through this tensor.
-
-        Two things get issued ahead of the gate:
-
-        * round 0's intra token AllGather, read straight off the packed bytes;
-        * the round 0 -> 1 inter hop, whose payload is the local token and so
-          does not need anything the gate produces. ``idx``/``w`` DO come out of
-          the gate, so their (tiny) hops stay in the loop.
-
-        Both dtypes go through here. On fp8 this also removes a redundant
-        quantization (the gate prefetch used to quantize for the gather and the
-        ring again for the hop); on bf16 there is nothing to quantize, so the
-        token itself is the carrier and the two collectives are plain ones.
-
-        The dispatcher constructor guarantees a real two-level ring (G>1, N>1),
-        so this is always the ring's sole token-gather entry point;
-        :meth:`ring_forward` asserts it ran.
+        MoELayer calls this on every forward, before the router, with the
+        same tensor it later passes to :meth:`ring_forward`, so the packed
+        token is the autograd carrier for the whole ring. On fp8 the token is
+        quantized here once and reused by every hop and gather. The intra
+        AllGather issued here overlaps the router; from the second call on
+        (remote-first), round 1's token hop and gather are issued as well
+        (see :meth:`_pre_gate_remote`). Routing comm needs the router output
+        and is issued in :meth:`ring_forward`.
         """
-        # A previous forward that aborted between here and ring_forward leaves
-        # in-flight NCCL tasks owning output buffers (the round-0 gather and the
-        # round 0 -> 1 hop). Wait them out before dropping the references, or the
-        # collectives issued below race buffers nobody is going to read. Same
-        # reasoning as _drain_async_handle on the flat allgather path.
         self._drain_stale_pregate()
         t = tokens.reshape([-1, tokens.shape[-1]]).contiguous()
-        n = self.N
-        r0 = self.inter_group.rank
-        dst, src = (r0 + 1) % n, (r0 - 1) % n
         meta = {}
-        h_shift = {}
         if self.fp8_dispatch:
             data, scale = _FP8TokenQuant.apply(t, meta)
             self._gate_pf_handle = _prefetch_tok_ag_fp8(
                 _fp8_pair(data, scale, meta), self.intra_group
             )
-            # VALUE-ONLY (no autograd node): ``ring_forward``'s ``_bwd`` reverses
-            # this hop itself, exactly like the rounds >= 2 hops rotated inside
-            # the loop. A PyLayer here hands the reverse to outer autograd, which
-            # runs it with ``sync_op=True`` strictly AFTER the ring op's backward
-            # -- past the last expert GEMM, so nothing is left to overlap it.
-            # Reversed inside ``_bwd`` it goes out before round 0's input-grad
-            # ReduceScatter is drained and hides under it instead.
-            nxt_data, nxt_scale = _raw_fp8_shift_async(
-                data, scale, self.inter_group, dst, src, h_shift
-            )
         else:
-            # bf16 ring: the same schedule with one tensor instead of two and no
-            # quantization -- the prefetched AllGather (consumed value-only by
-            # `_pre_ag_pair_value`) has the same AllGather forward / ReduceScatter
-            # backward as the flat path, so round 0's gather and its hop hide under
-            # the gate exactly like they do on the fp8 path.
-            data, scale, nxt_scale = t, None, None
-            self._gate_pf_handle = _prefetch_pair_ag(t, self.intra_group)
-            # Value-only for the same reason as the fp8 branch above.
-            nxt_data = _raw_inter_shift_async(
-                t, self.inter_group, dst, src, h_shift
-            )
+            # bf16: the token itself is the carrier.
+            data, scale = t, None
+            self._gate_pf_handle = _prefetch_intra_ag(t, self.intra_group)
         self._gate_pack = {
             "meta": meta,
             "data": data,
             "scale": scale,
-            "nxt_data": nxt_data,
-            "nxt_scale": nxt_scale,
-            "h_shift": h_shift,
+            "remote": self._pre_gate_remote(data, scale, meta),
+        }
+
+    def _pre_gate_remote(self, data, scale, meta):
+        """Issue the first remote round's token hop and intra gather.
+
+        The forward runs the remote rounds first and the home round last:
+        round 1's token (on fp8, its data and scale) is hopped and gathered
+        here so both overlap the router, and the last peer slot's
+        ReduceScatter and the combine all-to-all can then overlap the home
+        round's GEMM. Returns ``{"data", "scale", "h", "pf"}`` (hop outputs,
+        hop handle, gather handle), or None before
+        :meth:`_check_equal_tokens` has run (a hop with mismatched sizes
+        hangs instead of raising) or without an intra routing group.
+        """
+        if not (self._equal_tokens_checked and self.intra_rt_group is not None):
+            return None
+        inter = self.inter_group
+        tok_group = self.intra_ag_group or self.intra_group
+        inter_rank = inter.rank
+        dst, src = (inter_rank + 1) % self.N, (inter_rank - 1) % self.N
+        handle = {}
+        if self.fp8_dispatch:
+            remote_data, remote_scale = _raw_fp8_shift_async(
+                data, scale, inter, dst, src, handle
+            )
+        else:
+            remote_data = _raw_inter_shift_async(data, inter, dst, src, handle)
+            remote_scale = None
+        # Order the gather after the hop on the comm side; if that is not
+        # possible, wait for the hop instead.
+        if not _order_after(tok_group, inter):
+            self._drain([handle])
+        return {
+            "data": remote_data,
+            "scale": remote_scale,
+            "h": handle,
+            "pf": (
+                _prefetch_tok_ag_fp8(
+                    _fp8_pair(remote_data, remote_scale, meta), tok_group
+                )
+                if self.fp8_dispatch
+                else _prefetch_intra_ag(remote_data, tok_group)
+            ),
         }
 
     @staticmethod
     def _drain(handles):
-        """Wait out every in-flight async collective, in issue order.
+        """Wait for every task of the given collective handles, in order.
 
-        A handle carries either a single ``task`` (one collective, e.g.
-        :func:`_raw_inter_shift_async`) or a ``tasks`` list (several, e.g.
-        :func:`_raw_fp8_shift_async`, which moves data and scale separately). Missing
-        both means a degenerate group that issued nothing.
+        A handle holds a single ``task``, a ``tasks`` list (e.g. the separate
+        data and scale transfers of :func:`_raw_fp8_shift_async`), or neither
+        when its group issued nothing.
         """
-        for h in handles:
-            task = h.get("task")
+        for handle in handles:
+            task = handle.get("task")
             if task is not None:
                 task.wait()
-            for task in h.get("tasks") or ():
+            for task in handle.get("tasks") or ():
                 if task is not None:
                     task.wait()
 
     def _check_equal_tokens(self, local_tokens: int):
-        """Assert every inter-group rank holds the same token count.
+        """Raise unless every inter-group rank holds the same token count.
 
-        ``_raw_inter_shift_async`` fills its in/out split sizes from the *local*
-        ``x.shape[0]``, so sender and receiver disagree the moment token counts
-        diverge (e.g. unbalanced DP, or variable_seq_lengths without packing to
-        a fixed length). NCCL then mismatches sizes, which surfaces as a hang or
-        corrupted data rather than an exception. ``ring_forward`` runs this once
-        per dispatcher, on the first step, since it costs an all_gather.
+        Inter-node hops size their sends and receives from the local token
+        count, so unequal counts (unbalanced DP, unpacked variable-length
+        sequences) mismatch the transfer sizes and hang or corrupt data
+        instead of raising. Costs a gather, so ``ring_forward`` runs it once.
         """
         counts = paddle.full([1], local_tokens, dtype="int64")
         gathered = paddle.empty([self.inter_group.nranks], dtype="int64")
@@ -3301,14 +3276,16 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             )
 
     def global_tokens_per_expert(self, topk_indices):
-        """EP-wide tokens-per-expert histogram, for MoE balance logging.
+        """EP-wide tokens-per-expert histogram, for load-balance logging.
 
-        The ring never materializes the flat global index list that
-        :meth:`AllGatherTokenDispatcher.get_dispatched_routing` histograms, so
-        sum the per-rank histograms over the EP group instead — numerically
-        identical to histogramming the AllGathered indices.
+        The ring never builds the global index list, so this sums the
+        per-rank histograms over the EP group, which gives the same counts.
         """
-        counts = _tokens_per_expert_histogram(
+        from paddlefleet.triton_ops.tokens_per_expert_hist import (
+            tokens_per_expert_histogram_triton,
+        )
+
+        counts = tokens_per_expert_histogram_triton(
             topk_indices.detach().cast("int32"), self.num_experts
         )
         if self.moe_group is not None and self.moe_group.nranks > 1:
@@ -3327,39 +3304,33 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
     ):
         """Run the two-level ring and return this rank's combined output.
 
-        Only the token/routing tensors rotate around the N nodes, one hop at a
-        time via async ``_raw_inter_shift_async``. At each stop this node applies its
-        own mid-slice -- intra AllGather -> expert GEMM -> intra ReduceScatter --
-        producing one partial per round; a single inter-node ReduceScatter then
-        sums every node's contribution back to each home rank. Keeping the shift
-        independent of the compute is what lets it overlap the intra GEMM.
+        Each round handles one node's tokens: intra AllGather -> expert GEMM
+        -> intra ReduceScatter yields this node's partial for that node. The
+        next round's inputs are sent by async inter-node hops issued before
+        the current round's GEMM, so they overlap it. An inter-node
+        all-to-all then returns every node its tokens' partials, which are
+        summed locally.
 
-        The whole ring (the N rounds plus the inter-node combine) runs inside
-        one :class:`_RingRoundsExplicit` autograd boundary, so its backward is
-        hand-driven there rather than composed from the per-collective
-        PyLayers. The forward is unchanged. Requires an equal local token count
-        across the inter group (see :meth:`_check_equal_tokens`).
+        The first call runs the home round first and takes every round's
+        routing from one inter AllGather. Later calls run remote-first
+        (rounds 1..N-1, then home), hop the routing pair with the token, and
+        issue the combine before the home GEMM so it overlaps it.
 
-        Peak activation is not reduced versus the flat AllGather path (all N
-        rounds' gathered tokens stay resident for their backward); the wins are
-        the traffic pattern and the overlap headroom.
+        All rounds and the combine run inside one :class:`_RingRoundsExplicit`
+        op whose backward is scheduled by hand. Requires an equal local token
+        count across the inter group (see :meth:`_check_equal_tokens`).
 
-        ``combine_overlap_handle`` (optional, no-op when absent) runs the
-        shared-expert subgraph while the final inter combine's all-to-all is in
-        flight. It is folded INTO the ring op: the residual becomes a
-        differentiable input and the shared-expert output a differentiable
-        output, written back into the handle as ``fn_out`` for the caller.
+        ``combine_overlap_handle`` optionally carries a shared-expert function
+        that is run while the combine is in flight. Its residual becomes an
+        input and its output an output of the ring op; the output is written
+        back to the handle as ``fn_out``.
         """
         from paddle import framework as _framework
 
         x_l = x_l.reshape([-1, x_l.shape[-1]]).contiguous()
         if self.fp8_dispatch and x_l.shape[-1] % 128 != 0:
-            # Constrains the *latent* dim, a different axis from MoELayer's
-            # per-shard fp8 alignment check.
-            #
-            # Do NOT relax the tile width: the fp8 kernel consumes several
-            # scale blocks per tile, so the hidden width must be a multiple of
-            # the full block-scale tile, not just one scale block.
+            # The fp8 kernel consumes whole block-scale tiles, so the width
+            # must be a tile multiple, not just a scale-block multiple.
             raise ValueError(
                 f"RingMoE + fp8 requires the MoE hidden width "
                 f"({x_l.shape[-1]}, i.e. moe_latent_size when latent MoE is on, "
@@ -3367,496 +3338,724 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 f"tile)."
             )
         tok = x_l
-        cur_idx = topk_indices.detach().cast("int32").contiguous()
-        cur_w = topk_weights.cast(probs_dtype).contiguous()
-        # Zero the padded routing lanes once, on the local tensor, instead of
-        # once per round on the gathered one. Masking commutes with the
-        # gathers (both elementwise on matching rows) and with their backward
-        # reduce-scatter (the mask is a constant 0/1 diagonal, identical on every
-        # rank of either group), so the router gradient is unchanged. Kept
-        # OUTSIDE the ring op so the router grad flows on past the mask.
-        # _MaskDroppedLanes hard-selects a literal 0 (NaN-safe, unlike w*mask's
-        # Inf*0) without a traced where_grad node (which segfaulted here on a
-        # freed float tensor); see that PyLayer for the full rationale.
-        cur_w = _MaskDroppedLanes.apply(cur_w, cur_idx >= 0)
+        # One fused kernel casts the indices to int32 and the weights to
+        # probs_dtype, and zeroes the weights (and their grads) of dropped
+        # lanes (idx < 0). It selects a literal 0 rather than multiplying by a
+        # mask, since Inf * 0 would leak NaN through dropped lanes. It stays
+        # outside the ring op so the router grad flows through it.
+        from paddlefleet.triton_ops.mask_cast_routing_w import (
+            mask_cast_routing_w,
+        )
+        from paddlefleet.triton_ops.tokens_per_expert_hist import (
+            tokens_per_expert_histogram_triton,
+        )
+
+        local_idx, local_w = mask_cast_routing_w(
+            topk_indices.detach(), topk_weights, probs_dtype
+        )
 
         if not self._equal_tokens_checked:
-            # Once per dispatcher: catches a misconfigured token layout at the
-            # first step instead of hanging inside NCCL, without paying for a
-            # collective on every later step.
-            self._equal_tokens_checked = True
+            # Set only once the check passes: it gates remote-first, whose
+            # hops hang on mismatched sizes.
             self._check_equal_tokens(tok.shape[0])
+            self._equal_tokens_checked = True
 
         intra = self.intra_group
-        intra_on = intra is not None and intra.nranks > 1
-        fp8_ring = self.fp8_dispatch and intra_on
-        # pre_gate_token_ag may already have packed the token and started the
-        # round 0 -> 1 hop, ahead of the gate. Take it over; drop our reference
-        # so an aborted forward cannot hand a stale in-flight task to the next.
-        # cur_data is the fp8 autograd edge (a uint8 tensor can hold a grad);
-        # cur_scale rides along without one; cur_tok is the bf16 carrier.
-        pre = self._gate_pack
+        fp8_ring = self.fp8_dispatch
+        # Take over the pre-gate pack and clear the slot, so no later call
+        # reuses it; `_drain_stale_pregate` only sees unconsumed packs. On
+        # fp8, cur_data (a uint8 tensor) carries the token grad and cur_scale
+        # has none; on bf16 the packed token is the carrier.
+        gate_pack = self._gate_pack
         self._gate_pack = None
         cur_data = cur_scale = None
-        cur_tok = tok
+        local_tok = tok
+        # Raised rather than asserted so the check survives ``python -O``.
         if fp8_ring:
-            # The fp8 ring has exactly one entry point: pre_gate_token_ag packed
-            # the token and started round 0's gather and hop before the gate.
-            # A real raise (not assert) so the invariant survives ``python -O``
-            # instead of degenerating into a None subscript.
-            if pre is None:
+            if gate_pack is None:
                 raise RuntimeError(
                     "RingMoE fp8 dispatch requires the pre-gate prefetch: "
                     "MoELayer must call pre_gate_token_ag() before ring_forward()."
                 )
-            cur_data, cur_scale = pre["data"], pre["scale"]
+            cur_data, cur_scale = gate_pack["data"], gate_pack["scale"]
         else:
-            # bf16 two-level: same single always-on entry point. MoELayer issues
-            # pre_gate_token_ag for every ringmoe forward (not gated on
-            # moe_allgather_gate_overlap), so round 0's gather and hop are already
-            # in flight. Adopt the pre-gate's reshaped copy as the carrier so the
-            # tensor whose bytes are on the wire is the one carrying the gradient.
-            if pre is None:
+            if gate_pack is None:
                 raise RuntimeError(
                     "RingMoE dispatch requires the pre-gate prefetch: MoELayer "
                     "must call pre_gate_token_ag() before ring_forward()."
                 )
-            cur_tok = pre["data"]
-        pf_handle = self._gate_pf_handle
+            # Use the tensor the pre-gate gather reads as the carrier.
+            local_tok = gate_pack["data"]
+        home_tok_ag_handle = self._gate_pf_handle
         self._gate_pf_handle = None
+        # Remote round's pre-issued hop and gather, or None.
+        remote = gate_pack.get("remote")
 
-        # Assemble the differentiable leaves that cross the ring op boundary and
-        # a closure that runs the exact forward schedule with them.
-        carrier = cur_data if fp8_ring else cur_tok
-        # The round 0 -> 1 hop was issued before the gate as a VALUE-ONLY
-        # collective, so its output is NOT a leaf: `_bwd` reverses that hop
-        # itself (same as the rounds >= 2 hops), which is what lets the reverse
-        # hop overlap round 0's input-grad ReduceScatter. As a leaf its reverse
-        # belonged to outer autograd, which ran it synchronously after the ring
-        # op's backward had already finished every expert GEMM.
-        nxt_leaf = pre["nxt_data"]
-        # Shared expert folded into the combine for overlap.
+        # Differentiable inputs of the ring op: token carrier, router weights
+        # and, if present, the shared-expert residual.
+        carrier = cur_data if fp8_ring else local_tok
         has_se = combine_overlap_handle is not None
         se_fn = combine_overlap_handle["fn"] if has_se else None
         se_res = combine_overlap_handle["fn_args"][0] if has_se else None
 
-        leaves = [carrier, cur_w]
+        leaves = [carrier, local_w]
         if has_se:
             leaves.append(se_res)
 
-        # `is_first_fwd` MUST be sampled here, outside any PyLayer.forward: inside
-        # one the tracer's `_has_grad` is off, so a plan that recomputed it would
-        # always see "first fwd" and manual_backward would retain no subgraph.
+        # Sampled outside PyLayer.forward, where the tracer has grad disabled
+        # and every forward would look like a first forward.
         is_first_fwd = not _framework._dygraph_tracer()._has_grad
 
-        # Explicit reverse driver for the two-level ring (fp8 AND bf16, any N):
-        # each round's hop and the next round's gathers issue async ahead of that
-        # round's GEMM, and each round's intra reduce-scatter issues async right
-        # after its GEMM, but the backward is hand-scheduled per segment instead
-        # of one engine replay, so a round's reverse collectives overlap an
-        # adjacent round's expert GEMM. See `_RingRoundsExplicit`.
-        def _plan(*lv):
-            # Leaf order matches `leaves`: car (round 0 token), w (round 0 router
-            # weights), [se_res]. The round 0 -> 1 hop output is NOT a leaf -- it
-            # is a value-only collective taken from the closure, and every hop
-            # (round 0 -> 1 included) is reversed by hand in `_bwd`.
-            car, w = lv[0], lv[1]
-            res = lv[2] if has_se else None
-            nxt = nxt_leaf
+        # Runs the forward schedule on the ring op's inputs and returns
+        # ``(out, _bwd)``; see `_RingRoundsExplicit`.
+        def _plan(*ring_leaves):
+            # Hop outputs are not leaves: every hop is value-only and is
+            # reversed by hand in `_bwd`.
+            home_carrier, home_w = ring_leaves[0], ring_leaves[1]
+            res = ring_leaves[2] if has_se else None
 
-            n = self.N
-            r0 = self.inter_group.rank
+            num_nodes = self.N
+            inter_rank = self.inter_group.rank
             intra, inter = self.intra_group, self.inter_group
-            ag_group = self.intra_ag_group or intra
+            # Token and routing gathers use separate communicators so they
+            # run concurrently (see `_build_ring_subgroups`).
+            tok_group = self.intra_ag_group or intra
             rt_group = self.intra_rt_group
-            dst, src = (r0 + 1) % n, (r0 - 1) % n
-            meta = pre["meta"]
-            k_topk = cur_idx.shape[1]
-            w_dtype = w.dtype
+            dst, src = (
+                (inter_rank + 1) % num_nodes,
+                (inter_rank - 1) % num_nodes,
+            )
+            meta = gate_pack["meta"]
+            k_topk = local_idx.shape[1]
+            w_dtype = home_w.dtype
             rs_group = self.intra_rs_group
 
-            partials = [None] * n
+            # partials[slot] is this node's output for the tokens of
+            # inter rank ``slot``.
+            partials = [None] * num_nodes
             rs_tasks = []
+            # Peer slots are reduce-scattered straight into their slice of
+            # one combine send buffer (ascending peer order, allocated on
+            # the first peer ReduceScatter), so the combine needs no concat.
+            peer_ranks = [d for d in range(num_nodes) if d != inter_rank]
+            peer_index = {d: j for j, d in enumerate(peer_ranks)}
+            combine_send = None
+            # Remote-first: rounds 1..N-1 run before round 0, round 1
+            # using the hop and gather issued by `_pre_gate_remote`.
+            remote_first = remote is not None
+            # Otherwise every round's routing comes from one inter
+            # AllGather of round 0's gathered pair (round k reads block
+            # (rank - k) % N), so later rounds issue no routing comm. That
+            # gather runs on the combine communicator so it never queues
+            # ahead of a token hop. Remote-first rounds can't wait for it,
+            # so they hop the pair on `inter` with the token instead.
+            pair_pregather = not remote_first
+            pair_inter_group = self.inter_cb_group
+            # Every node's gathered routing pair, [N*G*T, 2K].
+            all_pairs = None
+            steps = (
+                [*range(1, num_nodes), 0]
+                if remote_first
+                else list(range(num_nodes))
+            )
+            # Combine all-to-all handle; filled early under remote-first.
+            combine_handle = {}
 
             def _rs_issue(y, slot):
-                # Async, value-only intra reduce-scatter (its reverse AllGather is
-                # hand-driven in `_bwd`). Issued right after the round's GEMM so it
-                # overlaps the next round / the combine; drained before combine.
+                # Async, value-only intra ReduceScatter of a round's output
+                # into partials[slot]; `_bwd` drives its reverse.
+                nonlocal combine_send
                 if rs_group is None or rs_group.nranks == 1:
                     partials[slot] = y
                     return
-                out, task = _reduce_scatter_async(y, rs_group)
+                if slot == inter_rank:
+                    # Home slot: stays local, own buffer.
+                    out, task = _reduce_scatter_async(y, rs_group)
+                    partials[slot] = out
+                    rs_tasks.append(task)
+                    return
+                # Peer slot: scatter into its slice of the combine buffer.
+                scatter_rows = y.shape[0] // rs_group.nranks
+                if combine_send is None:
+                    combine_send = paddle.empty(
+                        [len(peer_ranks) * scatter_rows, *y.shape[1:]],
+                        dtype=y.dtype,
+                    )
+                peer_idx = peer_index[slot]
+                out, task = _reduce_scatter_async(
+                    y,
+                    rs_group,
+                    out=combine_send[
+                        peer_idx * scatter_rows : (peer_idx + 1) * scatter_rows
+                    ],
+                )
                 partials[slot] = out
                 rs_tasks.append(task)
 
-            # Per-round state kept for the hand-driven backward.
-            bwfs = [None] * n  # per-round segment backward fns
-            pairs = [None] * n  # value-only routing pair per round
-            tok_rs_grps = [None] * n  # intra group to reduce-scatter the token
-            #                            input-grad over (hand-driven in `_bwd`)
-            rt_rs_grps = [
-                None
-            ] * n  # intra group for the routing pair input-grad
-            # Round 0's routing pair is differentiable via w; every later round's
-            # is a value-only hop of it, reversed by hand in `_bwd`.
-            pair0 = _routing_pair(cur_idx, w)
-            pair0.stop_gradient = False
-            pairs[0] = pair0
-            # Current-round carriers. Round 0 = pre-gate-gathered local token;
-            # its routing gather is issued here off the calc path.
-            cur_data, cur_scale = car, pre["scale"]
-            cur_pair, cur_idx_r = pair0, cur_idx
-            pf_tok = pf_handle
-            pf_rt = _prefetch_pair_ag(pair0, rt_group)
+            # Per-round state for `_bwd`: segment backward fns and the
+            # intra group for each round's token grad.
+            seg_bwd_fns = [None] * num_nodes
+            tok_rs_groups = [None] * num_nodes
+            # The home routing pair carries the router-weight grad; other
+            # rounds' pairs are value-only (hops of it, or slices of the
+            # inter gather). Pair gathers run on the routing comm stream
+            # (`_prefetch_routing_ag`), so they overlap compute.
+            home_pair = _routing_pair(local_idx, home_w)
+            home_pair.stop_gradient = False
+            pair_ag_handle = _prefetch_routing_ag(home_pair, rt_group)
+            # Inputs of the first round: the home round unless remote-first.
+            cur_data, cur_scale = home_carrier, gate_pack["scale"]
+            cur_pair = home_pair
+            tok_ag_handle = home_tok_ag_handle
+            home_pair_ag_handle = pair_ag_handle
+            remote_pair_hop_handle = {}
+            if remote_first:
+                # Start with round 1. Its token was hopped and
+                # gathered under the router; hop its routing pair now and
+                # gather it after the hop (comm-side order if possible).
+                cur_pair = _raw_inter_shift_async(
+                    home_pair, inter, dst, src, remote_pair_hop_handle
+                )
+                if not _order_after(rt_group, inter):
+                    self._drain([remote_pair_hop_handle])
+                pair_ag_handle = _prefetch_routing_ag(cur_pair, rt_group)
+                cur_pair.stop_gradient = False
+                cur_data, cur_scale = remote["data"], remote["scale"]
+                cur_data.stop_gradient = home_carrier.stop_gradient
+                tok_ag_handle = remote["pf"]
+            # A round's output ReduceScatter is deferred until just before
+            # the next round's GEMM, so it overlaps that GEMM; the last
+            # one is issued after the loop.
+            pending_rs = None
 
-            for step in range(n):
-                last = step == n - 1
-                # Issue this round's hop(s) + next round's gathers BEFORE the
-                # expert GEMM so they hide under it.
-                h_tok, h_rt = {}, {}
-                nxt_data = nxt_scale = nxt_pair = None
-                pf_tok_ahead = pf_rt_ahead = None
-                if not last:
-                    if step == 0:
-                        # round 0 -> 1 token hop already went out before the gate
-                        # (value-only, output carried in `pre["nxt_data"]`); only
-                        # the routing hop is new. bf16 carries no block scale
-                        # (pre["nxt_scale"] is None).
-                        nxt_data, nxt_scale = nxt, pre["nxt_scale"]
-                        h_tok = pre["h_shift"]
-                    elif fp8_ring:
-                        nxt_data, nxt_scale = _raw_fp8_shift_async(
-                            cur_data, cur_scale, inter, dst, src, h_tok
-                        )
-                    else:
-                        # bf16: one value-only tensor hop, no scale.
-                        nxt_data = _raw_inter_shift_async(
-                            cur_data, inter, dst, src, h_tok
-                        )
-                    nxt_pair = _raw_inter_shift_async(
-                        cur_pair, inter, dst, src, h_rt
-                    )
-                    if _order_after(ag_group, inter):
-                        pf_tok_ahead = (
-                            _prefetch_tok_ag_fp8(
-                                _fp8_pair(nxt_data, nxt_scale, meta), ag_group
-                            )
-                            if fp8_ring
-                            else _prefetch_pair_ag(nxt_data, ag_group)
-                        )
-                    if rt_group is not None and _order_after(rt_group, inter):
-                        pf_rt_ahead = _prefetch_pair_ag(nxt_pair, rt_group)
+            def _early_combine_issue():
+                # Remote-first: issue the combine all-to-all right after the
+                # last peer slot's ReduceScatter, ordered after it on the
+                # comm side (or after a wait). Only peer chunks are sent, so
+                # the not-yet-produced home slot just needs a placeholder for
+                # the shape and dtype.
+                if rs_group is not None and not _order_after(inter, rs_group):
+                    for pending_task in rs_tasks:
+                        pending_task.wait()
+                traveling_partial = next(p for p in partials if p is not None)
+                _combine_a2a_issue(
+                    [
+                        p if p is not None else traveling_partial
+                        for p in partials
+                    ],
+                    inter,
+                    combine_handle,
+                    send=combine_send,
+                )
 
-                # Token AND routing gathers VALUE-ONLY (off the segment): both
-                # gathered tensors become the segment's differentiable leaves so
-                # their reverse ReduceScatters are hand-driven + overlapped in
-                # `_bwd`, instead of running on the calc stream inside the segment.
+            for pos, step in enumerate(steps):
+                is_last = pos == len(steps) - 1
+                # Remote-first: the last remote round is followed by the
+                # home round, whose inputs are local and need no hop.
+                to_home = not is_last and steps[pos + 1] == 0
+                tok_hop_handle, pair_comm_handle = {}, {}
+                next_data = next_scale = next_pair = None
+                next_tok_ag_handle = None
+                next_pair_ag_handle = None
+
+                # Wait for the token gather outside the segment: the
+                # gathered token is the segment's leaf, and `_bwd`
+                # reduce-scatters its grad by hand.
                 if fp8_ring:
-                    g_tok_g, g_scale_g, tok_rs_grps[step] = _pre_ag_fp8_value(
-                        pf_tok
+                    gathered_tok, gathered_scale, tok_rs_groups[step] = (
+                        _pre_ag_fp8_value(tok_ag_handle)
                     )
                 else:
-                    g_tok_g, tok_rs_grps[step] = _pre_ag_pair_value(pf_tok)
-                    g_scale_g = None
-                g_pair_g, rt_rs_grps[step] = _pre_ag_pair_value(pf_rt)
-                # Mirror the local carriers' grad requirement onto the gathered
-                # leaves (forcing always-on would make `_bwd` hand back a grad for
-                # a stop-gradient carrier -> PyLayer errors at that position).
-                g_tok_g.stop_gradient = cur_data.stop_gradient
-                g_pair_g.stop_gradient = cur_pair.stop_gradient
+                    gathered_tok, tok_rs_groups[step] = _pre_ag_pair_value(
+                        tok_ag_handle
+                    )
+                    gathered_scale = None
+                # Match the carrier: a grad for a stop-gradient leaf would
+                # be rejected by the PyLayer.
+                gathered_tok.stop_gradient = cur_data.stop_gradient
 
-                def _seg(gtok, gpair, _s=step, _sc=g_scale_g):
-                    g_idx, g_w = _routing_unpair(gpair, k_topk, w_dtype)
-                    hist = _tokens_per_expert_histogram(g_idx, self.num_experts)
-                    with profile("fusion_mlp"):
-                        res = expert_fn(
-                            gtok,
+                def _seg(
+                    seg_tok,
+                    seg_pair,
+                    seg_step=step,
+                    seg_scale=gathered_scale,
+                    seg_pair_ag_handle=pair_ag_handle,
+                    seg_pregathered=pair_pregather and step > 0,
+                ):
+                    # One round as a manual-backward segment: routing gather,
+                    # histogram, next round's transfers, previous round's
+                    # ReduceScatter, expert GEMM. The comm is value-only
+                    # (`_bwd` reverses it) and sets `_plan` state read after
+                    # the segment.
+                    nonlocal \
+                        next_data, \
+                        next_scale, \
+                        next_pair, \
+                        next_tok_ag_handle, \
+                        pending_rs
+                    nonlocal next_pair_ag_handle, all_pairs
+                    # A pre-gathered pair needs no gather; otherwise consume
+                    # the comm-stream prefetch, or gather on the calc stream.
+                    if seg_pregathered:
+                        gathered_pair = seg_pair
+                    elif seg_pair_ag_handle is not None:
+                        gathered_pair = _RouterPreAllGather.apply(
+                            seg_pair, seg_pair_ag_handle
+                        )
+                    else:
+                        gathered_pair = _RouterAllGather.apply(
+                            seg_pair, rt_group
+                        )
+                    g_idx, g_w = _routing_unpair(gathered_pair, k_topk, w_dtype)
+                    hist = tokens_per_expert_histogram_triton(
+                        g_idx, self.num_experts
+                    )
+
+                    def _do_gemm():
+                        # Issue the previous round's deferred ReduceScatter
+                        # right before this GEMM so it overlaps the GEMM.
+                        nonlocal pending_rs
+                        if pending_rs is not None:
+                            _rs_issue(*pending_rs)
+                            pending_rs = None
+                            if remote_first and seg_step == 0:
+                                # Every peer ReduceScatter is issued: start
+                                # the combine so it overlaps the home GEMM.
+                                _early_combine_issue()
+                        return expert_fn(
+                            seg_tok,
                             g_idx,
                             g_w,
                             self.fp8_dispatch,
                             tokens_per_expert=hist,
-                            fp8_scale=_sc,
+                            fp8_scale=seg_scale,
                             recompute_moe_gate_up=recompute_moe_gate_up,
                             fp8_combine_grad_handle=None,
                             sync_free_sizing=True,
                         )
+
+                    # Issue the next round's transfers before the GEMM is
+                    # enqueued, so they overlap it. The home round after the
+                    # last remote round needs none.
+                    if not is_last and not to_home:
+                        if pair_pregather:
+                            # The first round gathers every node's
+                            # gathered pair over inter; later rounds
+                            # slice it and issue no routing comm.
+                            if seg_step == 0:
+                                all_pairs, pair_comm_handle["task"] = (
+                                    _all_gather_async(
+                                        gathered_pair, pair_inter_group
+                                    )
+                                )
+                        else:
+                            # Routing hop first, then its gather, ordered
+                            # after this hop only on the comm side. If
+                            # that fails, the next round gathers inline.
+                            next_pair = _raw_inter_shift_async(
+                                cur_pair, inter, dst, src, pair_comm_handle
+                            )
+                            if _order_after(rt_group, inter):
+                                next_pair_ag_handle = _prefetch_routing_ag(
+                                    next_pair, rt_group
+                                )
+                        # Token hop, then its gather on `tok_group`,
+                        # ordered after the `inter` hops on the comm side.
+                        if fp8_ring:
+                            next_data, next_scale = _raw_fp8_shift_async(
+                                cur_data,
+                                cur_scale,
+                                inter,
+                                dst,
+                                src,
+                                tok_hop_handle,
+                            )
+                        else:
+                            next_data = _raw_inter_shift_async(
+                                cur_data, inter, dst, src, tok_hop_handle
+                            )
+                        if _order_after(tok_group, inter):
+                            next_tok_ag_handle = (
+                                _prefetch_tok_ag_fp8(
+                                    _fp8_pair(next_data, next_scale, meta),
+                                    tok_group,
+                                )
+                                if fp8_ring
+                                else _prefetch_intra_ag(next_data, tok_group)
+                            )
+
+                    res = _do_gemm()
+
                     return res[0] if isinstance(res, (tuple, list)) else res
 
-                bwf, y = _manual_backward(_seg, is_first_fwd, g_tok_g, g_pair_g)
-                bwfs[step] = bwf
-                _rs_issue(y[0], (r0 - step) % n)
-                if not last:
-                    self._drain([h_tok, h_rt])
-                    nxt_idx, _ = _routing_unpair(nxt_pair, k_topk, w_dtype)
-                    # value-only hop outputs -> stop_gradient=True; mark grad-
-                    # requiring so the next segment/backward keeps their grad.
-                    nxt_pair.stop_gradient = False
-                    # The token carrier from the value-only hop needs the same
-                    # treatment so the next round's manual_backward keeps the
-                    # byte-carrier grad box (and y stays grad-requiring) -- but
-                    # MIRRORING `car`, not forced on. Every round's carrier
-                    # descends from `car` through hops the backward folds back
-                    # into g(car), so if `car` wants no gradient neither does any
-                    # round: forcing it on would make `_bwd` hand back a grad at
-                    # leaf position 0 for a stop-gradient tensor, which PyLayer
-                    # rejects.
-                    if nxt_data is not None:
-                        nxt_data.stop_gradient = car.stop_gradient
-                    if pf_tok_ahead is None:
-                        pf_tok_ahead = (
-                            _prefetch_tok_ag_fp8(
-                                _fp8_pair(nxt_data, nxt_scale, meta), ag_group
-                            )
-                            if fp8_ring
-                            else _prefetch_pair_ag(nxt_data, ag_group)
-                        )
-                    if pf_rt_ahead is None and rt_group is not None:
-                        pf_rt_ahead = _prefetch_pair_ag(nxt_pair, rt_group)
-                    pairs[step + 1] = nxt_pair
-                    cur_data, cur_scale = nxt_data, nxt_scale
-                    cur_pair, cur_idx_r = nxt_pair, nxt_idx
-                    pf_tok, pf_rt = pf_tok_ahead, pf_rt_ahead
+                seg_bwd_fn, y = _manual_backward(
+                    _seg, is_first_fwd, gathered_tok, cur_pair
+                )
+                seg_bwd_fns[step] = seg_bwd_fn
+                # Round `step` processed the tokens of inter rank
+                # (rank - step); its ReduceScatter is issued next round.
+                pending_rs = (y[0], (inter_rank - step) % num_nodes)
+                if remote_first and step == 1:
+                    # Retire the pre-loop hop tasks; round 1 consumed them.
+                    self._drain([remote["h"], remote_pair_hop_handle])
+                if to_home:
+                    # Switch to the home round: local carrier and pair,
+                    # and the handles of their pre-issued gathers.
+                    cur_data, cur_pair = home_carrier, home_pair
+                    cur_scale = gate_pack["scale"]
+                    tok_ag_handle, pair_ag_handle = (
+                        home_tok_ag_handle,
+                        home_pair_ag_handle,
+                    )
+                elif not is_last:
+                    self._drain([tok_hop_handle, pair_comm_handle])
+                    if pair_pregather:
+                        # The next round processes node (rank - step - 1),
+                        # whose gathered pair is that block of all_pairs.
+                        block_rows = all_pairs.shape[0] // num_nodes
+                        block = (inter_rank - step - 1) % num_nodes
+                        next_pair = all_pairs[
+                            block * block_rows : (block + 1) * block_rows
+                        ]
+                    # Hop outputs (and all_pairs slices) are value-only;
+                    # mark them so the next segment returns their grads. The
+                    # token mirrors the home carrier's stop_gradient.
+                    next_pair.stop_gradient = False
+                    if next_data is not None:
+                        next_data.stop_gradient = home_carrier.stop_gradient
+                    # `_order_after` only fails before a comm stream exists:
+                    # the hop just created `inter`'s and the subgroup warm-up
+                    # created `tok_group`'s.
+                    assert next_tok_ag_handle is not None, (
+                        "ring gather-ahead (token) not issued: _order_after("
+                        "tok_group, inter) returned False -- init_ring_subgroups "
+                        "warm-up missing?"
+                    )
+                    cur_data, cur_scale = next_data, next_scale
+                    cur_pair = next_pair
+                    tok_ag_handle = next_tok_ag_handle
+                    pair_ag_handle = next_pair_ag_handle
 
-            # Drain both intra reduce-scatters before the combine reads partials.
-            for _t in rs_tasks:
-                _t.wait()
-            # Value-only RS outputs are stop_gradient=True; mark them grad-
-            # requiring so the combine segment hands back their grad (the input to
-            # the hand-driven RS-reverse AllGather in `_bwd`).
-            for p in partials:
-                p.stop_gradient = False
+            # Issue the last ReduceScatter without waiting, so the shared
+            # expert below overlaps it as well as the combine.
+            if pending_rs is not None:
+                _rs_issue(*pending_rs)
 
-            # ---- Inter-node combine (+ folded shared expert) ----
-            # Hand-driven so `_bwd` can overlap the combine's reverse AllGather
-            # (inter-node, was on the calc stream) with the shared-expert
-            # backward GEMM. Forward is unchanged: issue the combine all-to-all,
-            # run the shared expert while it is in flight (capturing its backward
-            # fn), then wait + local-sum. `combined` is value-only -- the ring
-            # PyLayer owns its backward via `_bwd` -- while the shared expert
-            # keeps its own retained subgraph (`se_bwf`).
-            comb_h = {}
-            comb_shapes = [list(p.shape) for p in partials]
-            comb_T = partials[0].shape[0]
-            comb_on = inter is not None and inter.nranks > 1
-            if comb_on:
-                _combine_a2a_issue(partials, inter, comb_h)
+            # Inter-node combine. Issuing a collective makes it wait on
+            # the calc stream's current tail, so the all-to-all is issued
+            # before the shared-expert GEMM is enqueued, ordered after the
+            # ReduceScatters on the comm side (or after a wait if that is
+            # not possible). Remote-first has already issued it.
+            partial_shapes = [list(p.shape) for p in partials]
+            partial_rows = partials[0].shape[0]
+            if not combine_handle:
+                if rs_group is not None and not _order_after(inter, rs_group):
+                    for pending_task in rs_tasks:
+                        pending_task.wait()
+                _combine_a2a_issue(
+                    partials, inter, combine_handle, send=combine_send
+                )
             if has_se:
                 se_bwf, se_out = _manual_backward(se_fn, is_first_fwd, res)
                 if not isinstance(se_out, tuple):
                     se_out = (se_out,)
             else:
                 se_bwf, se_out = None, ()
+            # The shared expert is already enqueued, so it overlaps this
+            # wait. Partials are value-only; mark them as requiring grad
+            # so `_bwd` receives their grads.
+            for pending_task in rs_tasks:
+                pending_task.wait()
+            for p in partials:
+                p.stop_gradient = False
             with paddle.no_grad():
-                if comb_on:
-                    comb_h["task"].wait()
-                    _recv, _peers, _cT, _cr0 = (
-                        comb_h["recv"],
-                        comb_h["peers"],
-                        comb_h["T"],
-                        comb_h["r0"],
+                # Home partial plus the received peer partials, in ascending
+                # peer order.
+                combine_handle["task"].wait()
+                a2a_recv, chunk_rows = (
+                    combine_handle["recv"],
+                    combine_handle["T"],
+                )
+                combined = partials[combine_handle["r0"]]
+                for chunk_idx in range(len(combine_handle["peers"])):
+                    combined = (
+                        combined
+                        + a2a_recv[
+                            chunk_idx * chunk_rows : (chunk_idx + 1)
+                            * chunk_rows
+                        ]
                     )
-                    combined = partials[_cr0]
-                    for _i in range(len(_peers)):
-                        combined = combined + _recv[_i * _cT : (_i + 1) * _cT]
-                else:
-                    combined = partials[0]
             out = (combined, *tuple(se_out))
 
             def _bwd(*out_grads):
-                # A round's routing leaf is the fused [idx|w] pair, so its 2nd
-                # grad is [T,2K]; only the w half (cols k_topk:) carries grad.
-                def _w_of(gp):
-                    if gp is None:
+                # Hand-scheduled backward: reverse every forward collective
+                # and overlap each with a neighbouring round's expert
+                # backward. Returns one grad per ring-op input.
+
+                def _w_of(g_pair):
+                    # Router-weight half of a routing-pair grad.
+                    if g_pair is None:
                         return None
-                    gw = gp[:, k_topk:]
+                    g_w_half = g_pair[:, k_topk:]
                     return (
-                        gw.astype(w_dtype)
-                        if gw.dtype != w_dtype
-                        else gw.contiguous()
+                        g_w_half.astype(w_dtype)
+                        if g_w_half.dtype != w_dtype
+                        else g_w_half.contiguous()
                     )
 
-                # Combine backward, hand-driven to overlap comm with compute:
-                # the combine's reverse is an inter-node AllGather of
-                # g(combined) sliced per partial. Issue it async on the comm
-                # stream, run the shared-expert backward GEMM (calc stream) while
-                # it is in flight, then wait + slice. Mirrors the forward, where
-                # the shared expert overlaps the combine all-to-all.
+                # Combine backward. Round k's output grad is block (rank - k)
+                # of an inter AllGather of g_combined, intra-gathered (reverse
+                # of the output ReduceScatter). The home block is the local
+                # g_combined, so its gather starts at once and round 0's
+                # backward runs first. The remote gathers are ordered after
+                # the inter gather on the comm side and issued before any
+                # backward GEMM, so they overlap the shared-expert and home
+                # backward; without comm-side ordering they are issued after
+                # a wait, behind the shared expert.
                 g_combined = out_grads[0]
                 g_se_out = out_grads[1:] if has_se else ()
-                g_all = comb_task = None
-                if comb_on:
-                    gc = g_combined.contiguous()
-                    g_all, comb_task = _all_gather_async(gc, inter)
+                g_round_out = [None] * num_nodes
+                g_out_ag_tasks = [None] * num_nodes
+                g_round_out[0], g_out_ag_tasks[0] = _all_gather_async(
+                    g_combined.contiguous(), rs_group
+                )
+                g_all, g_all_task = _all_gather_async(
+                    g_combined.contiguous(), inter
+                )
+
+                def _issue_remote_out_gathers():
+                    # Slices of g_all are views; no copy is enqueued.
+                    for k in range(num_nodes - 1, 0, -1):
+                        d = (inter_rank - k) % num_nodes
+                        g_partial = g_all[
+                            d * partial_rows : (d + 1) * partial_rows
+                        ]
+                        if list(g_partial.shape) != partial_shapes[d]:
+                            g_partial = g_partial.reshape(partial_shapes[d])
+                        g_round_out[k], g_out_ag_tasks[k] = _all_gather_async(
+                            g_partial, rs_group
+                        )
+
+                remote_ag_issued = _order_after(rs_group, inter)
+                if remote_ag_issued:
+                    _issue_remote_out_gathers()
                 g_se = None
                 if se_bwf is not None:
-                    gse = se_bwf(*g_se_out)
-                    g_se = gse[0] if isinstance(gse, (tuple, list)) else gse
-                if comb_task is not None:
-                    comb_task.wait()
-                    g_parts = []
-                    for d in range(n):
-                        gd = g_all[d * comb_T : (d + 1) * comb_T]
-                        if list(gd.shape) != comb_shapes[d]:
-                            gd = gd.reshape(comb_shapes[d])
-                        g_parts.append(gd)
-                else:
-                    g_parts = [g_combined for _ in range(n)]
+                    se_grads = se_bwf(*g_se_out)
+                    g_se = (
+                        se_grads[0]
+                        if isinstance(se_grads, (tuple, list))
+                        else se_grads
+                    )
+                if not remote_ag_issued:
+                    g_all_task.wait()
+                    _issue_remote_out_gathers()
+                # Per-round grads w.r.t. the round's local token and pair
+                # (the pair grad is gathered-shaped for pre-gathered rounds).
+                local_g_tok = [None] * num_nodes
+                local_g_pair = [None] * num_nodes
+                # (round, out, task, input) of the in-flight token-grad
+                # ReduceScatter of the previous segment.
+                pending_tok_rs = None
+                # Reverse-hop chain: round j's token grad (and, without the
+                # pre-gather, its weight grad) hops back to `src` and is added
+                # to round j-1's grads there; g_tok_chain[j] / g_w_chain[j]
+                # hold round j's accumulated grads. Each hop is issued once
+                # its round is complete, overlapping the remaining GEMMs.
+                # Weight hops use `pair_inter_group`, so they run beside the
+                # token hops on `inter` instead of queueing behind them.
+                g_tok_chain = [None] * num_nodes
+                g_w_chain = [None] * num_nodes
+                pending_rev_hop = None
+                # Pre-gather (forward not remote-first): in-flight inter
+                # ReduceScatter of all remote rounds' routing grads.
+                rt_rs = {}
 
-                # Pass 1: B1 (output-RS dual AllGather, async) feeds each segment
-                # backward; the token AND routing input-grad ReduceScatters are
-                # pulled OUT of the segment and pipelined async so they overlap
-                # the NEXT round's expert-backward GEMM (mirrors the forward
-                # prefetched gather), instead of running on the calc stream
-                # inside the segment.
-                if rs_group is not None and rs_group.nranks > 1:
-                    srcs = [
-                        g_parts[(r0 - k) % n].contiguous() for k in range(n)
+                def _rt_rs_issue():
+                    # Reverse of the routing pre-gather: stack the remote
+                    # rounds' gathered pair grads in node order, with zeros for
+                    # this node's block (the home grad goes back through its
+                    # own segment), and reduce-scatter over inter.
+                    remote_g_pairs = [
+                        local_g_pair[k] for k in range(1, num_nodes)
                     ]
-                    gys, ag_tasks = [], []
-                    for _s in srcs:
-                        gy, t = _all_gather_async(_s, rs_group)
-                        gys.append(gy)
-                        ag_tasks.append(t)
-                else:
-                    gys = [g_parts[(r0 - k) % n] for k in range(n)]
-                    ag_tasks = None
-                g_tok_loc = [None] * n
-                g_pair_loc = [None] * n
-                pend = (
-                    None  # in-flight token+routing input-grad RS from round k+1
-                )
-                for k in range(n - 1, -1, -1):
-                    if ag_tasks is not None:
-                        ag_tasks[k].wait()
-                    # segment backward: expert GEMM. Its GEMM overlaps `pend`
-                    # (round k+1's token+routing input-grad RS) on the comm stream.
-                    g_tok_gathered, g_pair_gathered = bwfs[k](gys[k])
-                    if pend is not None:
-                        pk, tout, ttask, pout, ptask, _keep = pend
-                        if ttask is not None:
-                            ttask.wait()
-                            g_tok_loc[pk] = tout
-                        if ptask is not None:
-                            ptask.wait()
-                            g_pair_loc[pk] = pout
-                        pend = None
-                    tgrp, pgrp = tok_rs_grps[k], rt_rs_grps[k]
-                    tsrc = (
+                    ref = next(
+                        (g for g in remote_g_pairs if g is not None), None
+                    )
+                    if ref is None:
+                        return
+                    blocks = []
+                    for d in range(num_nodes):
+                        g = (
+                            local_g_pair[(inter_rank - d) % num_nodes]
+                            if d != inter_rank
+                            else None
+                        )
+                        blocks.append(
+                            g.contiguous()
+                            if g is not None
+                            else paddle.zeros_like(ref)
+                        )
+                    src_buf = paddle.concat(blocks, axis=0)
+                    out, task = _reduce_scatter_async(src_buf, pair_inter_group)
+                    rt_rs.update({"out": out, "task": task, "src": src_buf})
+
+                def _rt_rs_finish():
+                    # Finish with the intra ReduceScatter, giving the remote
+                    # rounds' contribution to the home router-weight grad.
+                    if not rt_rs:
+                        return None
+                    rt_rs["task"].wait()
+                    local_grad, t = _reduce_scatter_async(
+                        rt_rs.pop("out"), rt_group
+                    )
+                    t.wait()
+                    rt_rs.clear()
+                    return _w_of(local_grad)
+
+                def _fold(j):
+                    # Round j >= 1 is complete: add the reverse hop from round
+                    # j+1 to its own grads. For j >= 2, send the result on to
+                    # round j-1; the last link (1 -> 0) is issued after the
+                    # loop.
+                    nonlocal pending_rev_hop
+                    g_tok_j = local_g_tok[j]
+                    # With the pre-gather, weight grads go back through
+                    # `_rt_rs_issue` instead of the hop chain.
+                    g_w_j = None if pair_pregather else _w_of(local_g_pair[j])
+                    if pending_rev_hop is not None:
+                        (tok_hop, tok_rev), (w_hop, w_rev) = pending_rev_hop
+                        self._drain([tok_hop, w_hop])
+                        g_tok_j = (
+                            tok_rev if g_tok_j is None else g_tok_j + tok_rev
+                        )
+                        if w_rev is not None:
+                            g_w_j = w_rev if g_w_j is None else g_w_j + w_rev
+                        pending_rev_hop = None
+                    g_tok_chain[j] = g_tok_j
+                    g_w_chain[j] = g_w_j
+                    if j >= 2:
+                        tok_hop, w_hop = {}, {}
+                        tok_rev = (
+                            _raw_inter_shift_async(
+                                g_tok_j.contiguous(), inter, src, dst, tok_hop
+                            )
+                            if g_tok_j is not None
+                            else None
+                        )
+                        w_rev = (
+                            _raw_inter_shift_async(
+                                g_w_j.contiguous(),
+                                pair_inter_group,
+                                src,
+                                dst,
+                                w_hop,
+                            )
+                            if g_w_j is not None
+                            else None
+                        )
+                        pending_rev_hop = ((tok_hop, tok_rev), (w_hop, w_rev))
+
+                # Home round first, then the remote rounds in descending
+                # order, which is the order the reverse-hop chain folds them.
+                for k in [0, *range(num_nodes - 1, 0, -1)]:
+                    g_out_ag_tasks[k].wait()
+                    # Expert backward of round k; it overlaps the previous
+                    # segment's token-grad ReduceScatter. The routing-pair
+                    # grad is reduced inside the segment by the router gather
+                    # op (gathered-shaped for pre-gathered rounds).
+                    g_tok_gathered, g_pair_local = seg_bwd_fns[k](
+                        g_round_out[k]
+                    )
+                    local_g_pair[k] = g_pair_local
+                    if pair_pregather and k == 1:
+                        # All remote routing grads are in.
+                        _rt_rs_issue()
+                    if pending_tok_rs is not None:
+                        rs_round, rs_out, rs_task, _rs_input = pending_tok_rs
+                        if rs_task is not None:
+                            rs_task.wait()
+                            local_g_tok[rs_round] = rs_out
+                        pending_tok_rs = None
+                    if 0 < k < num_nodes - 1:
+                        # Round k+1's token grad was just completed.
+                        _fold(k + 1)
+                    # Reduce-scatter this round's gathered token grad async;
+                    # it is waited on after the next segment's backward.
+                    tok_rs_group = tok_rs_groups[k]
+                    tok_rs_src = (
                         g_tok_gathered.contiguous()
                         if (
-                            tgrp is not None
-                            and tgrp.nranks > 1
+                            tok_rs_group is not None
+                            and tok_rs_group.nranks > 1
                             and g_tok_gathered is not None
                         )
                         else None
                     )
-                    psrc = (
-                        g_pair_gathered.contiguous()
-                        if (
-                            pgrp is not None
-                            and pgrp.nranks > 1
-                            and g_pair_gathered is not None
+                    if tok_rs_src is not None:
+                        rs_out, rs_task = _reduce_scatter_async(
+                            tok_rs_src, tok_rs_group
                         )
-                        else None
-                    )
-                    tout = ttask = pout = ptask = None
-                    if tsrc is not None:
-                        tout, ttask = _reduce_scatter_async(tsrc, tgrp)
+                        pending_tok_rs = (k, rs_out, rs_task, tok_rs_src)
                     else:
-                        g_tok_loc[k] = g_tok_gathered
-                    if psrc is not None:
-                        pout, ptask = _reduce_scatter_async(psrc, pgrp)
-                    else:
-                        g_pair_loc[k] = g_pair_gathered
-                    pend = (
-                        (k, tout, ttask, pout, ptask, (tsrc, psrc))
-                        if (ttask is not None or ptask is not None)
-                        else None
-                    )
-                # Round 0's input-grad ReduceScatter is deliberately left in
-                # flight here: the last reverse hop (round 1 -> 0) reads round 1's
-                # grads, which are already drained, and runs on the INTER group --
-                # so issuing it before draining `pend` puts an inter-node hop and
-                # an intra-node ReduceScatter on two different comms at once
-                # instead of running them back to back. `pend0` is drained below,
-                # underneath that hop.
-                pend0, pend = pend, None
+                        local_g_tok[k] = g_tok_gathered
+                        pending_tok_rs = None
+                # The loop ended on round 1: wait for its token-grad
+                # ReduceScatter (it overlapped any in-flight 2 -> 1 hop),
+                # then fold round 1 before the final link.
+                if pending_tok_rs is not None:
+                    rs_round, rs_out, rs_task, _rs_input = pending_tok_rs
+                    if rs_task is not None:
+                        rs_task.wait()
+                        local_g_tok[rs_round] = rs_out
+                    pending_tok_rs = None
+                _fold(1)
 
-                # Pass 2: inter-node reverse-hop chains on the LOCAL grads,
-                # folding rounds n-1..1 into round 0 for both the token carrier
-                # and the router-weight half. The chain is inherently sequential
-                # (round k's grad must be summed in before round k-1 hops), so
-                # only its LAST link can overlap anything -- and that link is the
-                # whole chain when N == 2.
-                g_carrier = list(g_tok_loc)
-                gw_chain = [_w_of(g_pair_loc[k]) for k in range(n)]
-                # Links n-1 .. 2: both operands are already local, nothing else is
-                # in flight to hide them, so issue-and-drain each in turn.
-                for k in range(n - 1, 1, -1):
-                    for chain in (g_carrier, gw_chain):
-                        if chain[k] is None:
-                            continue
-                        _h = {}
-                        rev = _raw_inter_shift_async(
-                            chain[k].contiguous(), inter, src, dst, _h
-                        )
-                        self._drain([_h])
-                        chain[k - 1] = (
-                            rev if chain[k - 1] is None else chain[k - 1] + rev
-                        )
-                # Final link (round 1 -> 0): issue both hops, drain round 0's
-                # input-grad ReduceScatter under them, then sum. `t_src`/`w_src`
-                # stay referenced until the drain -- NCCL reads them until then.
-                h_t1, h_w1 = {}, {}
-                t_src = w_src = t_rev = w_rev = None
-                if n > 1:
-                    if g_carrier[1] is not None:
-                        t_src = g_carrier[1].contiguous()
-                        t_rev = _raw_inter_shift_async(
-                            t_src, inter, src, dst, h_t1
-                        )
-                    if gw_chain[1] is not None:
-                        w_src = gw_chain[1].contiguous()
-                        w_rev = _raw_inter_shift_async(
-                            w_src, inter, src, dst, h_w1
-                        )
-                if pend0 is not None:
-                    pk, tout, ttask, pout, ptask, _keep = pend0
-                    if ttask is not None:
-                        ttask.wait()
-                        g_tok_loc[pk] = tout
-                        g_carrier[pk] = tout
-                    if ptask is not None:
-                        ptask.wait()
-                        g_pair_loc[pk] = pout
-                        gw_chain[pk] = _w_of(pout)
-                self._drain([h_t1, h_w1])
-                if t_rev is not None:
-                    g_carrier[0] = (
-                        t_rev if g_carrier[0] is None else g_carrier[0] + t_rev
+                # Rounds 1..N-1 are folded. Seed the home round's grads.
+                g_w_chain[0] = _w_of(local_g_pair[0])
+                g_tok_chain[0] = local_g_tok[0]
+                # Final link (round 1 -> 0). The send buffers stay
+                # referenced until the hops are drained.
+                last_tok_hop, last_w_hop = {}, {}
+                last_tok_src = last_w_src = last_tok_rev = last_w_rev = None
+                if g_tok_chain[1] is not None:
+                    last_tok_src = g_tok_chain[1].contiguous()
+                    last_tok_rev = _raw_inter_shift_async(
+                        last_tok_src, inter, src, dst, last_tok_hop
                     )
-                if w_rev is not None:
-                    gw_chain[0] = (
-                        w_rev if gw_chain[0] is None else gw_chain[0] + w_rev
+                if g_w_chain[1] is not None:
+                    last_w_src = g_w_chain[1].contiguous()
+                    last_w_rev = _raw_inter_shift_async(
+                        last_w_src, pair_inter_group, src, dst, last_w_hop
                     )
-                g_car = g_carrier[0]
-                g_w = gw_chain[0]
-                outs = [g_car, g_w]
+                # Pre-gather: the remote rounds' weight grads, finished under
+                # the hops just issued.
+                g_w_pregather = _rt_rs_finish() if pair_pregather else None
+                self._drain([last_tok_hop, last_w_hop])
+                for g_w_extra in (last_w_rev, g_w_pregather):
+                    if g_w_extra is not None:
+                        g_w_chain[0] = (
+                            g_w_extra
+                            if g_w_chain[0] is None
+                            else g_w_chain[0] + g_w_extra
+                        )
+                g_home_tok = g_tok_chain[0]
+                if last_tok_rev is not None:
+                    g_home_tok = (
+                        last_tok_rev
+                        if g_home_tok is None
+                        else g_home_tok + last_tok_rev
+                    )
+                leaf_grads = [g_home_tok, g_w_chain[0]]
                 if has_se:
-                    outs.append(g_se)
-                return tuple(outs)
+                    leaf_grads.append(g_se)
+                return tuple(leaf_grads)
 
             return out, _bwd
 
-        # Two-level ring (fp8 OR bf16): the explicit hand-scheduled driver.
-        # `_plan` branches on `fp8_ring` for the token carrier/hop/prefetch; the
-        # routing-pair, combine and `_bwd` are dtype-generic. The two-level
-        # topology is guaranteed by the constructor (G>1 and N>1), so there is no
-        # degenerate fallback -- `intra_on` is always True here.
         out = _RingRoundsExplicit.apply(
             *leaves,
             plan=_plan,
-            is_first_fwd=is_first_fwd,
             relax_dtype=self.fp8_dispatch,
         )
 

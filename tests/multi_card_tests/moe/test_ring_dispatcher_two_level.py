@@ -13,15 +13,14 @@
 # limitations under the License.
 """Two-level (G>1 AND N>1) coverage for RingMoETokenDispatcher.
 
-Patching ``_RING_GPUS_PER_NODE`` below the world size forces the EP group to
-split into both an intra-node and an inter-node level, so an even world size
-large enough exercises the per-round intra AllGather/ReduceScatter running
-inside an inter-node rotation -- the interaction a single-level run never hits.
+Patching ``_RING_GPUS_PER_NODE`` below the world size splits the EP group
+into an intra-node and an inter-node level even on one node, so the per-round
+intra AllGather/ReduceScatter runs inside the inter-node rotation.
 
 With an expert fn linear in the tokens the ring's output is analytic: every
-rank's own rows come back scaled by EP (the intra ReduceScatter sums the intra
-partials, the inter ReduceScatter sums the inter ones), which lets the backward
-be checked element-wise against a closed-form gradient.
+rank's own rows come back scaled by EP (the intra ReduceScatter sums the G
+intra partials, the combine all-to-all plus local sum the N node partials),
+so forward and backward are checked element-wise against closed forms.
 
 Run with:
   python -m paddle.distributed.launch \
@@ -164,12 +163,11 @@ class _TwoLevelBase(unittest.TestCase):
             dtype="int32",
         )
         if pad_last:
-            # Mark the final token's lanes as padding; its weights must be
-            # zeroed by the mask that ring_forward hoists out of the loop.
+            # Mark the final token's lanes as padding; ring_forward must
+            # zero their weights.
             idx[-1, :] = -1
-        # Rank- AND row-dependent on purpose. With a uniform weight a wrong
-        # home-node slice in ring_forward would be invisible, because every
-        # node's routing would be interchangeable -- verified by mutation test.
+        # Rank- and row-dependent: with a uniform weight, routing taken from
+        # the wrong node would be indistinguishable from the right one.
         w = paddle.full(
             [self.T_local, self.K], 0.25 * (self.rank + 1), dtype="float32"
         ) + 0.01 * paddle.arange(self.T_local, dtype="float32").reshape([-1, 1])
@@ -200,11 +198,11 @@ class TestTwoLevelRing(_TwoLevelBase):
         self.assertEqual(disp.inter_group.nranks, self.ep_size // 2)
 
     def test_forward_returns_own_rows_scaled_by_ep(self):
-        """intra RS sums G partials, inter RS sums N of them -> EP*scale*x."""
+        """Intra RS sums G partials, the combine sums N -> EP*scale*x."""
         disp = _dispatcher(self.ep_group, self.num_experts)
         x = self._tokens()
         idx, w = self._routing()
-        disp.pre_gate_token_ag(x)  # ring's sole (always-on) token-gather entry
+        disp.pre_gate_token_ag(x)  # required before every ring_forward
         out = disp.ring_forward(x, w, idx, _scale_expert_fn(2.0), w.dtype)
         self.assertEqual(out.shape, [self.T_local, self.d_latent])
         np.testing.assert_allclose(
@@ -234,10 +232,8 @@ class TestTwoLevelRing(_TwoLevelBase):
         )
 
     def test_rejects_inter_only_topology(self):
-        # One GPU per node group (G==1) is the inter-only degenerate ring the
-        # removed ep test used to reach; construction must reject it with a real
-        # RuntimeError (survives ``python -O``) rather than run a single-level
-        # ring. Replaces the EP=2 coverage the deleted file provided.
+        # G==1 (one GPU per node group) is an inter-only ring; construction
+        # must raise RuntimeError (survives ``python -O``), not run it.
         with self.assertRaisesRegex(RuntimeError, "two-level ring"):
             _dispatcher(self.ep_group, self.num_experts, gpus_per_node=1)
 
@@ -293,8 +289,8 @@ class TestTwoLevelRing(_TwoLevelBase):
     def test_router_weights_are_applied_and_masked(self):
         """Padded lanes (idx<0) must contribute nothing.
 
-        Guards the mask hoist: ring_forward zeroes cur_w once on the local
-        [T, K] instead of once per round on the gathered [G*T, K].
+        ring_forward zeroes their weights once on the local [T, K] pair
+        (mask_cast_routing_w), before any gather.
         """
         disp = _dispatcher(self.ep_group, self.num_experts)
         x = self._tokens(requires_grad=False)
@@ -332,10 +328,9 @@ class TestTwoLevelRing(_TwoLevelBase):
     def test_repeated_forwards_are_stable(self):
         """A deferred reduce must not leak state across calls.
 
-        The explicit driver hands each round's async ReduceScatter task to the
-        caller; if a handle were ever left undrained the next call would read a
-        half-written buffer, surfacing as a second iteration disagreeing with
-        the first.
+        Each round's ReduceScatter is issued async and drained before the
+        combine; an undrained task would let the next call read a half-written
+        buffer. Calls 2-3 also run remote-first, so they must match call 1.
         """
         disp = _dispatcher(self.ep_group, self.num_experts)
         idx, w = self._routing()
@@ -393,14 +388,15 @@ def _fp8_expert_fn():
 
 
 class TestTwoLevelPreGateOverlap(_TwoLevelBase):
-    """bf16 gate-overlap: pre_gate_token_ag() then ring_forward() must match the
-    inline path and drive the prefetch / gather-ahead / _order_after code."""
+    """bf16 gate overlap: pre_gate_token_ag() then ring_forward() must match
+    the closed form and drive the prefetch / gather-ahead / _order_after
+    code."""
 
-    def test_pre_gate_matches_inline_forward(self):
+    def test_pre_gate_matches_closed_form(self):
         disp = _dispatcher(self.ep_group, self.num_experts)
         idx, w = self._routing()
         x = self._tokens()
-        disp.pre_gate_token_ag(x)  # round-0 gather + hop issued before the gate
+        disp.pre_gate_token_ag(x)  # home-round gather issued before the gate
         out = disp.ring_forward(x, w, idx, _scale_expert_fn(2.0), w.dtype)
         np.testing.assert_allclose(
             out.numpy(),
@@ -412,9 +408,8 @@ class TestTwoLevelPreGateOverlap(_TwoLevelBase):
         self.assertIsNotNone(x.grad)
 
     def test_bf16_ring_requires_pre_gate(self):
-        # The two-level bf16 ring has no inline fallback either: a direct
-        # ring_forward without the pre-gate prefetch must raise (a real
-        # RuntimeError, so it survives ``python -O``), not read a None handle.
+        # As on fp8, ring_forward without pre_gate_token_ag must raise
+        # RuntimeError (survives ``python -O``), not read a None handle.
         disp = _dispatcher(self.ep_group, self.num_experts)
         idx, w = self._routing()
         with self.assertRaisesRegex(RuntimeError, "pre-gate prefetch"):
@@ -433,6 +428,63 @@ class TestTwoLevelPreGateOverlap(_TwoLevelBase):
             self._tokens(), w, idx, _scale_expert_fn(2.0), w.dtype
         )
         self.assertEqual(out.shape, [self.T_local, self.d_latent])
+
+
+class TestTwoLevelRemoteFirst(_TwoLevelBase):
+    """Remote-first forward: from a dispatcher's second call on, the remote
+    rounds run before the home round. Checks forward and backward of every
+    call against the closed form, at G=2 (N=EP/2) and G=4 (N=EP/4, N=2 on
+    8 GPUs)."""
+
+    def _check_repeated(self, gpus_per_node):
+        if self.ep_size % gpus_per_node or self.ep_size // gpus_per_node < 2:
+            self.skipTest(f"EP={self.ep_size} has no G={gpus_per_node} ring")
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, gpus_per_node=gpus_per_node
+        )
+        self.assertEqual(
+            (disp.G, disp.N), (gpus_per_node, self.ep_size // gpus_per_node)
+        )
+        for it in range(3):
+            x = self._tokens()
+            idx, w = self._routing()
+            disp.pre_gate_token_ag(x)
+            # The first call runs in order (token counts not checked yet).
+            self.assertEqual(disp._gate_pack["remote"] is not None, it > 0)
+            out = disp.ring_forward(x, w, idx, _weighted_expert_fn(), w.dtype)
+            g_out = self._distinct_upstream(out.shape)
+            paddle.autograd.backward([out], [g_out])
+            s = w.detach().sum(axis=-1, keepdim=True)
+            np.testing.assert_allclose(
+                out.numpy(),
+                (self.ep_size * s * x.detach()).numpy(),
+                rtol=1e-5,
+                atol=1e-5,
+                err_msg=f"out, call {it}",
+            )
+            np.testing.assert_allclose(
+                x.grad.numpy(),
+                (self.ep_size * s * g_out).numpy(),
+                rtol=1e-5,
+                atol=1e-5,
+                err_msg=f"x.grad, call {it}",
+            )
+            exp_w = self.ep_size * (g_out * x.detach()).sum(
+                axis=-1, keepdim=True
+            )
+            np.testing.assert_allclose(
+                w.grad.numpy(),
+                np.broadcast_to(exp_w.numpy(), [self.T_local, self.K]),
+                rtol=1e-5,
+                atol=1e-5,
+                err_msg=f"w.grad, call {it}",
+            )
+
+    def test_remote_first_matches_analytic_g2(self):
+        self._check_repeated(2)
+
+    def test_remote_first_matches_analytic_g4(self):
+        self._check_repeated(4)
 
 
 @_needs_sonicmoe_fp8
@@ -504,6 +556,52 @@ class TestTwoLevelFp8Ring(_TwoLevelBase):
             rtol=2e-2,
             atol=2e-2,
         )
+
+    def test_fp8_remote_first_repeated_calls(self):
+        # From the second call on the fp8 ring runs remote-first, hopping the
+        # token's data and scale ahead of the router. Every call must give
+        # the first call's output and the straight-through x.grad=EP*g_out.
+        row_id = paddle.arange(self.T_local, dtype="float32").reshape(
+            [-1, 1]
+        ) + float(self.rank * self.T_local + 1)
+        g_out = paddle.tile(row_id, [1, self.H]).astype("bfloat16")
+        g_out.stop_gradient = True
+        for gpus_per_node in (2, 4):
+            if (
+                self.ep_size % gpus_per_node
+                or self.ep_size // gpus_per_node < 2
+            ):
+                continue
+            with self.subTest(G=gpus_per_node):
+                disp = _dispatcher(
+                    self.ep_group,
+                    self.num_experts,
+                    gpus_per_node=gpus_per_node,
+                    fp8_dispatch=True,
+                )
+                idx, w = self._routing()
+                first = None
+                for it in range(3):
+                    x = self._tokens128()
+                    disp.pre_gate_token_ag(x)
+                    self.assertEqual(
+                        disp._gate_pack["remote"] is not None, it > 0
+                    )
+                    out = disp.ring_forward(
+                        x, w, idx, _fp8_expert_fn(), w.dtype
+                    )
+                    paddle.autograd.backward([out], [g_out])
+                    out = out.astype("float32").numpy()
+                    if first is None:
+                        first = out
+                    else:
+                        np.testing.assert_array_equal(out, first)
+                    np.testing.assert_allclose(
+                        x.grad.astype("float32").numpy(),
+                        (self.ep_size * g_out.astype("float32")).numpy(),
+                        rtol=2e-2,
+                        atol=2e-2,
+                    )
 
 
 if __name__ == "__main__":
