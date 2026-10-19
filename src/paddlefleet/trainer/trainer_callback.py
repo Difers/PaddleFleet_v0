@@ -1087,18 +1087,29 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
 
         if not usages:
             return
-        usages_tensor = paddle.stack(
-            usages, 0
-        )  # [num_layers, num_local_experts]
+        # Routers from pools with different expert counts (HyperBody: 64 in the
+        # encoder vs 512 in the decoder) cannot share one stacked tensor, so each
+        # expert-count group is reduced on its own. With a single group this is
+        # the previous single-stack path, element for element.
+        groups = {}
+        for idx, usage in enumerate(usages):
+            groups.setdefault(tuple(usage.shape), []).append(idx)
+        # each entry: (layer indices, [num_layers_in_group, num_experts])
+        stacked = [
+            (indices, paddle.stack([usages[i] for i in indices], 0))
+            for indices in groups.values()
+        ]
         if use_dsv4_accuracy_compatible():
             # Preserve the frozen DSv4 path: its Fleet runtime does not expose
             # ``fleet._hcg`` here, so the callback only performs this
             # all-reduce and returns without updating correction bias or
             # clearing usage.
-            dist.all_reduce(usages_tensor)
+            for _, usages_tensor in stacked:
+                dist.all_reduce(usages_tensor)
             return
         if not hasattr(fleet, "_hcg"):
-            dist.all_reduce(usages_tensor)
+            for _, usages_tensor in stacked:
+                dist.all_reduce(usages_tensor)
             return
 
         hcg = fleet.get_hybrid_communicate_group()
@@ -1106,17 +1117,22 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
         dp_group = hcg.get_data_parallel_group()
         sd_group = hcg.get_sharding_parallel_group()
 
-        if self.use_mp and mp_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=mp_group)
-        if dp_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=dp_group)
-        if sd_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=sd_group)
+        # Indexed by position in ``usages`` so ``update_bias`` keeps consuming
+        # the updates in traversal order.
+        update_list = [None] * len(usages)
+        for indices, usages_tensor in stacked:
+            if self.use_mp and mp_group.nranks > 1:
+                dist.all_reduce(usages_tensor, group=mp_group)
+            if dp_group.nranks > 1:
+                dist.all_reduce(usages_tensor, group=dp_group)
+            if sd_group.nranks > 1:
+                dist.all_reduce(usages_tensor, group=sd_group)
 
-        usages_mean = usages_tensor.mean(-1, keepdim=True)
-        update = paddle.sign(usages_mean - usages_tensor) * self.update_lr
-        update = update.astype(paddle.float32)
-        update_list = list(update)
+            usages_mean = usages_tensor.mean(-1, keepdim=True)
+            update = paddle.sign(usages_mean - usages_tensor) * self.update_lr
+            update = update.astype(paddle.float32)
+            for slot, idx in enumerate(indices):
+                update_list[idx] = update[slot]
 
         # print('on_optimizer_end bias:', [bias.tolist() for bias in biases])
         # print('on_optimizer_end usage:', usages_tensor.tolist())
