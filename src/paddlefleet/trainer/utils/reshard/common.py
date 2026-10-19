@@ -31,6 +31,13 @@ except (ImportError, ModuleNotFoundError):
     MuonShardingOptimizer = None
 
 try:
+    from paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer import (
+        MixedShardingOptimizer,
+    )
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    MixedShardingOptimizer = None
+
+try:
     from paddle.distributed.communication.batch_isend_irecv import (
         _coalescing_manager,
     )
@@ -88,6 +95,10 @@ def is_sharding_opt(optimizer):
 
     if MuonShardingOptimizer is not None:
         if check(MuonShardingOptimizer):
+            return True
+
+    if MixedShardingOptimizer is not None:
+        if check(MixedShardingOptimizer):
             return True
 
     return False

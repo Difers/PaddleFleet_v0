@@ -844,15 +844,18 @@ class ConfigAdapter:
 
         # muon_sharding_optimizer asserts that comm_group_call_opt is only
         # enabled when EP is a multiple of gpus_per_node, moe_sharding > 1
-        # and TP == 1, and PaddleFormers' TrainingArguments additionally
-        # asserts optim == muon whenever the switch is on; a shrunk EP (or a
-        # non-Muon optimizer) easily violates that, so drop the switch
+        # and TP == 1, and TrainingArguments additionally asserts optim == muon
+        # or use_mixed_optimizer whenever the switch is on; a shrunk EP (or a
+        # non-Muon, non-mixed optimizer) easily violates that, so drop the switch
         # instead of shipping a config that dies on these asserts at startup.
         if _yaml_truthy(config.get("sharding_comm_group_call_opt")):
             moe_sharding = self.target_cards // (pp * ep)
             optim = str(config.get("optim") or "").strip().lower()
             group_call_ok = (
-                optim == "muon"
+                (
+                    optim == "muon"
+                    or _yaml_truthy(config.get("use_mixed_optimizer"))
+                )
                 and self.cards_per_node > 1
                 and ep % self.cards_per_node == 0
                 and moe_sharding > 1
@@ -866,7 +869,7 @@ class ConfigAdapter:
                         {"sharding_comm_group_call_opt": False},
                         protected=self.yaml_overrides,
                     ),
-                    f"框架断言 comm_group_call_opt 只能在优化器为 muon、"
+                    f"框架断言 comm_group_call_opt 只能在优化器为 muon（或 mixed）、"
                     f"EP 是每节点卡数的整数倍、moe_sharding>1 且 TP=1 时"
                     f"开启；当前 optim={optim or '未设置'}、EP={ep}、每节点 "
                     f"{self.cards_per_node} 卡、moe_sharding={moe_sharding}、"

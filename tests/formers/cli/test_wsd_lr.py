@@ -15,7 +15,7 @@
 """Behavior tests for ``get_wsd_schedule_with_warmup``.
 
 Module under test:
-    paddlefleet.cli.train.ernie_pretrain.src.lr_schedulers.wsd_lr
+    paddlefleet.lr_schedulers.wsd_lr
 
 Independent oracle
 ------------------
@@ -78,7 +78,7 @@ import unittest
 try:
     from paddle.optimizer.lr import LambdaDecay
 
-    from paddlefleet.cli.train.ernie_pretrain.src.lr_schedulers.wsd_lr import (
+    from paddlefleet.lr_schedulers.wsd_lr import (
         get_wsd_schedule_with_warmup,
     )
 

@@ -17,7 +17,54 @@
 
 import math
 
-from paddle.optimizer.lr import LambdaDecay
+from .base import BaseLRScheduler, register_lr_scheduler
+
+
+class CosineLR(BaseLRScheduler):
+    """Linear warmup, then half-cosine decay from the peak to ``min_lr``."""
+
+    def __init__(
+        self,
+        learning_rate: float,
+        num_warmup_steps: int,
+        num_training_steps: int,
+        min_lr: float = 0.0,
+        last_epoch: int = -1,
+        num_cycles: float = 0.5,
+    ):
+        self.num_cycles = num_cycles
+        super().__init__(
+            learning_rate,
+            num_warmup_steps,
+            num_training_steps,
+            min_lr,
+            last_epoch,
+        )
+
+    @classmethod
+    def get_param(cls):
+        return {}
+
+    def schedule(self, current_step):
+        num_warmup_steps = self.num_warmup_steps
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, self.num_training_steps - num_warmup_steps)
+        )
+        ratio = max(
+            0.0,
+            0.5
+            * (
+                1.0
+                + math.cos(math.pi * float(self.num_cycles) * 2.0 * progress)
+            ),
+        )
+        min_lr, learning_rate = self.min_lr, self.learning_rate
+        return ratio * (1 - min_lr / learning_rate) + min_lr / learning_rate
+
+
+register_lr_scheduler("cosine", CosineLR)
 
 
 def get_cosine_schedule_with_warmup(
@@ -45,20 +92,13 @@ def get_cosine_schedule_with_warmup(
         last_epoch (`int`, *optional*, defaults to -1):
             The index of the last epoch when resuming training.
     Return:
-        `paddle.optimizer.lr.LambdaDecay` with the appropriate schedule.
+        `CosineLR` (a `paddle.optimizer.lr.LambdaDecay`) with the appropriate schedule.
     """
-
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(
-            max(1, num_training_steps - num_warmup_steps)
-        )
-        ratio = max(
-            0.0,
-            0.5
-            * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
-        )
-        return ratio * (1 - min_lr / learning_rate) + min_lr / learning_rate
-
-    return LambdaDecay(learning_rate, lr_lambda, last_epoch)
+    return CosineLR(
+        learning_rate,
+        num_warmup_steps,
+        num_training_steps,
+        min_lr=min_lr,
+        last_epoch=last_epoch,
+        num_cycles=num_cycles,
+    )

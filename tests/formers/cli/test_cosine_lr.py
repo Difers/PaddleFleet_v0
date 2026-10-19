@@ -15,7 +15,7 @@
 """Behavior tests for ``get_cosine_schedule_with_warmup``.
 
 Module under test:
-    paddlefleet.cli.train.ernie_pretrain.src.lr_schedulers.cosine_lr
+    paddlefleet.lr_schedulers.cosine_lr
 
 Independent oracle
 ------------------
@@ -65,7 +65,7 @@ top level; every test therefore skips when the import fails.
 import unittest
 
 try:
-    from paddlefleet.cli.train.ernie_pretrain.src.lr_schedulers.cosine_lr import (
+    from paddlefleet.lr_schedulers.cosine_lr import (
         get_cosine_schedule_with_warmup,
     )
 

@@ -34,6 +34,15 @@ except ImportError:
         "This is expected for XPU or older GPU versions that do not include muon_sharding_optimizer. "
         "Muon sharding features will be disabled."
     )
+try:
+    # Sharding shell for a MixedInnerOptimizer (use_mixed_optimizer: true).
+    from paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer import (
+        MixedShardingOptimizer,
+        unwrap_mixed_inner,
+    )
+except ImportError:  # pragma: no cover  (Paddle without the mixed shell)
+    MixedShardingOptimizer = None
+    unwrap_mixed_inner = None
 from paddle.distributed.fleet.meta_optimizers.dygraph_optimizer.hybrid_parallel_optimizer import (
     HybridParallelOptimizer as HPBase,
 )
@@ -455,7 +464,12 @@ class MoEHybridParallelOptimizer(HPBase):
                 "sharding_configs"
             ].split_param
             use_muon_sharding = getattr(strategy, "use_muon_sharding", False)
-            if use_muon_sharding:
+            if (
+                MixedShardingOptimizer is not None
+                and unwrap_mixed_inner(optimizer) is not None
+            ):
+                ShardingOptimizer = MixedShardingOptimizer
+            elif use_muon_sharding:
                 ShardingOptimizer = MuonShardingOptimizer
             elif split_param:
                 ShardingOptimizer = DygraphShardingOptimizerV2
@@ -504,6 +518,11 @@ class MoEHybridParallelOptimizer(HPBase):
                     DygraphShardingOptimizer,
                     DygraphShardingOptimizerV2,
                     MuonShardingOptimizer,
+                )
+                + (
+                    (MixedShardingOptimizer,)
+                    if MixedShardingOptimizer is not None
+                    else ()
                 ),
             )
 

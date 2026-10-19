@@ -1354,6 +1354,20 @@ class TestDefaultAdaptation(ConfigAdapterTestBase):
         config = self.load_output_yaml(1536)
         self.assertEqual(config["sharding_comm_group_call_opt"], True)
 
+    def test_comm_group_call_opt_survives_with_the_mixed_optimizer(self):
+        # use_mixed_optimizer satisfies the optimizer condition on its own (a
+        # mixed config has no top-level optim), so at the same scale the
+        # switch must NOT be dropped.
+        self.write_yaml(
+            SOURCE_YAML
+            + "use_mixed_optimizer: true\n"
+            + "sharding_comm_group_call_opt: true\n"
+        )
+        ok, message = self.adapt(target_nodes=192, test_performance=True)
+        self.assertTrue(ok, message)
+        config = self.load_output_yaml(1536)
+        self.assertEqual(config["sharding_comm_group_call_opt"], True)
+
     def test_checkpoint_refs_survive_when_structure_is_unchanged(self):
         # --test-performance freezes the parallel dims, so the model structure
         # (and therefore the checkpoint) still matches and must be kept.

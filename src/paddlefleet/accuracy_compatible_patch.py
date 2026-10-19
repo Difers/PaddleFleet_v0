@@ -199,6 +199,7 @@ def _install_fusion_patch():
     consumers = (
         "paddle.distributed.fleet.meta_optimizers.dygraph_optimizer.dygraph_sharding_optimizer",
         "paddle.distributed.fleet.meta_optimizers.muon_sharding_optimizer",
+        "paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer",
         "paddle.distributed.fleet.meta_parallel.pipeline_parallel",
     )
     for module_name in consumers:

@@ -80,6 +80,14 @@ try:
     _WRAPPER_OPTIMIZERS += (MuonShardingOptimizer,)
 except ImportError:
     pass
+try:
+    from paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer import (
+        MixedShardingOptimizer,
+    )
+
+    _WRAPPER_OPTIMIZERS += (MixedShardingOptimizer,)
+except ImportError:  # pragma: no cover
+    pass
 
 
 class HFBitexactHybridParallelClipGrad(HybridParallelClipGrad):

@@ -109,6 +109,7 @@ def _unwrap_opt_for_fused_states(optimizer):
         inner_name = type(inner).__name__
         if inner_name in (
             "MuonShardingOptimizer",
+            "MixedShardingOptimizer",
             "DygraphShardingOptimizerV2",
             "DygraphShardingOptimizer",
         ):
@@ -3575,6 +3576,8 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
 
                 param_slice_info[param_name] = flattened_range
 
+        # Also accept the state suffixes declared by the inner optimizer's
+        # optimizer_state_layout(); the built-in names are kept as a superset.
         _FP32_MASTER = "fp32_master_0"
         _optimizer_scalar_name = [
             "beta1_pow_acc_0",
@@ -3585,6 +3588,24 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
             "moment2_0",
             "velocity_0",
         ]
+        _layout_fn = getattr(
+            getattr(optimizer, "_inner_opt", optimizer),
+            "optimizer_state_layout",
+            None,
+        )
+        if callable(_layout_fn):
+            _l = _layout_fn()
+            _FP32_MASTER = _l.get("master", _FP32_MASTER)
+            _optimizer_scalar_name = list(
+                dict.fromkeys(
+                    list(_l.get("scalar", [])) + _optimizer_scalar_name
+                )
+            )
+            _optimizer_non_scaler_name = list(
+                dict.fromkeys(
+                    list(_l.get("vector", [])) + _optimizer_non_scaler_name
+                )
+            )
 
         def _generate_base_static_name(vname):
             if _FP32_MASTER in vname:

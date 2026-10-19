@@ -1228,6 +1228,14 @@ class TrainingArguments:
         default="adamw",
         metadata={"help": "The optimizer to use."},
     )
+    use_mixed_optimizer: bool = field(
+        default=False,
+        metadata={
+            "help": "Build one inner optimizer per parameter group "
+            "(MixedInnerOptimizer, sharded by MixedShardingOptimizer). "
+            "`optim` is not used when this is on."
+        },
+    )
     muon_exclude_patterns: Optional[List[str]] = field(
         default_factory=lambda: ["embed", "bias", "lm_head", "mlp.gate"],
         metadata={
@@ -2357,9 +2365,9 @@ class TrainingArguments:
                     extra="enable fp16 or bf16",
                 )
 
-        if self.optim == OptimizerNames.MUON:
+        if self.tensorwise_sharding:
             assert self.use_hybrid_parallel, (
-                "Muon optimizer only supports use_hybrid_parallel=True"
+                "Muon / mixed optimizer only supports use_hybrid_parallel=True"
             )
 
         # use_hybrid_parallel
@@ -2802,18 +2810,18 @@ class TrainingArguments:
                             )
 
                         if self.sharding_comm_group_call_opt:
-                            assert self.optim == OptimizerNames.MUON, (
-                                "sharding_comm_group_call_opt only supports Muon optimizer."
+                            assert self.tensorwise_sharding, (
+                                "sharding_comm_group_call_opt only supports Muon / mixed optimizer."
                             )
                             strategy.hybrid_configs[
                                 "sharding_configs"
                             ].comm_group_call_opt = True
 
                         if self.sharding_machine_balanced_2d_partition:
-                            if self.optim != OptimizerNames.MUON:
+                            if not self.tensorwise_sharding:
                                 raise ValueError(
-                                    "sharding_machine_balanced_2d_partition only supports Muon "
-                                    f"optimizer, but got optim={self.optim}."
+                                    "sharding_machine_balanced_2d_partition only supports Muon / "
+                                    f"mixed optimizer, but got optim={self.optim}."
                                 )
                             if not hasattr(
                                 strategy.hybrid_configs["sharding_configs"],
@@ -2835,10 +2843,11 @@ class TrainingArguments:
                                 "Currently sharding stage1 v2 only support amp_master_grad"
                             )
 
-                        # Muon optimizer requires split_param for MuonSharding
-                        if self.optim == OptimizerNames.MUON:
+                        # Muon / mixed optimizer requires split_param for Muon/MixedSharding
+                        if self.tensorwise_sharding:
                             assert self.split_param, (
-                                "Muon optimizer requires split_param=True for MuonSharding"
+                                "Muon / mixed optimizer requires split_param=True for "
+                                "Muon/MixedSharding"
                             )
 
                         if self.sd_release_grads:
@@ -3640,6 +3649,15 @@ class TrainingArguments:
         return f"{self.__class__.__name__}(\n{''.join(attrs_as_str)})"
 
     __repr__ = __str__
+
+    @property
+    def tensorwise_sharding(self) -> bool:
+        """
+        Whether the sharding shell decides per tensor (whole on its owner rank
+        vs. element-wise slices): MuonShardingOptimizer for optim=muon, or
+        MixedShardingOptimizer for use_mixed_optimizer.
+        """
+        return self.use_mixed_optimizer or self.optim == OptimizerNames.MUON
 
     @property
     def train_batch_size(self) -> int:

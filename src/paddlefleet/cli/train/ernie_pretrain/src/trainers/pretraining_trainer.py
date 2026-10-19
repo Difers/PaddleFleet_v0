@@ -86,7 +86,7 @@ from paddlefleet.cli.train.ernie_pretrain.src.callbacks.moe_logging_callback imp
 from paddlefleet.cli.train.ernie_pretrain.src.clip import (
     ClipGradForMOEByGlobalNorm,
 )
-from paddlefleet.cli.train.ernie_pretrain.src.lr_schedulers import (
+from paddlefleet.lr_schedulers import (
     get_wsd_schedule_with_warmup,
 )
 from paddlefleet.cli.train.ernie_pretrain.src.trainers.data_parallel import (
@@ -1754,6 +1754,13 @@ class PretrainingTrainer(Trainer):
             optimizer_cls, optimizer_kwargs = (
                 Trainer.get_optimizer_cls_and_kwargs(self.args)
             )
+            if self.args.use_mixed_optimizer:
+                raise NotImplementedError(
+                    "use_mixed_optimizer needs a trainer whose create_optimizer "
+                    "builds one InnerOptimizer per parameter group and wraps "
+                    "them in MixedInnerOptimizer; this trainer builds a single "
+                    "optimizer over all parameters."
+                )
 
             if self.args.use_moe and not self.args.use_hybrid_parallel:
                 logger.info("using moe Global clip")

@@ -5140,6 +5140,13 @@ class Trainer:
             optimizer_cls, optimizer_kwargs = (
                 Trainer.get_optimizer_cls_and_kwargs(self.args)
             )
+            if self.args.use_mixed_optimizer:
+                raise NotImplementedError(
+                    "use_mixed_optimizer needs a trainer whose create_optimizer "
+                    "builds one InnerOptimizer per parameter group and wraps "
+                    "them in MixedInnerOptimizer; the base Trainer builds a "
+                    "single optimizer over all parameters."
+                )
             if self.args.optim == OptimizerNames.ADAMW_CUSTOM:
                 optimizer_kwargs["quantization_config"] = (
                     self.model.config.quantization_config
