@@ -429,8 +429,6 @@ class TestTrainerFsdpWiring(unittest.TestCase):
         trainer.amp_dtype = "bfloat16"
         trainer.do_grad_scaling = False
         trainer.using_fleet_model = False
-        # __new__ skips __init__, which is what normally defaults this
-        trainer._fsdp_module = None
         return trainer
 
     @staticmethod
@@ -445,27 +443,31 @@ class TestTrainerFsdpWiring(unittest.TestCase):
         optimizer._muon_param_info_map = muon_map
         return optimizer
 
-    def _run_save_model(self, fsdp_module):
+    def _run_save_model(self, fsdp_context):
         trainer = self._trainer(TinyModel(), None)
-        trainer._fsdp_module = fsdp_module
         with tempfile.TemporaryDirectory() as tmp:
             trainer.args.output_dir = tmp
             trainer.args.output_signal_dir = tmp
             trainer.args.should_save_model_state = False
             trainer.args.save_checkpoint_format = None
             trainer.args.unified_checkpoint_config = []
-            with patch("paddlefleet.trainer.trainer.logger") as log:
+            with (
+                patch(
+                    "paddlefleet.trainer.trainer._get_fsdp_context",
+                    return_value=fsdp_context,
+                ),
+                patch("paddlefleet.trainer.trainer.logger") as log,
+            ):
                 trainer.save_model(tmp)
         return log
 
-    def test_wrap_and_setup(self):
+    def test_fully_shard_with_optimizer(self):
         model = TinyModel()
-        trainer = self._trainer(model, self._optimizer(model))
-        self.assertIsNone(trainer._fsdp_module)
-        returned = trainer._wrap_model(model, training=True)
+        optimizer = self._optimizer(model)
+        returned = fully_shard(model, optimizer=optimizer, grad_accum_steps=2)
         self.assertIs(returned, model)
-        self.assertIs(trainer._fsdp_module, model)
         self.assertEqual(type(model._fsdp_context).__name__, "FullyShardFusion")
+        self.assertIs(optimizer._fsdp_state_dict_ctx, model._fsdp_context)
         self.assertTrue(model.embed.bias.no_weight_decay)
         self.assertFalse(model.embed.weight.no_weight_decay)
 
@@ -474,27 +476,68 @@ class TestTrainerFsdpWiring(unittest.TestCase):
             p.name: SimpleNamespace(use_muon=p.ndim == 2)
             for p in muon.parameters()
         }
-        self._trainer(muon, self._optimizer(muon, muon_map))._setup_fsdp(
-            muon, None
-        )
+        fully_shard(muon, optimizer=self._optimizer(muon, muon_map))
         self.assertTrue(muon.embed.weight.use_muon)
         self.assertFalse(muon.embed.bias.use_muon)
 
         bad = TinyModel()
         with self.assertRaises(ValueError) as caught:
-            self._trainer(bad, self._optimizer(bad, {}))._setup_fsdp(bad, None)
+            fully_shard(bad, optimizer=self._optimizer(bad, {}))
         self.assertIn("misses trainable params", str(caught.exception))
 
-        amp = TinyModel()
-        trainer = self._trainer(amp, self._optimizer(amp), amp_master_grad=True)
-        trainer._setup_fsdp(amp, None)
+    def test_wrap_model_fsdp_pipeline_branch(self):
+        model = TinyModel()
+        trainer = self._trainer(
+            model, self._optimizer(model), amp_master_grad=True
+        )
+        trainer.using_fleet_model = True
+        with (
+            patch.object(fleet, "distributed_model", side_effect=lambda m: m),
+            patch(
+                "paddlefleet.trainer.trainer.fully_shard",
+                side_effect=lambda m, **kwargs: m,
+            ) as shard,
+        ):
+            trainer._wrap_model(model, training=True)
+
         self.assertIsInstance(
             trainer.optimizer, mix_precision_utils.MixPrecisionOptimizer
         )
+        shard.assert_called_once_with(
+            model,
+            mp_policy=None,
+            optimizer=trainer.optimizer,
+            grad_accum_steps=2,
+        )
+
+    def test_wrap_model_sharding_stage1_without_pipeline(self):
+        model = TinyModel()
+        optimizer = self._optimizer(model)
+        trainer = self._trainer(
+            model,
+            optimizer,
+            sharding=[ShardingOption.SHARD_OP],
+            tensor_model_parallel_size=2,
+            sequence_parallel=False,
+            split_param=False,
+            stage1_broadcast_overlap=False,
+        )
+        with (
+            patch.object(
+                fleet, "distributed_model", side_effect=lambda m: m
+            ) as dist_model,
+            patch.object(
+                trainer, "_wrap_distributed_optimizer", side_effect=lambda o: o
+            ) as wrap_opt,
+        ):
+            trainer._wrap_model(model, training=True)
+
+        dist_model.assert_called_once_with(model)
+        wrap_opt.assert_called_once_with(optimizer)
 
     def test_save_model_guard(self):
         context = MagicMock()
-        self._run_save_model(SimpleNamespace(_fsdp_context=context))
+        self._run_save_model(context)
         context.all_gather_params.assert_called_once_with()
 
         log = self._run_save_model(None)

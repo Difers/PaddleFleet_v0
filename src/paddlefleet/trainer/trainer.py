@@ -225,6 +225,7 @@ from .trainer_utils import (  # set_hyrbid_parallel_seed,
     TrainerMemoryTracker,
     TrainOutput,
     _exec_mode_guard,
+    _get_fsdp_context,
     _get_muon_2d_param_names,
     _insert_sync,
     _is_muon_sharding_optimizer,
@@ -519,9 +520,6 @@ class Trainer:
                     "Using sharding only works in distributed training."
                 )
             self.sharding = True
-
-        # FSDP-wrapped module, set by _setup_fsdp
-        self._fsdp_module = None
 
         # Initialize the parallel environment.
         # Parallelism includes enabling auto-parallel or not, and the auto-parallel implementation
@@ -3776,7 +3774,7 @@ class Trainer:
                             not args.enable_auto_parallel
                             and self.args.gradient_accumulation_steps > 1
                             and not use_dsv4_accuracy_compatible()
-                            and self._fsdp_module is None
+                            and ShardingOption.FSDP not in self.args.sharding
                         ):
                             paddle.device.synchronize()
                             parameters = (
@@ -5565,49 +5563,6 @@ class Trainer:
             )
         return dist_optimizer
 
-    def _setup_fsdp(self, module, mp_policy):
-        decay_fun = self.optimizer._apply_decay_param_fun
-        muon_info_map = getattr(self.optimizer, "_muon_param_info_map", None)
-        missing = []
-        for name, param in module.named_parameters():
-            param.no_weight_decay = decay_fun is not None and not decay_fun(
-                param.name
-            )
-            if muon_info_map is None:
-                continue
-            info = muon_info_map.get(param.name)
-            if info is None and not param.stop_gradient:
-                missing.append(name)
-            use_muon = bool(info is not None and info.use_muon)
-            use_hyperball = bool(
-                info is not None and getattr(info, "use_hyperball", False)
-            )
-            # Hyperball (AdamH, e.g. lm_head) must stay keep-whole just like Muon:
-            # its projection needs the full-matrix ||W||_F, matching stage1's
-            # keep_whole = use_muon or use_hyperball. If sliced as fused AdamW the
-            # Muon optimizer only sees fuse_params_* buffers, misses the
-            # muon_param_info_map and silently degrades to plain AdamW (no
-            # projection) -> loss diverges from stage1.
-            param.use_muon = use_muon or use_hyperball
-        if missing:
-            raise ValueError(
-                f"muon_param_info_map misses trainable params: {missing[:8]}"
-            )
-        fully_shard(
-            module,
-            enable_tensor_fusion_and_overlap=True,
-            mp_policy=mp_policy,
-        )
-        ctx = module._fsdp_context
-        ctx.set_grad_accum_steps(self.args.gradient_accumulation_steps)
-        if self.args.amp_master_grad:
-            mix_precision_utils.MixPrecisionLayer(module, dtype=self.amp_dtype)
-            self.optimizer = mix_precision_utils.MixPrecisionOptimizer(
-                self.optimizer
-            )
-        ctx.bind_optimizer(self.optimizer)
-        self._fsdp_module = module
-
     def _wrap_model(self, model, training=True):
         if self.args.enable_auto_parallel:
             model = parallelize.parallelize_model(
@@ -5693,6 +5648,7 @@ class Trainer:
         in_tensor_parallel_mode = self.args.tensor_model_parallel_size > 1
         in_sep_parallel_mode = self.args.sep_parallel_size > 1
         in_cp_parallel_mode = self.args.context_parallel_size > 1
+        in_fsdp_mode = ShardingOption.FSDP in self.args.sharding
 
         # Multi-gpu training
         if self.args.world_size > 1 and (not self.args.use_hybrid_parallel):
@@ -5724,10 +5680,8 @@ class Trainer:
                 )
 
         # Paddle native FSDP (`--sharding fsdp`). fully_shard() owns param / grad /
-        # optimizer-state sharding, registers the main_grad hooks itself and must therefore run
-        # before MixPrecisionLayer, so the wrapping order below differs from the group-sharded path.
-        in_fsdp_mode = ShardingOption.FSDP in self.args.sharding
-        self._fsdp_module = None
+        # optimizer-state sharding and registers the main_grad hooks itself, so MixPrecisionLayer
+        # is skipped under FSDP (its hooks would double-accumulate into main_grad).
         fsdp_mp_policy = None
         if (
             in_fsdp_mode
@@ -5812,16 +5766,18 @@ class Trainer:
             assert self.optimizer is not None, (
                 "Pipeline mode need decorate optimizer, pelease init optimizer."
             )
-            if in_fsdp_mode:
-                fsdp_layers = (
-                    model._layers if hasattr(model, "_layers") else model
+            if self.args.amp_master_grad:
+                self.optimizer = mix_precision_utils.MixPrecisionOptimizer(
+                    self.optimizer
                 )
-                self._setup_fsdp(fsdp_layers, fsdp_mp_policy)
+            if in_fsdp_mode:
+                model = fully_shard(
+                    model,
+                    mp_policy=fsdp_mp_policy,
+                    optimizer=self.optimizer,
+                    grad_accum_steps=self.args.gradient_accumulation_steps,
+                )
             else:
-                if self.args.amp_master_grad:
-                    self.optimizer = mix_precision_utils.MixPrecisionOptimizer(
-                        self.optimizer
-                    )
                 self.optimizer = self._wrap_distributed_optimizer(
                     self.optimizer
                 )
@@ -5840,9 +5796,7 @@ class Trainer:
         # No pipeline mode, sharding only
         if not in_pipeline_parallel_mode and in_sharding_parallel_mode:
             # Sharded DDP!
-            if in_fsdp_mode:
-                self._setup_fsdp(model, fsdp_mp_policy)
-            elif self.args.tensor_model_parallel_size > 1:
+            if self.args.tensor_model_parallel_size > 1:
                 hcg = fleet.get_hybrid_communicate_group()
                 assert (
                     ShardingOption.SHARD_GRAD_OP in self.args.sharding
@@ -5860,10 +5814,7 @@ class Trainer:
                         )
                     )
 
-            if in_fsdp_mode:
-                # model is already wrapped by fully_shard above, skip group sharded parallel
-                pass
-            elif ShardingOption.SHARD_OP in self.args.sharding:
+            if ShardingOption.SHARD_OP in self.args.sharding:
                 if self.args.amp_master_grad:
                     mix_precision_utils.MixPrecisionLayer(
                         model, dtype=self.amp_dtype
@@ -6315,7 +6266,7 @@ class Trainer:
             )
 
         if ShardingOption.FSDP in self.args.sharding:
-            fsdp_context = getattr(self._fsdp_module, "_fsdp_context", None)
+            fsdp_context = _get_fsdp_context()
             if fsdp_context is None:
                 logger.warning(
                     "sharding=fsdp but no fsdp context is registered, "
