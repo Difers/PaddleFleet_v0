@@ -1210,22 +1210,30 @@ class MoELayer(nn.Layer):
         on the gate output. For latent MoE, ``fc1_latent_proj`` is applied
         here so the gather runs in latent space; ``_project_to_latent`` reuses
         the result via ``self._latent_hidden``.
+
+        For 'ringmoe' the ring's token carrier and the router input
+        (``self._gate_input``, set by ``forward``) are first routed through
+        ``join_token_hop``, so the ring backward's last token hop overlaps
+        the router backward; ``self._gate_input`` is replaced by its alias.
         """
         if (
             self.expert_model_parallel_size > 1
             and self.moe_token_dispatcher_type == "ringmoe"
         ):
             if self.use_latent_moe:
-                self._latent_hidden = deferrable_linear_bare(
+                tokens = deferrable_linear_bare(
                     self.config,
                     "moe_latent_proj",
                     self.fc1_latent_proj,
                     hidden_states,
                 )
-                self.token_dispatcher.pre_gate_token_ag(self._latent_hidden)
             else:
-                self._latent_hidden = None
-                self.token_dispatcher.pre_gate_token_ag(hidden_states)
+                tokens = hidden_states
+            if getattr(self, "_gate_input", None) is not None:
+                join = self.token_dispatcher.join_token_hop
+                tokens, self._gate_input = join(tokens, self._gate_input)
+            self._latent_hidden = tokens if self.use_latent_moe else None
+            self.token_dispatcher.pre_gate_token_ag(tokens)
             return
         if not (
             self.expert_model_parallel_size > 1
@@ -1987,7 +1995,11 @@ class MoELayer(nn.Layer):
         gate_input = self._prepare_gate_input(_hs_router_path, residual)
         gate_input = inspect_tensor("moe_gate_input", layer_idx, gate_input)
 
+        # The ring may swap the router input for an alias (see
+        # `_maybe_pre_allgather_overlap`); read it back after the call.
+        self._gate_input = gate_input
         self._maybe_pre_allgather_overlap(hidden_states)
+        gate_input, self._gate_input = self._gate_input, None
 
         (
             capacity,

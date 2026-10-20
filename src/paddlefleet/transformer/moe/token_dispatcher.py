@@ -2130,6 +2130,24 @@ class _ByteGradCapture(paddle.autograd.PyLayer):
             )
 
 
+class _GradRoot(paddle.autograd.PyLayer):
+    """Scalar root over a manual-backward segment's outputs.
+
+    ``paddle.autograd.backward(outs, grads)`` deep-copies every root grad on
+    the calc stream. Starting from this root instead, its backward hands the
+    grads parked in ``box["grads"]`` to the outputs as they are.
+    """
+
+    @staticmethod
+    def forward(ctx, box, *outs):
+        ctx.box = box
+        return paddle.empty([1], dtype="float32")
+
+    @staticmethod
+    def backward(ctx, _):
+        return tuple(ctx.box.pop("grads"))
+
+
 def _manual_backward(f: Callable, is_first_fwd: bool, *args: Any):
     """``moe_utils.manual_backward`` with support for byte-carrier leaves.
 
@@ -2172,6 +2190,10 @@ def _manual_backward(f: Callable, is_first_fwd: bool, *args: Any):
         return None, out
 
     out_cached = [FakeClone.apply(o) for o in out if o is not None]
+    # Root over the grad-carrying outputs; see `_GradRoot`.
+    root_box = {}
+    root_outs = [o for o in out_cached if not o.stop_gradient]
+    root = _GradRoot.apply(root_box, *root_outs) if root_outs else None
     for o in out_cached:
         o._clear_dataptr()
     tracer._has_grad = orig_has_grad
@@ -2184,7 +2206,11 @@ def _manual_backward(f: Callable, is_first_fwd: bool, *args: Any):
             *[(g, o) for g, o in zip(grads, out_cached) if not o.stop_gradient]
         )
         assert len(grads) == len(out_cached), (len(grads), len(out_cached), f)
-        paddle.autograd.backward(out_cached, grads)
+        if root is not None and len(grads) == len(root_outs):
+            root_box["grads"] = grads
+            paddle.autograd.backward([root])
+        else:
+            paddle.autograd.backward(out_cached, grads)
         return tuple(
             box.get("grad") if box is not None else leaf.grad
             for leaf, box in zip(detached_args, grad_boxes)
@@ -2215,6 +2241,48 @@ class _RingRoundsExplicit(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, *out_grads):
         return ctx.bwd(*out_grads)
+
+
+def _alias(x):
+    """``x`` as a new tensor sharing its storage, or a clone if it is not
+    contiguous."""
+    if x.is_contiguous():
+        out = paddle.Tensor()
+        out.get_tensor()._share_data_nocheck_with(x.get_tensor())
+        return out
+    return x.clone()
+
+
+class _RingTokHopJoin(paddle.autograd.PyLayer):
+    """Identity on the ring's token carrier and the router input that
+    finishes the ring's last token hop.
+
+    The ring backward's final link hops the remote rounds' token grad back
+    home. Waiting for it inside the ring op would hold back the router
+    backward, which only needs the routing grad. Instead the ring op
+    leaves the hop in flight and records it in ``slot``. This op aliases both
+    the carrier and the router input, so autograd runs its backward only
+    after both grads arrived, i.e. after the router backward is enqueued. It
+    then waits for the hop and adds its result to the carrier grad.
+    """
+
+    @staticmethod
+    def forward(ctx, carrier, gate_input, slot):
+        ctx.slot = slot
+        return _alias(carrier), _alias(gate_input)
+
+    @staticmethod
+    def backward(ctx, carrier_grad, gate_grad):
+        slot = ctx.slot
+        ctx.slot = None
+        if slot:
+            RingMoETokenDispatcher._drain([slot["hop"]])
+            rev = slot["rev"].reshape(carrier_grad.shape)
+            if rev.dtype != carrier_grad.dtype:
+                rev = rev.astype(carrier_grad.dtype)
+            slot.clear()
+            carrier_grad = carrier_grad + rev
+        return carrier_grad, gate_grad
 
 
 @paddle.no_grad()
@@ -3105,6 +3173,8 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         self._gate_pf_handle = None
         # Token pack from pre_gate_token_ag, consumed by ring_forward.
         self._gate_pack = None
+        # Slot from join_token_hop, consumed by ring_forward.
+        self._tok_hop_slot = None
         # A real EP group is required; the multi-node (N > 1) and intra-node
         # (G > 1) checks follow once the sub-groups are built. All three are
         # raised rather than asserted so they survive ``python -O``.
@@ -3193,6 +3263,29 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     "discarding handle.",
                     exc,
                 )
+
+    def join_token_hop(self, tokens, gate_input):
+        """Route the ring's token carrier and the router input through
+        :class:`_RingTokHopJoin`.
+
+        Optional. MoELayer calls this before the router, then passes the
+        returned token alias to :meth:`pre_gate_token_ag` and the returned
+        router-input alias to the router. The next ring backward then leaves
+        its last token hop in flight so the router backward overlaps it; the
+        join's backward waits for it. Returns both inputs unchanged when
+        either takes no grad: without a router backward there is nothing to
+        overlap.
+        """
+        self._tok_hop_slot = None
+        if (
+            tokens.stop_gradient
+            or gate_input.stop_gradient
+            or not framework._dygraph_tracer()._has_grad
+        ):
+            return tokens, gate_input
+        slot = {}
+        self._tok_hop_slot = slot
+        return _RingTokHopJoin.apply(tokens, gate_input, slot)
 
     def pre_gate_token_ag(self, tokens):
         """Pack the local token and start the home round's gather.
@@ -3427,6 +3520,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             local_tok = gate_pack["data"]
         home_tok_ag_handle = self._gate_pf_handle
         self._gate_pf_handle = None
+        # Set by `join_token_hop`: the backward then hands its last token hop
+        # to the join instead of waiting for it.
+        tok_hop_slot = self._tok_hop_slot
+        self._tok_hop_slot = None
         # Remote round's pre-issued hop and gather, or None.
         remote = gate_pack.get("remote")
 
@@ -3905,6 +4002,11 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 # the remote gathers were issued without waiting; otherwise
                 # the wait below is what the shared expert has to cover.
                 se_late = remote_ag_issued
+                # With a token-hop join the router backward already covers
+                # the final hop, so the held-back shared expert covers the
+                # last remote round's token-grad ReduceScatter instead (see
+                # after the loop).
+                se_covers_last_tok_rs = se_late and tok_hop_slot is not None
                 if not se_late:
                     _run_se_bwd()
                 if not remote_ag_issued:
@@ -4072,6 +4174,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 # The loop ended on round 1: wait for its token-grad
                 # ReduceScatter (it overlapped any in-flight 2 -> 1 hop),
                 # then fold round 1 before the final link.
+                # The shared expert held back for the join is enqueued after
+                # that ReduceScatter was issued, so it overlaps it.
+                if se_covers_last_tok_rs:
+                    _run_se_bwd()
                 if pending_tok_rs is not None:
                     rs_round, rs_out, rs_task, _rs_input = pending_tok_rs
                     if rs_task is not None:
@@ -4105,9 +4211,26 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 # pre-gather (which must stay fp32, so overlapping it is the
                 # only thing left to do with it).
                 g_w_pregather = _rt_rs_finish(
-                    overlap=_run_se_bwd if se_late else None
+                    overlap=_run_se_bwd
+                    if se_late and not se_covers_last_tok_rs
+                    else None
                 )
-                self._drain([last_tok_hop, last_w_hop])
+                g_home_tok = g_tok_chain[0]
+                # With a join (see `join_token_hop`), the token hop is left
+                # in flight: the join waits for it after the router backward
+                # is enqueued, and adds last_tok_rev itself.
+                defer_tok_hop = (
+                    tok_hop_slot is not None
+                    and last_tok_rev is not None
+                    and g_home_tok is not None
+                )
+                if defer_tok_hop:
+                    tok_hop_slot.update(
+                        hop=last_tok_hop, rev=last_tok_rev, src=last_tok_src
+                    )
+                    self._drain([last_w_hop])
+                else:
+                    self._drain([last_tok_hop, last_w_hop])
                 for g_w_extra in (last_w_rev, g_w_pregather):
                     if g_w_extra is not None:
                         g_w_chain[0] = (
@@ -4115,8 +4238,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                             if g_w_chain[0] is None
                             else g_w_chain[0] + g_w_extra
                         )
-                g_home_tok = g_tok_chain[0]
-                if last_tok_rev is not None:
+                if last_tok_rev is not None and not defer_tok_hop:
                     g_home_tok = (
                         last_tok_rev
                         if g_home_tok is None

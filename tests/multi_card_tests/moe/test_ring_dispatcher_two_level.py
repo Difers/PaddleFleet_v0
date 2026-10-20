@@ -231,6 +231,258 @@ class TestTwoLevelRing(_TwoLevelBase):
             atol=1e-5,
         )
 
+    def test_join_token_hop_matches_plain(self):
+        # join_token_hop leaves the backward's last token hop in flight and
+        # has the join on the input add it. Grads must match the plain path,
+        # with a router stand-in also reading the input, on the in-order
+        # first forward and the remote-first second one.
+        # The carrier and the gate input are two DIFFERENT tensors, as in
+        # MoELayer's latent wiring: the carrier is a projection of the gate
+        # input, so the deferred hop grad belongs to the carrier only and a
+        # rev mis-added to the gate input (or dropped) shows up in the
+        # projection's weight grad or the token grad.
+        grads = {}
+        for use_join in (False, True):
+            paddle.seed(7)
+            proj = paddle.nn.Linear(self.d_latent, self.d_latent)
+            disp = _dispatcher(self.ep_group, self.num_experts)
+            for step in range(2):
+                idx, w0 = self._routing()
+                x = self._tokens()
+                carrier = proj(x)
+                carrier, gate_in = (
+                    disp.join_token_hop(carrier, x)
+                    if use_join
+                    else (carrier, x)
+                )
+                slot = disp._tok_hop_slot
+                deferred = []
+                if use_join:
+                    # Runs after the ring backward, before the join's.
+                    carrier.register_hook(
+                        lambda _: deferred.append("hop" in slot)
+                    )
+                w = w0 * gate_in.mean(axis=-1, keepdim=True)
+                disp.pre_gate_token_ag(carrier)
+                out = disp.ring_forward(
+                    carrier, w, idx, _weighted_expert_fn(), w.dtype
+                )
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                if use_join:
+                    self.assertEqual(deferred, [True])
+                    self.assertEqual(slot, {})
+                    self.assertIsNone(disp._tok_hop_slot)
+                grads[use_join, step] = (
+                    x.grad.numpy(),
+                    w0.grad.numpy(),
+                    proj.weight.grad.numpy(),
+                )
+                proj.clear_gradients()
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=1e-5, atol=1e-5)
+
+    def test_join_skips_router_input_without_grad(self):
+        # A router input that takes no grad has no backward to overlap, so
+        # the join must hand both inputs back and leave the hop to the ring.
+        disp = _dispatcher(self.ep_group, self.num_experts)
+        x = self._tokens()
+        gate_in = self._tokens(requires_grad=False)
+        carrier, gate_out = disp.join_token_hop(x, gate_in)
+        self.assertIs(carrier, x)
+        self.assertIs(gate_out, gate_in)
+        self.assertIsNone(disp._tok_hop_slot)
+
+    def test_join_clones_non_contiguous_input(self):
+        # The join aliases contiguous inputs and clones strided ones. Without
+        # a ring backward its slot stays empty, so its backward is identity.
+        disp = _dispatcher(self.ep_group, self.num_experts)
+        base = paddle.arange(
+            self.T_local * self.d_latent, dtype="float32"
+        ).reshape([self.d_latent, self.T_local])
+        base.stop_gradient = False
+        strided = base.transpose([1, 0])
+        self.assertFalse(strided.is_contiguous())
+        gate_in = self._tokens()
+        carrier, gate_out = disp.join_token_hop(strided, gate_in)
+        self.assertTrue(carrier.is_contiguous())
+        np.testing.assert_array_equal(carrier.numpy(), strided.numpy())
+        disp._tok_hop_slot = None
+        g = self._distinct_upstream(carrier.shape)
+        paddle.autograd.backward([carrier, gate_out], [g, g * 2])
+        np.testing.assert_array_equal(base.grad.numpy(), g.numpy().T)
+        np.testing.assert_array_equal(gate_in.grad.numpy(), (g * 2).numpy())
+
+    def test_join_in_moe_layer_wiring_without_latent(self):
+        # Without latent MoE the carrier and the router input start as the
+        # same hidden state; the join aliases them separately and the ring
+        # entry still has to hand the carrier alias to the gather.
+        from types import SimpleNamespace
+
+        from paddlefleet.transformer.moe import moe_layer
+
+        grads = {}
+        for use_join in (False, True):
+            disp = _dispatcher(self.ep_group, self.num_experts)
+            for step in range(2):
+                hs = self._tokens()
+                idx, w0 = self._routing()
+                layer = SimpleNamespace(
+                    expert_model_parallel_size=self.ep_size,
+                    moe_token_dispatcher_type="ringmoe",
+                    use_latent_moe=False,
+                    token_dispatcher=disp,
+                    _gate_input=hs if use_join else None,
+                )
+                carrier = {}
+                pre_gate = disp.pre_gate_token_ag
+
+                def _record(t, _pre_gate=pre_gate, _carrier=carrier):
+                    _carrier["t"] = t
+                    return _pre_gate(t)
+
+                with mock.patch.object(disp, "pre_gate_token_ag", _record):
+                    moe_layer.MoELayer._maybe_pre_allgather_overlap(layer, hs)
+                self.assertIsNone(layer._latent_hidden)
+                self.assertEqual(carrier["t"] is not hs, use_join)
+                gate_in = layer._gate_input if use_join else hs
+                w = w0 * gate_in.mean(axis=-1, keepdim=True)
+                out = disp.ring_forward(
+                    carrier["t"], w, idx, _weighted_expert_fn(), w.dtype
+                )
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                grads[use_join, step] = (hs.grad.numpy(), w0.grad.numpy())
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=1e-5, atol=1e-5)
+
+    def test_manual_backward_root_and_partial_grads(self):
+        # With every grad given, the segment backward starts from its scalar
+        # root; with a None grad it falls back to backward over the outputs
+        # that do get one.
+        from paddlefleet.transformer.moe import token_dispatcher as td
+
+        def f(a):
+            return a * 2.0, a * 3.0
+
+        for grads, expect in (((1.0, 1.0), 5.0), ((1.0, None), 2.0)):
+            a = self._tokens()
+            bwd, _ = td._manual_backward(f, False, a)
+            g = [
+                None if s is None else paddle.full(a.shape, s, a.dtype)
+                for s in grads
+            ]
+            (a_grad,) = bwd(*g)
+            np.testing.assert_allclose(
+                a_grad.numpy(), np.full(a.shape, expect, "float32")
+            )
+
+    def test_join_in_moe_layer_wiring_matches_plain(self):
+        # MoELayer's ring entry with latent MoE: the carrier is the latent
+        # projection and the router input is the hidden state, two different
+        # tensors; the router input is swapped for its alias through
+        # `_gate_input`. Grads of the hidden state, the projection weight and
+        # the router weights must match the path without a join.
+        from types import SimpleNamespace
+
+        from paddlefleet.transformer.moe import moe_layer
+
+        grads = {}
+        for use_join in (False, True):
+            paddle.seed(7)
+            proj = paddle.nn.Linear(2 * self.d_latent, self.d_latent)
+            disp = _dispatcher(self.ep_group, self.num_experts)
+            for step in range(2):
+                hs = paddle.concat([self._tokens(False)] * 2, axis=-1)
+                hs.stop_gradient = False
+                idx, w0 = self._routing()
+                layer = SimpleNamespace(
+                    expert_model_parallel_size=self.ep_size,
+                    moe_token_dispatcher_type="ringmoe",
+                    use_latent_moe=True,
+                    config=None,
+                    fc1_latent_proj=proj,
+                    token_dispatcher=disp,
+                    _gate_input=hs if use_join else None,
+                )
+                with mock.patch.object(
+                    moe_layer,
+                    "deferrable_linear_bare",
+                    lambda config, point, linear, x: linear(x),
+                ):
+                    moe_layer.MoELayer._maybe_pre_allgather_overlap(layer, hs)
+                gate_in = layer._gate_input if use_join else hs
+                self.assertEqual(disp._tok_hop_slot is not None, use_join)
+                w = w0 * gate_in.mean(axis=-1, keepdim=True)
+                out = disp.ring_forward(
+                    layer._latent_hidden,
+                    w,
+                    idx,
+                    _weighted_expert_fn(),
+                    w.dtype,
+                )
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                grads[use_join, step] = (
+                    hs.grad.numpy(),
+                    proj.weight.grad.numpy(),
+                    w0.grad.numpy(),
+                )
+                proj.clear_gradients()
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=1e-5, atol=1e-5)
+
+    def test_join_with_shared_expert_matches_plain(self):
+        # With a join the shared expert's backward moves to overlap the last
+        # remote round's token-grad ReduceScatter. Grads of the tokens, router
+        # weights, shared-expert input and its weight must match the plain
+        # path.
+        grads = {}
+        for use_join in (False, True):
+            paddle.seed(7)
+            se = paddle.nn.Linear(self.d_latent, self.d_latent)
+            disp = _dispatcher(self.ep_group, self.num_experts)
+            for step in range(2):
+                x = self._tokens()
+                # Leading batch dim, like the MoE layer's residual.
+                res = (self._tokens(requires_grad=False) * 0.5).unsqueeze(0)
+                res.stop_gradient = False
+                idx, w0 = self._routing()
+                carrier, gate_in = (
+                    disp.join_token_hop(x, x) if use_join else (x, x)
+                )
+                w = w0 * gate_in.mean(axis=-1, keepdim=True)
+                handle = {"fn": se, "fn_args": (res,)}
+                disp.pre_gate_token_ag(carrier)
+                out = disp.ring_forward(
+                    carrier,
+                    w,
+                    idx,
+                    _weighted_expert_fn(),
+                    w.dtype,
+                    combine_overlap_handle=handle,
+                )
+                out = out + handle["fn_out"][0].squeeze(0)
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                grads[use_join, step] = (
+                    x.grad.numpy(),
+                    w0.grad.numpy(),
+                    res.grad.numpy(),
+                    se.weight.grad.numpy(),
+                )
+                se.clear_gradients()
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=1e-5, atol=1e-5)
+
     def test_rejects_inter_only_topology(self):
         # G==1 (one GPU per node group) is an inter-only ring; construction
         # must raise RuntimeError (survives ``python -O``), not run it.
@@ -556,6 +808,108 @@ class TestTwoLevelFp8Ring(_TwoLevelBase):
             rtol=2e-2,
             atol=2e-2,
         )
+
+    def test_fp8_join_matches_plain(self):
+        # fp8 ring with a join: the deferred token grad comes back through the
+        # straight-through quantizer and is added in the join. Token and
+        # router-weight grads must match the path without a join, on the
+        # in-order first forward and the remote-first second one.
+        def expert_fn(g_tok, g_idx, g_w, use_fp8, **kwargs):
+            scale = g_w.sum(axis=-1, keepdim=True).astype("bfloat16")
+            return _Fp8StraightThrough.apply(g_tok) * scale
+
+        grads = {}
+        for use_join in (False, True):
+            disp = self._fp8_dispatcher()
+            for step in range(2):
+                x = self._tokens128()
+                idx, w0 = self._routing()
+                carrier, gate_in = (
+                    disp.join_token_hop(x, x) if use_join else (x, x)
+                )
+                gate = gate_in.astype("float32").mean(axis=-1, keepdim=True)
+                w = w0 * gate
+                disp.pre_gate_token_ag(carrier)
+                out = disp.ring_forward(carrier, w, idx, expert_fn, w.dtype)
+                paddle.autograd.backward(
+                    [out],
+                    [self._distinct_upstream(out.shape).astype("bfloat16")],
+                )
+                grads[use_join, step] = (
+                    x.grad.astype("float32").numpy(),
+                    w0.grad.numpy(),
+                )
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=2e-2, atol=2e-2)
+
+    def test_join_casts_deferred_grad_to_carrier_dtype(self):
+        # The join adds the deferred hop grad in the carrier grad's dtype.
+        # The fp8 quantizer only takes bf16 carriers, so a mismatched rev is
+        # fed straight into the slot: a bf16 rev on an fp32 carrier, with a
+        # hop handle that issued nothing.
+        disp = self._fp8_dispatcher()
+        x = self._tokens128(False).astype("float32")
+        x.stop_gradient = False
+        gate_in = self._tokens128()
+        carrier, gate_out = disp.join_token_hop(x, gate_in)
+        slot = disp._tok_hop_slot
+        disp._tok_hop_slot = None
+        rev = paddle.full([self.T_local * self.H], 0.5, dtype="bfloat16")
+        slot.update(hop={}, rev=rev)
+        paddle.autograd.backward(
+            [carrier, gate_out],
+            [paddle.ones_like(carrier), paddle.ones_like(gate_out)],
+        )
+        self.assertEqual(slot, {})
+        self.assertEqual(x.grad.dtype, paddle.float32)
+        np.testing.assert_array_equal(
+            x.grad.numpy(), np.full(x.shape, 1.5, "float32")
+        )
+
+    def test_fp8_join_distinct_inputs_matches_plain(self):
+        # Same fp8 join path, but the carrier and the router input are two
+        # DIFFERENT tensors, as in MoELayer: the carrier is a projection of
+        # the hidden state and the gate input is the hidden state itself. The
+        # deferred hop carries only the carrier's grad, which the join adds
+        # after the straight-through quantizer's backward; a rev added on the
+        # wrong input (or dropped) shifts exactly one of these grads.
+        def expert_fn(g_tok, g_idx, g_w, use_fp8, **kwargs):
+            scale = g_w.sum(axis=-1, keepdim=True).astype("bfloat16")
+            return _Fp8StraightThrough.apply(g_tok) * scale
+
+        grads = {}
+        for use_join in (False, True):
+            paddle.seed(7)
+            proj = paddle.nn.Linear(self.H, self.H)
+            proj.to(dtype="bfloat16")
+            disp = self._fp8_dispatcher()
+            for step in range(2):
+                hs = self._tokens128()
+                idx, w0 = self._routing()
+                carrier = proj(hs)
+                carrier, gate_in = (
+                    disp.join_token_hop(carrier, hs)
+                    if use_join
+                    else (carrier, hs)
+                )
+                gate = gate_in.astype("float32").mean(axis=-1, keepdim=True)
+                w = w0 * gate
+                disp.pre_gate_token_ag(carrier)
+                out = disp.ring_forward(carrier, w, idx, expert_fn, w.dtype)
+                paddle.autograd.backward(
+                    [out],
+                    [self._distinct_upstream(out.shape).astype("bfloat16")],
+                )
+                grads[use_join, step] = (
+                    hs.grad.astype("float32").numpy(),
+                    proj.weight.grad.astype("float32").numpy(),
+                    w0.grad.numpy(),
+                )
+                proj.clear_gradients()
+        for step in range(2):
+            for plain, joined in zip(grads[False, step], grads[True, step]):
+                np.testing.assert_allclose(joined, plain, rtol=2e-2, atol=2e-2)
 
     def test_fp8_remote_first_repeated_calls(self):
         # From the second call on the fp8 ring runs remote-first, hopping the
