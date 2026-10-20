@@ -966,6 +966,82 @@ def _fsdp_owns_param_storage(args):
     return ShardingOption.FSDP in args.sharding
 
 
+def _fp8_quant_target_params(layer):
+    """Params whose values ``TransformerLayer.fp8_quant_weight`` reads."""
+    params = []
+    mlp = getattr(layer, "mlp", None)
+    for name in ("grouped_gemm_experts", "experts"):
+        experts = getattr(mlp, name, None)
+        if experts is not None:
+            params.extend(experts.parameters())
+    for m in layer.sublayers(include_self=False):
+        if getattr(m, "is_expert", False) or not getattr(m, "fp8", False):
+            continue
+        if getattr(m, "weight_quant_func", None) is None:
+            continue
+        weight = getattr(m, "weight", None)
+        if weight is not None:
+            params.append(weight)
+    return params
+
+
+def _fsdp_fp8_quant_weight(model, batch_mode, quant_transpose):
+    """Per-step fp8 pre-quantization under fsdp.
+
+    Unshards one transformer layer's quant-target weights at a time (peak
+    memory stays at one layer, like forward), quantizes them and reshards.
+    The fp8 caches are attributes on the param objects and survive the
+    reshard, so forward / recompute / dgrad reuse them instead of
+    re-quantizing every micro-batch. The bf16 storage is left to fsdp: the
+    param shard is what the optimizer updates in place, and the unsharded
+    copy is freed on leaving ``unshard_params``.
+    """
+    from paddle.distributed.fsdp._fsdp_context import get_fsdp_context
+    from paddlefleet.transformer.transformer_layer import TransformerLayer
+
+    fsdp_context = get_fsdp_context()
+    assert fsdp_context is not None, (
+        "sharding=fsdp but no fsdp context is registered."
+    )
+    with paddle.no_grad():
+        for layer in model.sublayers(include_self=True):
+            if not isinstance(layer, TransformerLayer):
+                continue
+            with fsdp_context.unshard_params(_fp8_quant_target_params(layer)):
+                layer.fp8_quant_weight(
+                    batch_mode=batch_mode, quant_transpose=quant_transpose
+                )
+
+
+def _fsdp_expert_master_weight_names():
+    """Master-weight keys of fsdp-managed expert params.
+
+    Non-muon groups step on the fused shard (``fuse_params_*``), muon groups
+    on the original params, so both names are candidates.
+    """
+    from paddle.distributed.fsdp._fsdp_context import get_fsdp_context
+
+    fsdp_context = get_fsdp_context()
+    if fsdp_context is None:
+        return []
+    names = []
+    for group in fsdp_context.buffer_manager.buffer_groups:
+        if not group.is_expert_param:
+            continue
+        names.append(group.params_buffer.data_buffer.name)
+        names.extend(p.name for p in group.params)
+    return names
+
+
+def _master_weights_of(optimizer):
+    inner = optimizer
+    while not hasattr(inner, "_master_weights") and hasattr(
+        inner, "_inner_opt"
+    ):
+        inner = inner._inner_opt
+    return getattr(inner, "_master_weights", {})
+
+
 class FP8QuantWeightCallback(TrainerCallback):
     """
     Callback for FP8 weight quantization during training
@@ -976,17 +1052,6 @@ class FP8QuantWeightCallback(TrainerCallback):
         Quantize expert weights to FP8 before each training step
         """
         if args.using_sonic_moe:
-            return
-        # Under fsdp the per-step pre-quantization is both impossible (the
-        # weights have no storage here) and unnecessary: the fp8 expert path
-        # quantizes lazily in forward, where the unit's weight is gathered --
-        # ``fp8_utils.fused_stack_quant`` falls back to
-        # ``fused_stack_quant_without_cache`` when a weight carries no
-        # ``fp8_weight_stacked`` cache, and the split-group-gemm path has the
-        # same fallback (``fusion_layer_utils.py`` ~line 1135). Cost of skipping:
-        # the expert weights are re-quantized once per micro-batch forward
-        # instead of once per step, and expert master weights are not offloaded.
-        if _fsdp_owns_param_storage(args):
             return
         model = kwargs["model"]
         optimizer = kwargs["optimizer"]
@@ -1003,23 +1068,40 @@ class FP8QuantWeightCallback(TrainerCallback):
                 self.use_fp8 = model.use_fp8()
             if not self.use_fp8:
                 return
-            model.fp8_quant_weight(True, quant_transpose=False)
-            optimizer.clear_param_storage("moe_expert")
-            optimizer.clear_param_storage("rms_linear")
-            optimizer.clear_param_storage("memory_attn")
-            optimizer.clear_param_storage("attn_out_project")
-            optimizer.clear_param_storage("shared_expert")
+            if _fsdp_owns_param_storage(args):
+                # fsdp: weights are storage-less shells here and the plain
+                # optimizer has no clear_param_storage; gather layer by layer
+                # to quantize, and leave the bf16 shards to fsdp.
+                _fsdp_fp8_quant_weight(model, True, quant_transpose=False)
+                moe_weights_name = _fsdp_expert_master_weight_names()
+            else:
+                model.fp8_quant_weight(True, quant_transpose=False)
+                optimizer.clear_param_storage("moe_expert")
+                optimizer.clear_param_storage("rms_linear")
+                optimizer.clear_param_storage("memory_attn")
+                optimizer.clear_param_storage("attn_out_project")
+                optimizer.clear_param_storage("shared_expert")
+                moe_weights_name = None
             if not args.offload_fp8_expert_master_weight:
                 return
-            for param in optimizer._inner_opt._parameter_list:
-                color = getattr(param, "color", -1)
-                if isinstance(color, dict) and color["color"] == "moe_expert":
-                    self.moe_weights_name.append(param.name)
+            if moe_weights_name is not None:
+                self.moe_weights_name = moe_weights_name
+            else:
+                for param in optimizer._inner_opt._parameter_list:
+                    color = getattr(param, "color", -1)
+                    if (
+                        isinstance(color, dict)
+                        and color["color"] == "moe_expert"
+                    ):
+                        self.moe_weights_name.append(param.name)
 
+            master_weights = _master_weights_of(optimizer)
             for name in self.moe_weights_name:
                 # NOTE(Waynezee): when moe_sharding_degree > 1, experts parameter's master_weight may exist in ranks of another moe_sharding_rank.
-                if name in optimizer._master_weights:
-                    offload(optimizer._master_weights[name])
+                # Under fsdp the master weights are created lazily in the
+                # first step, so nothing is offloaded before it.
+                if name in master_weights:
+                    offload(master_weights[name])
 
         skip_count += 1
 
@@ -1028,9 +1110,6 @@ class FP8QuantWeightCallback(TrainerCallback):
         Reload weights before optimizer step
         """
         if args.using_sonic_moe:
-            return
-        if _fsdp_owns_param_storage(args):
-            # Symmetric to on_step_begin: nothing was quantized or offloaded.
             return
         model = kwargs["model"]
         optimizer = kwargs["optimizer"]
@@ -1041,9 +1120,10 @@ class FP8QuantWeightCallback(TrainerCallback):
             and hasattr(model, "fp8_quant_weight")
             and not args.sharding_parallel_size <= 1
         ):
-            for name in self.moe_weights_name:
-                if name in optimizer._master_weights:
-                    reload(optimizer._master_weights[name])
+            master_weights = _master_weights_of(optimizer)
+            for name in getattr(self, "moe_weights_name", []):
+                if name in master_weights:
+                    reload(master_weights[name])
 
 
 class MoECorrectionBiasAdjustCallback(TrainerCallback):
@@ -1641,8 +1721,8 @@ class SonicMoELayoutSwitchCallback(TrainerCallback):
     def _reject_fsdp(self, args):
         """SonicMoE is not supported together with paddle-native FSDP yet.
 
-        Unlike the plain fp8 expert path, SonicMoE cannot simply drop this
-        callback under fsdp: ``convert_weights_to_sonic_layout`` /
+        Unlike the plain fp8 expert path, SonicMoE cannot reuse the fsdp
+        per-layer unshard pre-quantization: ``convert_weights_to_sonic_layout`` /
         ``convert_weights_to_grouped_layout`` *write* parameter storage, so they
         can only run while the owning unit's weight is gathered (i.e. inside
         forward, which ``SonicMoEExpert.forward`` already does). That leaves the
