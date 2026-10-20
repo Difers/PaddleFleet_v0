@@ -40,6 +40,9 @@ control flow:
   before the Python-side momentum update and offloads both afterwards, but only
   when ``param.is_offload_opt`` is truthy. It degrades to a no-op when Muon or
   its update entry points are absent.
+* Step 5 (mixed-optimizer sub-optimizers) is covered by
+  ``test_inner_optimizer_offload.py``; like Step 4 its gate defaults to
+  ``True`` in both variants.
 
 Both hack variants carry textually duplicated Step 1/3/4 code, so tests whose
 expectation is identical for both are parameterized over both variants to
@@ -79,6 +82,19 @@ try:
 except ImportError:  # pragma: no cover - Muon missing on very old Paddle
     Muon = None
     _HAS_MUON = False
+
+try:
+    from paddle.optimizer.inner_optimizer import InnerOptimizer
+
+    from paddlefleet.optimizers import MuonOptimizer
+
+    # Step 5 patches (mixed-optimizer sub-optimizers), restored per test.
+    _INNER_ATTRS = (
+        (InnerOptimizer, "_apply_optimize"),
+        (MuonOptimizer, "_update_shape_group"),
+    )
+except (ImportError, ModuleNotFoundError):  # Paddle without InnerOptimizer
+    _INNER_ATTRS = ()
 
 _MISSING = object()
 _MUON_ATTRS = ("_muon_update_group", "_muon_update")
@@ -154,6 +170,8 @@ class _HackTestCase(unittest.TestCase):
         if _HAS_MUON:
             for attr in _MUON_ATTRS:
                 saved[(Muon, attr)] = getattr(Muon, attr, _MISSING)
+        for obj, attr in _INNER_ATTRS:
+            saved[(obj, attr)] = getattr(obj, attr)
 
         def restore():
             for (obj, name), val in saved.items():

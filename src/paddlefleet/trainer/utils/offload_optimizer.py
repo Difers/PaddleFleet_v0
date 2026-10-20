@@ -39,6 +39,122 @@ def reload(tensor):
     assert new_tensor is tensor, "to_device must be inplace operation"
 
 
+def _inner_param_states(opt, param):
+    """Every state tensor *opt* keeps for *param*: accumulators + master weight.
+
+    Generic over the state layout, so it covers any ``InnerOptimizer``
+    subclass (moment1/moment2/beta_pow, square_avg/momentum_buffer, ...).
+    """
+    states = [
+        accs[param.name]
+        for accs in opt._accumulators.values()
+        if param.name in accs
+    ]
+    master = opt._master_weights.get(param.name)
+    if isinstance(master, paddle.Tensor):
+        states.append(master)
+    return states
+
+
+def _reload_inner_states(opt, params):
+    for param in params:
+        for t in _inner_param_states(opt, param):
+            reload(t)
+
+
+def _offload_inner_states(opt, params):
+    for param in params:
+        if getattr(param, "is_offload_opt", True):
+            for t in _inner_param_states(opt, param):
+                offload(t)
+
+
+def _hack_offload_inner_optimizers():
+    """Reload/offload the state of mixed-optimizer sub-optimizers.
+
+    ``InnerOptimizer`` subclasses (``use_mixed_optimizer``) mostly update in
+    pure Python, bypassing the ``_C_ops.adamw_`` patch, and their master
+    weights are not created through ``_add_accumulator``. Around every update
+    the touched parameters' accumulators and master weights are reloaded to
+    the device and offloaded again afterwards, at the finest granularity that
+    keeps the update math unchanged:
+
+    - ``MuonOptimizer`` family: per Newton-Schulz batch (``_update_shape_group``,
+      same as the legacy Muon patch), since a batch couples its parameters;
+    - ``AdamWOptimizer`` / ``RMSpropOptimizer`` families: per parameter, their
+      ``_update_parameters`` being a plain per-parameter loop;
+    - any other (custom) ``InnerOptimizer``: one ``_update_parameters`` call,
+      which is correct for any update math at the cost of a higher peak.
+
+    Like Step 4 (Muon), the offload gate defaults to ``is_offload_opt=True`` in
+    both ``hack_offload_optimizer`` and ``hack_offload_optimizer_eb5``: these
+    pure-Python updates follow Step 4, not the eb5 ``False`` default of the
+    ``_C_ops.adamw_`` / ``_insert_sync`` patches (Steps 2/3).
+    """
+    try:
+        from paddle.optimizer.inner_optimizer import InnerOptimizer
+
+        from ...optimizers import (
+            AdamWOptimizer,
+            MuonOptimizer,
+            RMSpropOptimizer,
+        )
+    except ImportError:
+        return
+
+    # 5a: Muon batches, reloaded/offloaded as a whole.
+    origin_update_shape_group = MuonOptimizer._update_shape_group
+
+    def new_update_shape_group(self, group_params_grads, *args, **kwargs):
+        params = [param for param, _ in group_params_grads]
+        _reload_inner_states(self, params)
+        ret = origin_update_shape_group(
+            self, group_params_grads, *args, **kwargs
+        )
+        _offload_inner_states(self, params)
+        return ret
+
+    MuonOptimizer._update_shape_group = new_update_shape_group
+
+    # 5b: every other sub-optimizer, through the _apply_optimize template.
+    # The template calls ``self._update_parameters`` once with all active
+    # (param, grad) pairs; shadow it on the instance for the duration of the
+    # call so the chunking applies to subclasses registered later as well.
+    origin_apply_optimize = InnerOptimizer._apply_optimize
+
+    def new_apply_optimize(self, loss, startup_program, params_grads):
+        if isinstance(self, MuonOptimizer):
+            return origin_apply_optimize(
+                self, loss, startup_program, params_grads
+            )
+        per_param = isinstance(self, (AdamWOptimizer, RMSpropOptimizer))
+        cls_update = type(self)._update_parameters
+
+        def chunked_update(active_params_grads, lr):
+            chunks = (
+                [[pg] for pg in active_params_grads]
+                if per_param
+                else [active_params_grads]
+            )
+            for chunk in chunks:
+                params = [param for param, _ in chunk]
+                _reload_inner_states(self, params)
+                cls_update(self, chunk, lr)
+                _offload_inner_states(self, params)
+
+        self._update_parameters = chunked_update
+        try:
+            return origin_apply_optimize(
+                self, loss, startup_program, params_grads
+            )
+        finally:
+            # pop, not del: when patched twice the inner wrapper has already
+            # removed the attribute (keeps the hack idempotent like Steps 1-4).
+            self.__dict__.pop("_update_parameters", None)
+
+    InnerOptimizer._apply_optimize = new_apply_optimize
+
+
 def hack_offload_optimizer(mode=None):
     if mode == "eb5":
         return hack_offload_optimizer_eb5()
@@ -192,6 +308,9 @@ def hack_offload_optimizer(mode=None):
     except ImportError:
         pass
 
+    # Step 5: mixed-optimizer sub-optimizers (use_mixed_optimizer)
+    _hack_offload_inner_optimizers()
+
 
 def hack_offload_optimizer_eb5():
     # Step 1: mock _add_accumulator
@@ -342,3 +461,6 @@ def hack_offload_optimizer_eb5():
 
     except ImportError:
         pass
+
+    # Step 5: mixed-optimizer sub-optimizers (use_mixed_optimizer)
+    _hack_offload_inner_optimizers()
