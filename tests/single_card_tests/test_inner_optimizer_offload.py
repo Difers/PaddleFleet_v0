@@ -15,10 +15,10 @@
 optimizer's sub-optimizers.
 
 * ``TestOffloadGranularity`` (CPU, ``reload``/``offload`` recorded): which
-  states are moved, and at which granularity -- per parameter for the
-  AdamW / RMSprop families (AdamH, RMSprop), per Newton-Schulz batch for the
-  Muon family, one ``_update_parameters`` call for any other
-  ``InnerOptimizer``; the ``is_offload_opt`` gate; patching twice is harmless.
+  states are moved, and at which granularity -- per ``_update_shape_group``
+  batch when the class defines one (Muon family), otherwise one
+  ``_update_parameters`` call; the ``is_offload_opt`` gate; patching twice is
+  harmless.
 * ``TestOffloadAccuracy`` (GPU): a ``MixedInnerOptimizer`` over all six
   registered sub-optimizers with bf16 params (fp32 master weights), run with
   and without offload. Parameters and every state tensor must be
@@ -49,7 +49,7 @@ try:
         get_inner_optimizer,
     )
 
-    from paddlefleet.optimizers import MuonOptimizer
+    import paddlefleet.optimizers  # noqa: F401  (registers the sub-optimizers)
 except (ImportError, ModuleNotFoundError):
     # Paddle build without the inner-optimizer API.
     InnerOptimizer = None
@@ -80,9 +80,6 @@ def _hack_snapshot(test):
             HybridParallelOptimizer._insert_sync
         ),
         (InnerOptimizer, "_apply_optimize"): InnerOptimizer._apply_optimize,
-        (MuonOptimizer, "_update_shape_group"): (
-            MuonOptimizer._update_shape_group
-        ),
     }
     if Muon is not None:
         for attr in ("_muon_update_group", "_muon_update"):
@@ -177,52 +174,28 @@ class TestOffloadGranularity(unittest.TestCase):
         self.events.clear()
         _step(opt, params, seed=1)
         self.assertNotIn("_update_parameters", vars(opt))
+        self.assertNotIn("_update_shape_group", vars(opt))
         return self.events
 
     @staticmethod
     def _moves(kind, opt, params):
         return [(kind, id(t)) for p in params for t in _states(opt, p)]
 
-    def test_rmsprop_per_param(self):
-        params = [_param([4, 3], "float32", s) for s in range(2)]
-        opt = get_inner_optimizer("rmsprop")(
-            parameters=params,
-            learning_rate=1e-2,
-            weight_decay=0.0,
-            momentum=0.9,
+    def _sgd(self, params):
+        return _Sgd(parameters=params, learning_rate=0.1, weight_decay=0.0)
+
+    def _whole(self, opt, params):
+        return self._moves("reload", opt, params) + self._moves(
+            "offload", opt, params
         )
-        events = self._second_step_events(opt, params)
-        self.assertEqual(len(_states(opt, params[0])), 2)
-        self.assertEqual(events, self._per_param(opt, params))
-
-    def _per_param(self, opt, params):
-        expected = []
-        for p in params:
-            expected += self._moves("reload", opt, [p])
-            expected += self._moves("offload", opt, [p])
-        return expected
-
-    def _adamh(self, params):
-        return get_inner_optimizer("adamh")(
-            parameters=params, learning_rate=1e-2, weight_decay=0.0, **ADAM_HP
-        )
-
-    def test_adamh_per_param(self):
-        # AdamH updates in pure Python (no _C_ops.adamw_), so only Step 5b
-        # moves its state; it must do so per parameter (AdamW family).
-        params = [_param([4, 3], "float32", s) for s in range(2)]
-        opt = self._adamh(params)
-        events = self._second_step_events(opt, params)
-        self.assertEqual(len(_states(opt, params[0])), 4)
-        self.assertEqual(events, self._per_param(opt, params))
 
     def test_hack_twice_is_idempotent(self):
         oo.hack_offload_optimizer()  # second time (first one in setUp)
         params = [_param([4, 3], "float32", s) for s in range(2)]
-        opt = self._adamh(params)
+        opt = self._sgd(params)
         events = self._second_step_events(opt, params)
         # The inner wrapper's shadow wins: still one move per state.
-        self.assertEqual(events, self._per_param(opt, params))
+        self.assertEqual(events, self._whole(opt, params))
 
     def test_no_inner_optimizer_api_is_noop(self):
         before = InnerOptimizer._apply_optimize
@@ -252,26 +225,22 @@ class TestOffloadGranularity(unittest.TestCase):
         )
         self.assertEqual(events, expected)
 
-    def test_custom_optimizer_one_call(self):
+    def test_update_parameters_one_call(self):
+        # A custom InnerOptimizer unknown to the hack: one move per state
+        # around its single _update_parameters call.
         params = [_param([4, 3], "float32", s) for s in range(2)]
-        opt = _Sgd(parameters=params, learning_rate=0.1, weight_decay=0.0)
+        opt = self._sgd(params)
         events = self._second_step_events(opt, params)
-        expected = self._moves("reload", opt, params) + self._moves(
-            "offload", opt, params
-        )
-        self.assertEqual(events, expected)
+        self.assertEqual(len(_states(opt, params[0])), 1)
+        self.assertEqual(events, self._whole(opt, params))
 
     def test_is_offload_opt_gate(self):
         params = [_param([4, 3], "float32", s) for s in range(2)]
         params[1].is_offload_opt = False
-        opt = get_inner_optimizer("rmsprop")(
-            parameters=params, learning_rate=1e-2, weight_decay=0.0
-        )
+        opt = self._sgd(params)
         events = self._second_step_events(opt, params)
-        expected = (
-            self._moves("reload", opt, [params[0]])
-            + self._moves("offload", opt, [params[0]])
-            + self._moves("reload", opt, [params[1]])
+        expected = self._moves("reload", opt, params) + self._moves(
+            "offload", opt, [params[0]]
         )
         self.assertEqual(events, expected)
 
