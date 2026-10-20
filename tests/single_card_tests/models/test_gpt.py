@@ -222,6 +222,8 @@ class TestGPTSublayersSpec(unittest.TestCase):
         "lm_head",
         "mtp_lm_head",
         "mtp_loss",
+        "dspark",
+        "dspark_loss",
     }
 
     def test_all_fields_default_to_none(self):

@@ -73,6 +73,9 @@ from paddlefleet.transformer.moe.moe_layer import MoELayer
 from paddlefleet.transformer.multi_latent_attention import MultiLatentAttention
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import log_single_rank
+from paddlefleet.utils.dspark.dspark_utils import (
+    detach_and_reduce_hidden_status,
+)
 
 if is_deep_ep_available():
     if paddle.is_compiled_with_cuda():
@@ -1239,6 +1242,12 @@ class TransformerLayer(nn.Layer):
 
         rst = OrderedDict()
         rst = {"hidden_states": output}
+        # Capture the main stream before MTP tensors are concatenated.
+        _dspark_lid = getattr(self, "_dspark_target_id", None)
+        if _dspark_lid is not None:
+            rst[f"dspark_target_hidden_{_dspark_lid}"] = (
+                detach_and_reduce_hidden_status(output, self.config)
+            )
         if (
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0

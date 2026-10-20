@@ -204,6 +204,12 @@ def mtp_layers_active(config) -> bool:
     )
 
 
+def dspark_layers_active(config) -> bool:
+    """Return whether DSpark is enabled and has target layers."""
+    ids = getattr(config, "dspark_target_layer_ids", None)
+    return ids is not None and len(ids) > 0
+
+
 @dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for transformers."""
@@ -373,6 +379,79 @@ class TransformerConfig(ModelParallelConfig):
       tensors plus ``cu_seqlens_q`` for packed doc boundaries; MTP shifting
       happens inside MultiTokenPredictionLayer.forward via
       ``roll_tensor(cu_seqlens_q=...)``.
+    """
+
+    dspark_block_size: int = 7
+    """Draft block length K: tokens predicted after each anchor.
+
+    Each anchor drafts ``K`` future tokens (targets are ``labels`` at the
+    anchor position + 1..K), so the draft output carries a
+    ``[B, num_anchors, K, H]`` block dimension. Default 7 follows the DSpark
+    draft recipe; larger K raises draft FLOPs and activation memory. Must be a
+    positive integer.
+    """
+
+    dspark_noise_token_id: int = 1024
+    """Placeholder token id written where the draft must predict.
+
+    In the default ``anchor_mask`` draft input, each block is the anchor's own
+    token followed by ``dspark_block_size - 1`` copies of this id, so the draft
+    cannot see the tokens it is asked to reproduce. It only shapes the draft
+    input (never the loss targets), but must be a valid id in
+    ``[0, vocab_size)`` for the target tokenizer; default 1024 is a
+    placeholder.
+    """
+
+    dspark_num_anchors: int = 2048
+    """Number of anchor positions sampled per sequence row.
+
+    Positions are drawn deterministically per row (content hash of
+    ``input_ids`` + global step + seed) and fixed to this count; rows with
+    fewer valid positions cycle them to fill the grid. It is not divided by
+    ``cp_size`` (each CP rank samples on its local shard). Default 2048 sets
+    the draft-loss token budget per sequence; larger values raise draft FLOPs
+    and loss cost. Must be a positive integer.
+    """
+
+    dspark_target_layer_ids: list[int] | None = None
+    """Target transformer layer indices whose hidden states feed the draft.
+
+    A non-empty list enables DSpark: those layers are captured and
+    concatenated into the draft's feature input, and a draft prediction layer
+    plus loss are built. ``None``/empty disables DSpark entirely (the master
+    switch, see ``dspark_layers_active``). Entries must be in
+    ``[0, num_hidden_layers)``. When enabled, ``__post_init__`` requires
+    ``pipeline_model_parallel_size == 1`` and
+    ``tensor_model_parallel_size == 1``.
+    """
+
+    dspark_markov_rank: int = 256
+    """Rank of the default Markov transition refiner (``MarkovHead``).
+
+    The refiner adds a low-rank transition term ``w2 @ w1[prev_token]`` to the
+    draft logits, with ``w1`` of shape ``[vocab, rank]`` and ``w2`` of shape
+    ``[rank, vocab]``. Default 256 trades refiner capacity against parameter
+    count and memory; larger values cost more at both ends. Must be a positive
+    integer.
+    """
+
+    dspark_loss_scaling_factor: float = 1.0
+    """Multiplier applied to the DSpark distillation loss before backward.
+
+    The DSpark loss is multiplied by this factor before it is logged and,
+    with ``add_dspark_loss``, used as the gradient scale carried back to the
+    draft. Default 1.0 keeps the raw loss. Must be finite and non-negative.
+    """
+
+    add_dspark_loss: bool = False
+    """Whether to route the DSpark distillation loss into the main loss path.
+
+    When True, ``DSparkLanguageLoss`` carries the scaled DSpark loss back
+    through ``hidden_states`` via ``DSparkLossAutoScaler`` so the draft
+    parameters receive gradient from the main backward. The draft branch
+    (capture bridge, draft backbone, loss computation) still runs when False;
+    only the gradient carrier is gated. DSpark itself is enabled by
+    ``dspark_target_layer_ids``.
     """
 
     num_empty_layers_add_in_head: int = 0
@@ -2411,6 +2490,38 @@ class TransformerConfig(ModelParallelConfig):
                 "calculate_per_token_loss + csa_compress_ratios is unsupported: "
                 "the per-token normalisation has not been validated for CSA."
             )
+        # Validate DSpark topology and target layers.
+        if dspark_layers_active(self):
+            if int(getattr(self, "num_nextn_predict_layers", 0) or 0) != 0:
+                raise ValueError(
+                    "DSpark requires num_nextn_predict_layers==0: the draft "
+                    "consumes the main-stream input_ids/labels, but an MTP "
+                    "target appends its K-token tail to those same tensors, "
+                    "which the draft's global/local CP coordinate handling "
+                    "does not reconcile. Got num_nextn_predict_layers="
+                    f"{self.num_nextn_predict_layers}."
+                )
+            if int(getattr(self, "pipeline_model_parallel_size", 1)) != 1:
+                raise ValueError(
+                    "DSpark currently requires pipeline_model_parallel_size==1 "
+                    "(the feature-capture buffer is per-rank; pp>1 same-rank "
+                    "capture is future work), got "
+                    f"{self.pipeline_model_parallel_size}."
+                )
+            if int(getattr(self, "tensor_model_parallel_size", 1)) != 1:
+                raise ValueError(
+                    "DSpark draft attention inherits the CSA core, which does "
+                    "not support tensor parallelism; require "
+                    "tensor_model_parallel_size==1, got "
+                    f"{self.tensor_model_parallel_size}."
+                )
+            n_layers = int(getattr(self, "num_hidden_layers", 0))
+            for lid in self.dspark_target_layer_ids:
+                if not (0 <= int(lid) < n_layers):
+                    raise ValueError(
+                        f"dspark_target_layer_ids entry {lid} is out of range "
+                        f"[0, {n_layers})."
+                    )
         # ``True`` predates the "hf" target and has always meant Megatron, so
         # canonicalize it to the explicit name; every falsy spelling collapses to
         # False. An unknown target raises rather than falling back to the default

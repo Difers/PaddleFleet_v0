@@ -46,7 +46,15 @@ from paddlefleet.models.gpt.lm_head import (
 from paddlefleet.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
 )
+from paddlefleet.transformer.paddle_norm import WrappedPaddleNormPipe
+from paddlefleet.transformer.parallel_multi_token_prediction import (
+    DsparkPredictionLayer,
+    dspark_share_embedding,
+    dspark_share_lm_head,
+)
+from paddlefleet.transformer.transformer_config import dspark_layers_active
 from paddlefleet.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerNode,
     TransformerLayerOverlappedScheduleNode,
@@ -185,6 +193,8 @@ class GPTSublayersSpec:
     lm_head: LayerSpec | None = None
     mtp_lm_head: LayerDesc | None = None
     mtp_loss: LayerDesc | None = None
+    dspark: list[LayerSpec] | None = None
+    dspark_loss: LayerDesc | None = None
 
 
 class GPTModel(PipelineLayer):
@@ -230,6 +240,25 @@ class GPTModel(PipelineLayer):
                     raise NotImplementedError(
                         "IndexCache PP requires Trainer-managed AMP/scaler rather than strategy.amp"
                     )
+        if dspark_layers_active(self.config):
+            # The draft takes the backbone embedding / LM head weights through
+            # SharedLayerDesc, and paddle rejects SharedLayerDesc outright under
+            # dualpipev ("dualpipev scheduler does not support SharedLayerDesc
+            # yet"). Fail here instead, where the reason is stated.
+            strategy = getattr(fleet.fleet, "_user_defined_strategy", None)
+            pp_config = (
+                strategy.hybrid_configs["pp_configs"]
+                if strategy is not None
+                else None
+            )
+            if kwargs.get("use_dualpipev", False) or (
+                pp_config is not None and pp_config.use_dualpipev
+            ):
+                raise NotImplementedError(
+                    "DSpark does not support DualPipeV: the draft shares the "
+                    "backbone embedding / LM head through SharedLayerDesc, "
+                    "which paddle's dualpipev scheduler rejects outright."
+                )
         tie_word_embeddings = (
             kwargs["tie_word_embeddings"]
             and self.config.pipeline_model_parallel_size > 1
@@ -287,6 +316,8 @@ class GPTModel(PipelineLayer):
 
         # Tie GPTMTPLMHead weight to GPTMainLMHead weight on the same stage.
         self._tie_mtp_lm_head_weight()
+        # Configure DSpark capture when the draft layer is present.
+        self._setup_dspark_capture()
         if (
             getattr(self.config, "mtp_shared_weights", False)
             and getattr(self.config, "mtp_shared_last_layer", False)
@@ -571,6 +602,131 @@ class GPTModel(PipelineLayer):
             if getattr(param, "is_weight_only_mtp", False)
         ]
 
+    def _iter_local_layers(self):
+        """Yield this rank's local layers under any pipeline layout.
+
+        ``PipelineLayer`` builds the flat ``run_function`` only for 1F1B; under
+        VPP>1 and DualPipeV the layers live in ``_model_chunks``, and
+        ``run_function`` is assigned later -- per chunk, by
+        ``update_run_function`` inside ``forward`` -- so at ``__init__`` time it
+        does not exist yet, and afterwards it only ever points at the chunk most
+        recently executed.
+
+        Do not reach for ``get_model_chunks()`` here: it returns ``None``
+        whenever ``_num_virtual_pipeline_stages == 1``, which is exactly the
+        DualPipeV case, even though ``_model_chunks`` is populated there.
+        """
+        chunks = getattr(self, "_model_chunks", None)
+        if chunks is not None:
+            for chunk in chunks:
+                yield from chunk.run_function
+        else:
+            yield from self.run_function
+
+    def _mark_dspark_target_layers(self, target_ids):
+        """Stamp ``_dspark_target_id`` on every target layer this rank holds.
+
+        Deliberately independent of where the draft lives. The draft may sit in
+        a different VPP chunk, or on a downstream PP stage, from the layers it
+        taps; gating this loop on "the draft is local" would leave those layers
+        unmarked, and the omission would only resurface much later as a missing
+        ``dspark_target_hidden_<lid>`` key inside the draft.
+        """
+        for layer in self._iter_local_layers():
+            if (
+                isinstance(
+                    layer,
+                    (HyperConnectionTransformerLayer, TransformerLayer),
+                )
+                and not isinstance(layer, DsparkPredictionLayer)
+                and not getattr(layer, "is_mtp_layer", False)
+                and getattr(layer, "layer_number", None) in target_ids
+            ):
+                if type(layer).forward is not TransformerLayer.forward:
+                    raise NotImplementedError(
+                        f"DSpark target layer {layer.layer_number} is a "
+                        f"{type(layer).__name__}, whose forward does not carry "
+                        f"the feature tap. Only TransformerLayer / "
+                        f"HyperConnectionTransformerLayer / Gemma4 are supported "
+                        f"this phase; extend the tap to that variant first."
+                    )
+                layer._dspark_target_id = int(layer.layer_number)
+
+    def _setup_dspark_capture(self):
+        """Mark capture layers and validate DSpark inputs on this stage."""
+        # Short-circuit on the canonical predicate before touching any layer
+        # container: for interleaved (VPP) and DualPipeV layouts PipelineLayer
+        # populates neither ``run_function`` nor (until forward) the chunk
+        # sequence, so a model that never asks for DSpark must not walk layers.
+        if not dspark_layers_active(self.config):
+            return
+
+        target_ids = set(self.config.dspark_target_layer_ids)
+        # Mark first, and unconditionally -- see _mark_dspark_target_layers.
+        self._mark_dspark_target_layers(target_ids)
+
+        dspark_layer = embedding = None
+        norm_layers = []
+        present_ids = set()
+        for layer in self._iter_local_layers():
+            if isinstance(layer, DsparkPredictionLayer):
+                dspark_layer = layer
+            elif isinstance(layer, GPTEmbedding):
+                embedding = layer
+            elif isinstance(layer, WrappedPaddleNormPipe):
+                norm_layers.append(layer)
+            lid = getattr(layer, "_dspark_target_id", None)
+            if lid is not None:
+                present_ids.add(lid)
+
+        if dspark_layer is None:
+            # No draft on this rank; the marking above is all this rank owes.
+            return
+
+        final_norm = norm_layers[-1] if norm_layers else None
+        if final_norm is not None:
+            # Capture only the final norm output.
+            final_norm._dspark_is_final_norm = True
+
+        # The embedding is still located here for the host-metadata hook below,
+        # but it is no longer handed to the draft: the shared embedding / LM
+        # head weights reach the draft through dict_args, published by the
+        # SharedLayerDesc pass-throughs declared next to it in
+        # get_layer_desc_list. Those descs live in the draft's own stage, so
+        # unlike the backbone layers they need no co-location check.
+        missing = target_ids - present_ids
+        if missing or final_norm is None or embedding is None:
+            raise RuntimeError(
+                "DSpark requires its target layers / final norm / embedding to "
+                "be co-located with the draft in the same stage: "
+                f"missing_target_layers={sorted(missing)}, "
+                f"final_norm={'present' if final_norm else 'MISSING'}, "
+                f"embedding={'present' if embedding else 'MISSING'}."
+            )
+
+        def _host_meta_pre_hook(module, args, kwargs):
+            # Preserve host metadata for block construction. attn_mask_
+            # startend_row_indices rides the same side-channel: it is built
+            # upstream from the GLOBAL sequence and is the preferred
+            # document-boundary source in get_doc_start_per_pos, with the
+            # "startend_row_indices" fallback name mirroring GPTEmbedding's own
+            # lookup order.
+            dict_args = args[0] if args else kwargs.get("dict_args")
+            if dict_args is None:
+                return
+            startend = dict_args.get("attn_mask_startend_row_indices")
+            if startend is None:
+                startend = dict_args.get("startend_row_indices")
+            dspark_layer._host_meta = {
+                "input_ids": dict_args.get("input_ids"),
+                "labels": dict_args.get("labels"),
+                "attn_mask_startend_row_indices": startend,
+            }
+
+        embedding.register_forward_pre_hook(
+            _host_meta_pre_hook, with_kwargs=True
+        )
+
     def _tie_mtp_lm_head_weight(self):
         """Tie GPTMTPLMHead.weight to GPTMainLMHead.weight on the same rank."""
         main_head = None
@@ -627,21 +783,29 @@ class GPTModel(PipelineLayer):
     def get_layer_desc_list(self, spec, tie_word_embeddings):
         layers = []
         name_prefix = self._model_name_prefix()
+        # The draft reads the backbone embedding / LM head weights. When a draft
+        # is present both are declared as SharedLayerDesc under a stable key, and
+        # the draft joins those keys further down (see the DSpark section): that
+        # is what makes the sharing framework-managed instead of an instance
+        # handed over by hand after construction.
+        dspark_specs = getattr(spec, "dspark", None) or []
+        has_draft = bool(dspark_specs)
         if tie_word_embeddings:
-            self.add_sequential_layer(
-                layers,
-                SharedLayerDesc(
-                    "embed",
-                    spec.embedding,
-                    shared_weight_attr="embedding_weight",
-                ),
-                name_prefix,
-            )
+            embed_key = "embed"
         elif self.config.enable_mtp_magic_send:
+            embed_key = "mtp_embed"
+        elif has_draft:
+            # Promote. A plain LayerDesc registers no key, so the draft's desc
+            # below would become the pivot and build a second, randomly
+            # initialised embedding instead of aliasing this one.
+            embed_key = "embed"
+        else:
+            embed_key = None
+        if embed_key is not None:
             self.add_sequential_layer(
                 layers,
                 SharedLayerDesc(
-                    "mtp_embed",
+                    embed_key,
                     spec.embedding,
                     shared_weight_attr="embedding_weight",
                 ),
@@ -801,6 +965,77 @@ class GPTModel(PipelineLayer):
                 layers, LayerDesc(spec.mtp_loss), f"{name_prefix}.mtp_loss"
             )
 
+        # The LM head's key is resolved here, before the DSpark section below,
+        # because the draft's head pass-through desc needs it.
+        if tie_word_embeddings or spec.mtp_lm_head:
+            head_key = "embed"
+        elif has_draft:
+            # Deliberately distinct from embed_key: paddle keeps only the first
+            # instance registered per key and reuses it for every later desc, so
+            # one key for both would make the LM head position execute the
+            # embedding. The guard below rejects the configuration that would
+            # collide.
+            head_key = "dspark_lm_head"
+        else:
+            head_key = None
+        if has_draft and head_key == embed_key:
+            raise NotImplementedError(
+                "DSpark cannot share the embedding and the LM head under one "
+                f"SharedLayerDesc key ({head_key!r}): paddle keeps only the "
+                "first instance per key, so the LM head position would run the "
+                "embedding. That needs tie_word_embeddings with "
+                "pipeline_model_parallel_size > 1 or separate_mtp_headloss, "
+                "neither of which DSpark's configuration validation allows."
+            )
+
+        # ``getattr`` keeps duck-typed test specs (which predate these slots)
+        # working; production always passes a full GPTSublayersSpec.
+        if has_draft:
+            # Declare the draft's use of the backbone embedding / LM head as
+            # shared layers instead of poking the instances onto the draft after
+            # construction. Each desc reuses the backbone's key, so paddle hands
+            # the pass-through the *same* instance the backbone uses, and the
+            # draft picks the weights up from dict_args. The partial is one
+            # pipeline step that computes nothing.
+            #
+            # Both descs sit here, before the draft: the pivot for a key is the
+            # first desc that registers it, and the draft consumes the weights
+            # during its own forward. The embedding's pivot is therefore still
+            # the backbone desc above (same key), while the LM head is *built*
+            # here and the backbone's own head desc below reuses this instance.
+            self.add_sequential_layer(
+                layers,
+                SharedLayerDesc(
+                    embed_key,
+                    spec.embedding,
+                    forward_func=dspark_share_embedding,
+                    shared_weight_attr="embedding_weight",
+                ),
+                name_prefix,
+            )
+            self.add_sequential_layer(
+                layers,
+                SharedLayerDesc(
+                    head_key,
+                    spec.lm_head,
+                    forward_func=dspark_share_lm_head,
+                    shared_weight_attr=lmhead_shared_weights,
+                ),
+                f"{name_prefix}.shared_head",
+            )
+        for dspark_spec in dspark_specs:
+            desc = LayerDesc(dspark_spec)
+            self.add_sequential_layer(layers, desc, f"{name_prefix}.layers.{i}")
+            i += 1
+
+        dspark_loss_spec = getattr(spec, "dspark_loss", None)
+        if dspark_loss_spec:
+            self.add_sequential_layer(
+                layers,
+                LayerDesc(dspark_loss_spec),
+                f"{name_prefix}.dspark_loss",
+            )
+
         for tail_empty_layer in spec.tail_empty_layers:
             self.add_sequential_layer(
                 layers, LayerDesc(tail_empty_layer), next_empty_layer_name()
@@ -819,11 +1054,11 @@ class GPTModel(PipelineLayer):
             self.add_sequential_layer(
                 layers, LayerDesc(spec.layer_norm), name_prefix
             )
-        if tie_word_embeddings or spec.mtp_lm_head:
+        if head_key is not None:
             self.add_sequential_layer(
                 layers,
                 SharedLayerDesc(
-                    "embed",
+                    head_key,
                     spec.lm_head,
                     shared_weight_attr=lmhead_shared_weights,
                 ),
@@ -1310,6 +1545,17 @@ class GPTModel(PipelineLayer):
                             batch_mode=batch_mode,
                             quant_transpose=quant_transpose,
                         )
+                    elif isinstance(layer, DsparkPredictionLayer):
+                        # The draft blocks live in ``layer.layers``, not in
+                        # run_function, so they must be driven explicitly or
+                        # their routed-expert weights never get the offline fp8
+                        # stack -- while clear_param_storage("moe_expert") still
+                        # frees their bf16 storage.
+                        for sub in layer.layers:
+                            sub.fp8_quant_weight(
+                                batch_mode=batch_mode,
+                                quant_transpose=quant_transpose,
+                            )
         else:
             for idx, layer in enumerate(self.run_function):
                 if isinstance(layer, TransformerLayer):
@@ -1320,6 +1566,12 @@ class GPTModel(PipelineLayer):
                     layer.transformer_layer.fp8_quant_weight(
                         batch_mode=batch_mode, quant_transpose=quant_transpose
                     )
+                elif isinstance(layer, DsparkPredictionLayer):
+                    for sub in layer.layers:
+                        sub.fp8_quant_weight(
+                            batch_mode=batch_mode,
+                            quant_transpose=quant_transpose,
+                        )
 
     def clear_fp8_quant_weight(self):
         if self._num_virtual_pipeline_stages > 1:
@@ -1329,12 +1581,18 @@ class GPTModel(PipelineLayer):
                         layer.clear_fp8_quant_weight()
                     elif isinstance(layer, MultiTokenPredictionLayer):
                         layer.transformer_layer.clear_fp8_quant_weight()
+                    elif isinstance(layer, DsparkPredictionLayer):
+                        for sub in layer.layers:
+                            sub.clear_fp8_quant_weight()
         else:
             for idx, layer in enumerate(self.run_function):
                 if isinstance(layer, TransformerLayer):
                     layer.clear_fp8_quant_weight()
                 elif isinstance(layer, MultiTokenPredictionLayer):
                     layer.transformer_layer.clear_fp8_quant_weight()
+                elif isinstance(layer, DsparkPredictionLayer):
+                    for sub in layer.layers:
+                        sub.clear_fp8_quant_weight()
 
     def use_fp8(self):
         if self._num_virtual_pipeline_stages > 1:

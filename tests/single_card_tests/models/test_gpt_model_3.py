@@ -83,6 +83,8 @@ _SPEC_FIELD_NAMES = [
     "lm_head",
     "mtp_lm_head",
     "mtp_loss",
+    "dspark",
+    "dspark_loss",
 ]
 
 

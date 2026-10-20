@@ -38,6 +38,7 @@ from paddlefleet.context_parallel_utils import (
 )
 from paddlefleet.cp_shard import to_cp_global, to_cp_local
 from paddlefleet.parallel_state import (
+    get_context_parallel_group,
     get_context_parallel_world_size,
     get_expert_model_parallel_group,
     get_tensor_model_parallel_world_size,
@@ -302,6 +303,120 @@ def subbatch(
         return paddle.cat(outs, out_idx)
 
     return wrapper
+
+
+# Publish failures are counted rather than announced once. A channel that
+# stays broken (renamed key, logs unavailable in this configuration) would
+# otherwise drop every dspark metric for the rest of the run after a single
+# line on stdout, and the caller only logs -- it can never notice on its own.
+_DSPARK_TERMS_WARN_EVERY = 100
+_dspark_terms_publish_failures = 0
+
+
+def _report_dspark_terms_failure(exc):
+    """Count a failed publish and re-report it periodically."""
+    global _dspark_terms_publish_failures
+    _dspark_terms_publish_failures += 1
+    failures = _dspark_terms_publish_failures
+    if failures == 1 or failures % _DSPARK_TERMS_WARN_EVERY == 0:
+        print(
+            f"[dspark-terms] publish skipped ({failures} failures so far): "
+            f"{exc!r}",
+            flush=True,
+        )
+
+
+def _publish_dspark_terms(terms):
+    """Surface accept-rate and the draft-loss breakdown per step.
+
+    ``compute_dspark_loss`` already builds ``accept_rate_per_pos_num/_den``
+    and ``tau_num/_den``, but its default ``return_terms=False`` dropped them,
+    so the only accept-rate ever observed came from print-only probes that
+    exist in a different fleet line. Publishing through the same
+    ``get_global_training_logs`` channel as ``loss`` / ``dspark_loss`` puts
+    them in the per-step JSONL (``metrics_rank0.json``) with no TensorBoard
+    wiring.
+
+    The loss terms get the same treatment for the same reason: a micro-batch
+    with every block dropped yields loss 0 (``dspark_losses.py:1015``), and
+    averaging that in dilutes the draft-loss curve. ``<base>_num`` is the
+    weighted token sum -- ``term * denominator``, recovering the numerator
+    ``compute_dspark_loss`` divided by -- and ``<base>_den`` is this rank's
+    own weight sum, so the derived reading is per-token at any CP size.
+    ``dspark_loss`` itself is left alone: it is the pre-existing
+    production key every earlier run is compared against.
+
+    Logging only -- every value is detached, and a failure here must never
+    take down a training step.
+    """
+    logs = get_global_training_logs()
+    if logs is None or not hasattr(logs, "update"):
+        return
+    try:
+        values = dict(terms.terms)
+        payload = {}
+        num = values.get("accept_rate_per_pos_num")
+        den = values.get("accept_rate_per_pos_den")
+        if num is not None and den is not None:
+            num = num.astype("float32").detach()
+            den = den.astype("float32").detach()
+            for k in range(int(num.shape[0])):
+                payload[f"dspark_accept_k{k + 1}_num"] = num[k]
+                payload[f"dspark_accept_k{k + 1}_den"] = den[k]
+            payload["dspark_accept_all_num"] = num.sum()
+            payload["dspark_accept_all_den"] = den.sum()
+        for base in ("tau", "confidence_prob"):
+            pair_num = values.get(base + "_num")
+            pair_den = values.get(base + "_den")
+            if pair_num is None or pair_den is None:
+                continue
+            payload[f"dspark_{base}_num"] = pair_num.astype("float32").detach()
+            payload[f"dspark_{base}_den"] = pair_den.astype("float32").detach()
+        den_w = values.get("normalized_weight_denominator")
+        if den_w is not None:
+            den_w = den_w.astype("float32").detach()
+            local_w = values.get("weight_denominator")
+            pub_den = (
+                local_w.astype("float32").detach()
+                if local_w is not None
+                else den_w
+            )
+            for name, base in (
+                ("loss", "draft"),
+                ("ce_loss", "ce"),
+                ("l1_loss", "l1"),
+                ("tv_loss", "tv"),
+                ("confidence_loss", "confidence"),
+            ):
+                value = values.get(name)
+                if value is None:
+                    continue
+                payload[f"dspark_{base}_num"] = (
+                    value.astype("float32").detach() * den_w
+                )
+                payload[f"dspark_{base}_den"] = pub_den
+            if local_w is not None:
+                payload["dspark_weight_tokens_local"] = pub_den
+                payload["dspark_weight_tokens_group"] = den_w
+        logs.update(**payload)
+    except Exception as exc:  # logging must not kill a training step
+        _report_dspark_terms_failure(exc)
+
+
+def _publish_dspark_loss(scaled):
+    """Surface the draft loss next to the main one in the training logs.
+
+    The main ``loss`` is deliberately left as a clean lm_loss: the draft
+    contributes gradient only, through ``DSparkLossAutoScaler``, which is the
+    same ``main + draft - draft.detach()`` contract the MTP path spells out
+    explicitly. But nothing reads the loss tracker, so without this the draft
+    loss is invisible and a healthy-looking lm_loss cannot tell you whether the
+    draft is training at all. Mirrors how the MTP path publishes
+    ``mtp_{i}_loss``.
+    """
+    logs = get_global_training_logs()
+    if logs is not None and hasattr(logs, "update"):
+        logs.update(dspark_loss=scaled.detach())
 
 
 class LanguageLoss(FleetLayer):
@@ -1440,3 +1555,80 @@ class MTPLanguageLoss(LanguageLoss):
 
     def build_schedule_node(self):
         return ScheduleNode(self.forward, name="MTPLanguageLoss")
+
+
+class DSparkLanguageLoss(LanguageLoss):
+    """Compute and record the DSpark draft loss."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection=None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection)
+
+    def forward(self, dict_args: dict):
+        dspark_out = dict_args.get("dspark_out")
+        if dspark_out is None:
+            return dict_args
+        from paddlefleet.transformer.parallel_multi_token_prediction import (
+            DSparkLossAutoScaler,
+            DSparkLossLoggingHelper,
+        )
+        from paddlefleet.utils.dspark.dspark_losses import (
+            LossProfile,
+            compute_dspark_loss,
+        )
+        from paddlefleet.utils.dspark.dspark_utils import DrafterOutput
+
+        output = DrafterOutput(
+            draft_logits=dspark_out.get("draft_logits"),
+            target_ids=dspark_out["target_ids"],
+            eval_mask=dspark_out["eval_mask"],
+            block_keep_mask=dspark_out["block_keep_mask"],
+            confidence_pred=dspark_out.get("confidence_pred"),
+            draft_hidden_states=dspark_out.get("draft_hidden_states"),
+            aligned_target_hidden_states=dspark_out.get(
+                "aligned_target_hidden_states"
+            ),
+            previous_token_ids=dspark_out.get("previous_token_ids"),
+            logits_projection=dspark_out.get("logits_projection"),
+            markov_head=dspark_out.get("markov_head"),
+            candidate_selector=dspark_out.get("candidate_selector"),
+        )
+        # CP>1: the draft sees only this rank's window, so its ``weights.sum()``
+        # denominator is a 1/cp_size partial of the global token count, while
+        # the trainer scales non-expert grads by cp_worldsize -- together a
+        # cp_size-times-too-large draft gradient. All-reducing the denominator
+        # restores the CP=1 gradient. Skipped at cp_size==1 (no-op group) to
+        # keep CP=1 numerics identical.
+        normalization_group = None
+        if get_context_parallel_world_size() > 1:
+            normalization_group = get_context_parallel_group()
+        dspark_terms = compute_dspark_loss(
+            output,
+            LossProfile(),
+            return_terms=True,
+            normalization_group=normalization_group,
+        )
+        dspark_loss = dspark_terms.loss
+        scaled = (
+            float(getattr(self.config, "dspark_loss_scaling_factor", 1.0))
+            * dspark_loss
+        )
+        DSparkLossLoggingHelper.save_loss_to_tracker(scaled)
+        dict_args["dspark_loss"] = scaled
+        _publish_dspark_loss(scaled)
+        _publish_dspark_terms(dspark_terms)
+        # Carry the draft gradient through the main loss path.
+        if getattr(self.config, "add_dspark_loss", False) and (
+            "hidden_states" in dict_args
+        ):
+            dict_args["hidden_states"] = DSparkLossAutoScaler.apply(
+                dict_args["hidden_states"], scaled
+            )
+        dict_args.pop("dspark_out", None)
+        return dict_args
+
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DSparkLanguageLoss")

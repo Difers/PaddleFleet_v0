@@ -1063,6 +1063,26 @@ def get_gpt_spec(
             HyperConnectionExpandLayer,
         )
 
+    # DSpark draft prediction layer + loss (enabled by dspark_target_layer_ids).
+    from paddlefleet.transformer.transformer_config import dspark_layers_active
+
+    dspark_layers_spec = None
+    dspark_loss_spec = None
+    if dspark_layers_active(config):
+        from paddlefleet.models.common.language_loss.language_loss import (
+            DSparkLanguageLoss,
+        )
+        from paddlefleet.transformer.parallel_multi_token_prediction import (
+            get_dspark_layer_spec_for_backend,
+        )
+
+        dspark_layers_spec = [
+            get_dspark_layer_spec_for_backend(config, vocab_size, 0)
+        ]
+        dspark_loss_spec = LayerSpec(
+            layer=DSparkLanguageLoss, extra_kwargs={"config": config}
+        )
+
     return LayerSpec(
         layer=GPTModel,
         extra_kwargs={
@@ -1093,6 +1113,8 @@ def get_gpt_spec(
             mtp=mtp_layers_spec,
             mtp_lm_head=mtp_lm_head_spec,
             mtp_loss=mtp_loss_spec,
+            dspark=dspark_layers_spec,
+            dspark_loss=dspark_loss_spec,
             output_block_attn_res=output_block_attn_res_spec,
             layer_norm=LayerSpec(
                 layer=WrappedPaddleNormPipe,

@@ -144,6 +144,8 @@ class TestGPTSublayersSpec(unittest.TestCase):
         "lm_head",
         "mtp_lm_head",
         "mtp_loss",
+        "dspark",
+        "dspark_loss",
     )
 
     def test_is_dataclass_with_expected_field_set(self):

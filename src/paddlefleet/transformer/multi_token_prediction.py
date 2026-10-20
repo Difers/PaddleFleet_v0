@@ -739,6 +739,28 @@ def resolve_mtp_sampled_depth(config, dict_args):
 
 _AOA_DROP_SEGMENT = "transformer_layer"
 
+_DSPARK_CAPTURE_PREFIX = "dspark_target_hidden_"
+_DSPARK_CAPTURE_KEYS = ("dspark_target_last_hidden_states",)
+
+
+def _carry_dspark_capture_keys(dict_args, new_args):
+    """Copy the DSpark capture taps from ``dict_args`` into ``new_args``.
+
+    The draft layer sits after the MTP layers in the flat LayerDesc list and
+    consumes the target features tapped in ``TransformerLayer.forward`` / the
+    final norm (tagged by ``GPTModel._setup_dspark_capture``). The P2P whitelist
+    that builds ``new_args`` would otherwise drop them, and the draft would then
+    raise at ``_resolve_inputs``. Safe for P2P because the same setup requires
+    the draft and its target layers to share one pipeline stage.
+    """
+    for key in (
+        *(k for k in dict_args if k.startswith(_DSPARK_CAPTURE_PREFIX)),
+        *_DSPARK_CAPTURE_KEYS,
+    ):
+        val = dict_args.get(key, None)
+        if val is not None:
+            new_args[key] = val
+
 
 class MultiTokenPredictionLayer(FleetLayer):
     """The implementation for Multi-Token Prediction (MTP) which extends
@@ -1791,6 +1813,8 @@ class MultiTokenPredictionLayer(FleetLayer):
             # GPTModel.forward drops this stage-local key at a PP boundary.
             if dict_args.get("_dsa_topk_holder") is not None:
                 new_args["_dsa_topk_holder"] = dict_args["_dsa_topk_holder"]
+
+            _carry_dspark_capture_keys(dict_args, new_args)
 
             # mHC: pass multi-stream output to next MTP layer
             if (

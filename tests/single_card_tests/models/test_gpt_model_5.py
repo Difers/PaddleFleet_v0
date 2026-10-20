@@ -82,6 +82,8 @@ _EXPECTED_SPEC_FIELDS = (
     "lm_head",
     "mtp_lm_head",
     "mtp_loss",
+    "dspark",
+    "dspark_loss",
 )
 
 

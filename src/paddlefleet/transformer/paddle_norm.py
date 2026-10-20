@@ -36,6 +36,9 @@ except ImportError:
 from paddle.distributed.fleet.meta_parallel import ScheduleNode
 
 from paddlefleet.jit import jit_fuser
+from paddlefleet.utils.dspark.dspark_utils import (
+    detach_and_reduce_hidden_status,
+)
 
 if TYPE_CHECKING:
     from paddle import Tensor
@@ -280,9 +283,10 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
             )
             dict_args["hidden_states"] = tensor_list[0]
+        normed_main = self.norm(dict_args["hidden_states"])
         rst = {
             **dict_args,
-            "hidden_states": self.norm(dict_args["hidden_states"]),
+            "hidden_states": normed_main,
         }
         if (
             self.config.num_nextn_predict_layers is not None
@@ -305,6 +309,12 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
             )
             rst["hidden_states"] = hidden_states_concat
         rst = {**dict_args, **rst}
+
+        # Capture the main normalized stream for DSpark.
+        if getattr(self, "_dspark_is_final_norm", False):
+            rst["dspark_target_last_hidden_states"] = (
+                detach_and_reduce_hidden_status(normed_main, self.config)
+            )
 
         # Loss-path MD5 probe: final_layernorm output
         if (
