@@ -59,6 +59,17 @@ require_command() {
     fi
 }
 
+# Major version of the local CUDA toolkit (e.g. "12", "13"); empty if nvcc is not found.
+cuda_major_version() {
+    local nvcc_bin
+    nvcc_bin="$(command -v nvcc || true)"
+    if [[ -z "${nvcc_bin}" && -x /usr/local/cuda/bin/nvcc ]]; then
+        nvcc_bin="/usr/local/cuda/bin/nvcc"
+    fi
+    [[ -n "${nvcc_bin}" ]] || return 0
+    "${nvcc_bin}" --version | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p'
+}
+
 setup_proxy() {
     if [[ -z "${PROXY_URL:-}" ]]; then
         echo "[setup_venvs] warning: PROXY_URL is not set, continuing without a proxy." >&2
@@ -145,14 +156,34 @@ setup_paddle_venv() {
         "setuptools>=66.1.0" pip wheel packaging "ninja==1.11.1.1" \
         "pybind11[global]>=2.13,<3" \
         "tensor-spec-worker"
-    uv pip install --python "${paddle_py}" "paddle-nvidia-nvshmem-cu12>=3.3.9,<3.5" -i https://www.paddlepaddle.org.cn/packages/nightly/cu129/
+
+    # nvshmem, paddlepaddle-gpu (pinned by the paddlefleet wheel) and paddlefleet-ops
+    # must match the CUDA toolkit: CUDA 13.x uses the cu130 nightly index, CUDA 12.x
+    # (e.g. Fleet CI) uses cu129.
+    local cuda_major nvshmem_pkg nightly_index
+    cuda_major="$(cuda_major_version || true)"
+    case "${cuda_major}" in
+        13)
+            nvshmem_pkg="paddle-nvidia-nvshmem-cu13"
+            nightly_index="https://www.paddlepaddle.org.cn/packages/nightly/cu130/"
+            ;;
+        *)
+            if [[ "${cuda_major}" != "12" ]]; then
+                echo "[setup_venvs] warning: cannot detect CUDA 12/13 via nvcc (got '${cuda_major}'), defaulting to cu129." >&2
+            fi
+            nvshmem_pkg="paddle-nvidia-nvshmem-cu12"
+            nightly_index="https://www.paddlepaddle.org.cn/packages/nightly/cu129/"
+            ;;
+    esac
+    echo "[setup_venvs] CUDA ${cuda_major:-unknown}: ${nvshmem_pkg} from ${nightly_index}"
+    uv pip install --python "${paddle_py}" "${nvshmem_pkg}>=3.3.9,<3.5" -i "${nightly_index}"
 
     # PaddleFleet. --no-deps is intentionally dropped: the wheel's pinned
     # paddlepaddle-gpu dependency must be installed here, otherwise
     # venv/paddle/bin/paddlefleet-cli fails to import paddle at runtime.
     uv pip install --python "${paddle_py}" "${paddle_index[@]}" \
         --force-reinstall \
-        --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/cu129/ \
+        --extra-index-url="${nightly_index}" \
         "${PADDLEFLEET_WHEEL}"
     # (
     #     cd ./PaddleFleet
@@ -164,7 +195,7 @@ setup_paddle_venv() {
 
     # paddlefleet_ops
     UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install --python "${paddle_py}" --force-reinstall \
-    --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/cu129/ \
+    --extra-index-url "${nightly_index}" \
         "${PADDLEFLEET_OPS_WHEEL}"
     # uv pip install --python "${paddle_py}" -v --no-build-isolation \
     #     -e ./PaddleFleet/packages/paddlefleet_ops
