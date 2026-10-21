@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import contextlib
 import functools
 import hashlib
 import os
@@ -56,6 +57,29 @@ from paddlefleet.utils import use_dsv4_accuracy_compatible
 # A replay must not notify either the original observer or one installed by a
 # later micro-batch. Context-local state also keeps nested calls isolated.
 _token_loss_replaying = ContextVar("token_loss_replaying", default=False)
+
+# Global token-avg loss bookkeeping (log_global_token_avg_loss): which head the
+# current CE belongs to, as a log-key prefix ("" = main LM head -> "loss",
+# "mtp_1_" -> "mtp_1_loss"), so the main and every MTP head are reduced
+# separately instead of being pooled into one ΣS/Σn.
+_token_avg_head = ContextVar("token_avg_head", default="")
+# Explicit record decision for a recomputed CE (None = decide from grad mode).
+# The recompute wrapper fixes it at call time: record on the first pass iff
+# training, never on the backward replay, whatever grad mode each pass runs in.
+_token_avg_record = ContextVar("token_avg_record", default=None)
+
+
+def _mtp_token_avg_prefix(depth: int) -> str:
+    return f"mtp_{depth + 1}_"
+
+
+@contextlib.contextmanager
+def _token_avg_head_scope(prefix: str):
+    token = _token_avg_head.set(prefix)
+    try:
+        yield
+    finally:
+        _token_avg_head.reset(token)
 
 
 # calculate_per_token_loss: running count of this rank's non-padded label tokens
@@ -439,7 +463,9 @@ class LanguageLoss(FleetLayer):
     # Class-level accumulator for the global token-weighted loss (logging only),
     # filled per micro-batch by _reduce_loss_by_tokens and reduced by
     # consume_token_avg_loss, whose only caller is
-    # ``Trainer._apply_global_token_avg_loss``.
+    # ``Trainer._apply_global_token_avg_loss``. Keys are ``<head prefix>S`` /
+    # ``<head prefix>n``: ``S``/``n`` for the main head, ``mtp_1_S``/``mtp_1_n``
+    # for MTP depth 1, and so on.
     token_avg_tracker: dict = {}
 
     # Class-level stash for cu_seqlens_q under use_erndata=True.
@@ -587,9 +613,11 @@ class LanguageLoss(FleetLayer):
         EP-replicated fp64 reduction. Neither is ΣΣS/ΣΣn, so folding them in
         would change what the logged number means. Under those configurations
         ``log_global_token_avg_loss`` therefore leaves the tracker empty,
-        ``consume_token_avg_loss`` returns ``None`` and the trainer keeps
-        logging the micro-average -- the absence of a ``loss_microavg`` key is
-        how to tell that apart from the feature being active. The branch is
+        ``consume_token_avg_loss`` maps that head to ``None`` and the trainer
+        keeps logging its previous value (the micro-average for ``loss``, the
+        last micro-batch's per-rank value for ``mtp_{d}_loss``) -- the absence
+        of a ``loss_microavg`` (``mtp_{d}_loss_last``) key is how to tell that
+        apart from the feature being active. The branch is
         chosen by config, identically on every rank, so there is no desync
         risk. (The all-ignored early returns skip the helper as well, but a
         micro-batch with zero valid tokens would contribute (0, 0) anyway.)
@@ -601,27 +629,37 @@ class LanguageLoss(FleetLayer):
         ``prediction_pipeline_step``) run under ``paddle.no_grad()`` -- so even a
         subclass that reimplements the eval loop (ERNIE's
         ``EvalPPLMixin.evaluate``) stays correct with no trainer coordination.
+        A recomputed CE (``loss_fn`` in ``recompute_modules``) instead follows
+        ``_token_avg_record``, fixed by ``_forward`` at call time, so it is
+        counted exactly once whichever recompute pass runs with grad.
 
         ``self.training`` cannot serve as that discriminator: the criterion is
         stored in ``PipelineLayer._loss_fn`` (a plain ``list``), never a
         registered sublayer, so ``model.eval()`` never reaches it and the flag
         is always ``True``.
+
+        Heads are kept apart: the terms go under the ``_token_avg_head`` prefix
+        (main head ``""``, MTP depth d ``mtp_{d}_``), so the logged main loss
+        is ΣΣS/ΣΣn of the main head alone and each MTP head gets its own.
         """
         # Accumulate this rank's device scalars; the trainer produces the
         # logging value. Grad mode keeps eval/predict out of the interval.
-        # A recompute replay re-runs forward_impl, so skip it or the pair would
-        # be counted twice; MTP heads are excluded for the same reason T_global
-        # excludes them, keeping the logged value a main-head ΣΣS/ΣΣn that
-        # matches Megatron ``lm loss``.
-        if (
-            getattr(self.config, "log_global_token_avg_loss", False)
-            and paddle.is_grad_enabled()
-            and not _token_loss_replaying.get()
-            and not _PT_SUPPRESS_COUNT.get()
-        ):
-            _tr = LanguageLoss.token_avg_tracker
-            _tr["S"] = _tr.get("S", 0.0) + loss_sum.detach()
-            _tr["n"] = _tr.get("n", 0.0) + local_valid.detach()
+        # A recompute replay re-runs forward_impl, so it must not be counted
+        # twice: a recomputed CE carries an explicit ``_token_avg_record``
+        # (False on the replay); otherwise grad mode decides and any replay is
+        # skipped. MTP heads go to their own prefixed keys, so the main-head
+        # ΣΣS/ΣΣn still matches Megatron ``lm loss``.
+        if getattr(self.config, "log_global_token_avg_loss", False):
+            record = _token_avg_record.get()
+            if record is None:
+                record = (
+                    paddle.is_grad_enabled() and not _token_loss_replaying.get()
+                )
+            if record:
+                _tr = LanguageLoss.token_avg_tracker
+                _p = _token_avg_head.get()
+                _tr[_p + "S"] = _tr.get(_p + "S", 0.0) + loss_sum.detach()
+                _tr[_p + "n"] = _tr.get(_p + "n", 0.0) + local_valid.detach()
         # Per-token: raw token sum, the trainer divides once by T_global.
         if getattr(self, "calculate_per_token_loss", False):
             return loss_sum
@@ -631,25 +669,38 @@ class LanguageLoss(FleetLayer):
         return loss_sum / paddle.clip(local_valid, min=1.0)
 
     @classmethod
-    def consume_token_avg_loss(cls):
-        """all_reduce(SUM) the accumulated (ΣS, Σn) and return the global
-        token-weighted loss ΣΣS/ΣΣn, clearing the tracker. None if empty.
+    def consume_token_avg_loss(cls, num_mtp: int = 0) -> dict:
+        """all_reduce(SUM) the accumulated per-head (ΣS, Σn) and return each
+        head's global token-weighted loss ΣΣS/ΣΣn, clearing the tracker.
 
-        COLLECTIVE: two ``all_reduce`` calls on the default group, so every rank
-        must reach this the same number of times -- gate only on rank-invariant
-        state (not on e.g. ``evaluation_loop``'s per-rank ``all_losses``) and
-        decide what to log after it returns. Ranks that accumulated nothing
-        (non-last pipeline stages) still take part, contributing (0, 0).
+        Returns ``{"loss": main, "mtp_1_loss": ..., "mtp_{num_mtp}_loss": ...}``;
+        a head with no valid tokens this interval (non-last pipeline stage,
+        ``train_mtp_only``, sampled-out MTP depth, already consumed) maps to
+        ``None``.
+
+        COLLECTIVE: one ``all_reduce`` on the default group, so every rank must
+        reach this the same number of times with the same ``num_mtp`` -- gate
+        only on rank-invariant state (not on e.g. ``evaluation_loop``'s
+        per-rank ``all_losses``) and decide what to log after it returns. The
+        head set comes from ``num_mtp`` (config), never from this rank's
+        tracker contents, so ranks that accumulated nothing still contribute
+        zeros in lockstep.
         """
         _tr = cls.token_avg_tracker
-        _S = paddle.to_tensor([float(_tr.get("S", 0.0))], dtype="float64")
-        _n = paddle.to_tensor([float(_tr.get("n", 0.0))], dtype="float64")
+        prefixes = [""] + [_mtp_token_avg_prefix(d) for d in range(num_mtp)]
+        packed = paddle.to_tensor(
+            [float(_tr.get(p + k, 0.0)) for p in prefixes for k in ("S", "n")],
+            dtype="float64",
+        )
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(_S, dist.ReduceOp.SUM)
-            dist.all_reduce(_n, dist.ReduceOp.SUM)
+            dist.all_reduce(packed, dist.ReduceOp.SUM)
         _tr.clear()
-        nv = float(_n.item())
-        return round(float(_S.item()) / nv, 8) if nv > 0 else None
+        vals = packed.numpy().tolist()
+        out = {}
+        for i, p in enumerate(prefixes):
+            S, n = vals[2 * i], vals[2 * i + 1]
+            out[p + "loss"] = round(S / n, 8) if n > 0 else None
+        return out
 
     def forward_impl(self, logits: Tensor | tuple, labels: Tensor) -> Tensor:
         # Per-token loss is training-only: the returned raw sum is not a valid
@@ -933,14 +984,23 @@ class LanguageLoss(FleetLayer):
             # several heads/micro-batches may await backward simultaneously.
             # Do not retain token losses or their autograd graphs in the closure.
             forward_active = True
+            # Pin the token-avg head and record decision now: a reentrant
+            # replay runs inside backward, outside the caller's head scope and
+            # with grad on, while its first pass ran under no_grad.
+            head = _token_avg_head.get()
+            record = paddle.is_grad_enabled()
 
             def loss_forward(logits, labels):
                 token = _token_loss_replaying.set(
                     _token_loss_replaying.get() or not forward_active
                 )
+                head_token = _token_avg_head.set(head)
+                record_token = _token_avg_record.set(record and forward_active)
                 try:
                     return self.forward_impl(logits, labels)
                 finally:
+                    _token_avg_record.reset(record_token)
+                    _token_avg_head.reset(head_token)
                     _token_loss_replaying.reset(token)
 
             try:
@@ -1068,7 +1128,12 @@ class LanguageLoss(FleetLayer):
 
                         if self.config.fused_linear_ce_loss_chunk > 0:
                             # MTP head: keep its labels out of T_global.
-                            with suppress_per_token_count():
+                            with (
+                                suppress_per_token_count(),
+                                _token_avg_head_scope(
+                                    _mtp_token_avg_prefix(depth)
+                                ),
+                            ):
                                 loss_matrix_cur_depth = self._forward(
                                     logits_cur_depth,
                                     labels_cur_depth,
@@ -1133,7 +1198,10 @@ class LanguageLoss(FleetLayer):
                             loss_cur_depth = loss_matrix_cur_depth.sum() * 0.0
                     else:
                         # MTP head: keep its labels out of T_global.
-                        with suppress_per_token_count():
+                        with (
+                            suppress_per_token_count(),
+                            _token_avg_head_scope(_mtp_token_avg_prefix(depth)),
+                        ):
                             loss_cur_depth = self._forward(
                                 logits_cur_depth,
                                 labels_cur_depth,
@@ -1541,7 +1609,10 @@ class MTPLanguageLoss(LanguageLoss):
             logits_cur_depth = mtp_logits[depth]
             labels_cur_depth = self._labels_for_depth(labels, depth)
             # MTP head: keep its labels out of T_global.
-            with suppress_per_token_count():
+            with (
+                suppress_per_token_count(),
+                _token_avg_head_scope(_mtp_token_avg_prefix(depth)),
+            ):
                 loss_cur_depth = self._forward(
                     logits_cur_depth,
                     labels_cur_depth,

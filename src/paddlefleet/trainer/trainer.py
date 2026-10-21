@@ -4161,6 +4161,12 @@ class Trainer:
         """When ``log_global_token_avg_loss`` is enabled, replace the logged loss
         with the global token-averaged loss (ΣΣS/ΣΣn) reduced across ranks by
         ``LanguageLoss``, keeping the micro-average as ``loss_microavg``.
+        Each MTP head is reduced on its own the same way: ``mtp_{d}_loss``
+        becomes that head's ΣΣS/ΣΣn and the previous value moves to
+        ``mtp_{d}_loss_last``. That previous value is not a micro-average: it is
+        ``LanguageLoss.mtp_loss_tracker``, overwritten every micro-batch, i.e.
+        the last micro-batch's value on this rank (DP-averaged only under
+        ``LOG_LOSS_MD5=1``), so do not compare it with ``loss_microavg``.
         Logging only — backprop is unchanged.
 
         Called from ``log()`` so every Trainer subclass (incl. ernie5) gets it
@@ -4170,7 +4176,8 @@ class Trainer:
         The ``"loss" in logs`` gate keeps this to the training log
         (``_maybe_log_save_evaluate`` always sets it; the eval / checkpoint-save
         / train-end ``log()`` sites never do) and is rank-invariant, as
-        ``consume_token_avg_loss``'s all_reduce requires.
+        ``consume_token_avg_loss``'s all_reduce requires; so is the MTP head
+        count, which comes from config.
 
         Training loss only, on purpose: ``evaluate()`` keeps reporting
         ``{prefix}_loss`` as the micro-average. The eval number belongs to
@@ -4190,10 +4197,15 @@ class Trainer:
                 LanguageLoss as _LL,
             )
 
-            _v = _LL.consume_token_avg_loss()
-            if _v is not None:
-                logs["loss_microavg"] = logs["loss"]
-                logs["loss"] = _v
+            _num_mtp = int(getattr(_cfg, "num_nextn_predict_layers", 0) or 0)
+            _vals = _LL.consume_token_avg_loss(_num_mtp)
+            for _key, _v in _vals.items():
+                if _v is None:
+                    continue
+                if _key in logs:
+                    _suffix = "_microavg" if _key == "loss" else "_last"
+                    logs[f"{_key}{_suffix}"] = logs[_key]
+                logs[_key] = _v
         except Exception as _e:  # noqa: BLE001
             logger.warning(f"[tokenavg] skip override: {_e}")
 

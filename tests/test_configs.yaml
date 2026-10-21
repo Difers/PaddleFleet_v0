@@ -189,7 +189,7 @@ tests:
   - test_case: [tests/multi_card_tests/models/test_language_loss.py]
     products:
       - num_gpus: 2
-  # models: consume_token_avg_loss's two all_reduce (needs world_size > 1, PP=2)
+  # models: consume_token_avg_loss's packed all_reduce (needs world_size > 1, PP=2)
   - test_case: [tests/multi_card_tests/models/test_language_loss_token_avg_reduction.py]
     products:
       - num_gpus: 2

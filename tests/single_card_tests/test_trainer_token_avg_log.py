@@ -48,11 +48,14 @@ _NO_TIMERS = patch(
 )
 
 
-def _fake_trainer(enabled):
+def _fake_trainer(enabled, num_mtp=0):
     """Minimal ``self``: the method only reads ``self.model.config``."""
     return types.SimpleNamespace(
         model=types.SimpleNamespace(
-            config=types.SimpleNamespace(log_global_token_avg_loss=enabled)
+            config=types.SimpleNamespace(
+                log_global_token_avg_loss=enabled,
+                num_nextn_predict_layers=num_mtp,
+            )
         )
     )
 
@@ -64,8 +67,10 @@ def _seed_tracker(S=212.0, n=100.0):
     LanguageLoss.token_avg_tracker["n"] = n
 
 
-def _apply(enabled, logs):
-    trainer.Trainer._apply_global_token_avg_loss(_fake_trainer(enabled), logs)
+def _apply(enabled, logs, num_mtp=0):
+    trainer.Trainer._apply_global_token_avg_loss(
+        _fake_trainer(enabled, num_mtp), logs
+    )
     return logs
 
 
@@ -119,6 +124,34 @@ def test_empty_tracker_degrades_silently_to_the_microavg():
 
     assert logs == {"loss": 9.5}, logs
     assert "loss_microavg" not in logs
+
+
+def test_mtp_heads_are_overridden_separately():
+    """With MTP, ``loss`` is the main head's ΣS/Σn only and each
+    ``mtp_{d}_loss`` is replaced by its own, the old values kept as
+    ``loss_microavg`` / ``mtp_{d}_loss_last`` (the MTP tracker holds the last
+    micro-batch's value, not a micro-average). A depth with no tokens this
+    interval is left alone."""
+    _seed_tracker()
+    LanguageLoss.token_avg_tracker["mtp_1_S"] = 450.0
+    LanguageLoss.token_avg_tracker["mtp_1_n"] = 90.0
+    try:
+        logs = _apply(
+            True,
+            {"loss": 9.5, "mtp_1_loss": 7.0, "mtp_2_loss": 8.0},
+            num_mtp=2,
+        )
+
+        assert abs(logs["loss"] - 2.12) < 1e-6, logs
+        assert logs["loss_microavg"] == 9.5
+        assert abs(logs["mtp_1_loss"] - 5.0) < 1e-6, logs
+        assert logs["mtp_1_loss_last"] == 7.0
+        assert "mtp_1_loss_microavg" not in logs
+        assert logs["mtp_2_loss"] == 8.0
+        assert "mtp_2_loss_last" not in logs
+        assert LanguageLoss.token_avg_tracker == {}
+    finally:
+        LanguageLoss.token_avg_tracker.clear()
 
 
 def test_a_second_call_in_the_same_step_is_a_no_op():
@@ -207,6 +240,7 @@ if __name__ == "__main__":
         test_a_log_without_loss_does_not_consume()
         test_enabled_overrides_loss_and_keeps_the_microavg()
         test_empty_tracker_degrades_silently_to_the_microavg()
+        test_mtp_heads_are_overridden_separately()
         test_a_second_call_in_the_same_step_is_a_no_op()
         test_a_broken_consume_warns_instead_of_killing_the_step()
         test_log_applies_the_override_at_its_single_call_site()

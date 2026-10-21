@@ -16,12 +16,13 @@
 
 With ``log_global_token_avg_loss`` on, every training forward stashes this rank's
 raw ``(loss_sum, valid_tokens)`` in a class-level tracker; the trainer then calls
-``consume_token_avg_loss``, which ``all_reduce(SUM)``s both terms and returns the
-global token-weighted loss ΣΣS/ΣΣn (matching Megatron ``lm_loss``). The switch is
-independent of ``calculate_per_token_loss``, which only decides what
-``_reduce_loss_by_tokens`` returns for backprop. Those two
-collectives are skipped when the world has a single rank, so a multi-card test is
-the only thing that can reach them.
+``consume_token_avg_loss``, which packs every head's terms into one float64
+``all_reduce(SUM)`` and returns the global token-weighted loss ΣΣS/ΣΣn
+(matching Megatron ``lm_loss``). The switch is independent of
+``calculate_per_token_loss``, which only decides what
+``_reduce_loss_by_tokens`` returns for backprop. That collective is skipped
+when the world has a single rank, so a multi-card test is the only thing that
+can reach it.
 
 Topology: world_size=2, TP=1, PP=2 -- the plain (non parallel-cross-entropy)
 branch of ``forward_impl``. The two ranks get deterministic but *unequal* valid
@@ -176,7 +177,7 @@ def test_forward_returns_this_ranks_raw_sum():
 
 
 def test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n():
-    """The collective under test: two ``all_reduce(SUM)`` over the 2-GPU world.
+    """The collective under test: one packed ``all_reduce(SUM)`` over 2 GPUs.
 
     Both ranks are checked against the same global reference, and because their
     token counts differ it cannot coincide with the mean of the per-rank means --
@@ -186,7 +187,7 @@ def test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n():
     try:
         _stash_local_terms()
 
-        got = LanguageLoss.consume_token_avg_loss()
+        got = LanguageLoss.consume_token_avg_loss()["loss"]
         token_weighted, mean_of_means = _global_reference()
 
         assert got is not None
@@ -210,9 +211,36 @@ def test_second_consume_is_a_no_op_that_still_runs_in_lockstep():
     try:
         _stash_local_terms()
 
-        assert LanguageLoss.consume_token_avg_loss() is not None
-        assert LanguageLoss.consume_token_avg_loss() is None
-        assert LanguageLoss.consume_token_avg_loss() is None
+        assert LanguageLoss.consume_token_avg_loss()["loss"] is not None
+        assert LanguageLoss.consume_token_avg_loss()["loss"] is None
+        assert LanguageLoss.consume_token_avg_loss()["loss"] is None
+    finally:
+        LanguageLoss.token_avg_tracker.clear()
+
+
+def test_mtp_head_reduces_in_lockstep_even_where_absent():
+    """Per-head reduction: only rank 0 has an MTP head this interval, yet both
+    ranks pass the same ``num_mtp`` and reach one shared collective, and the
+    main head stays the main-only ΣΣS/ΣΣn."""
+    from paddlefleet.models.common.language_loss import language_loss as ll
+
+    LanguageLoss.token_avg_tracker.clear()
+    try:
+        _stash_local_terms()
+        if Utils.rank == 0:
+            with ll._token_avg_head_scope(ll._mtp_token_avg_prefix(0)):
+                _stash_local_terms()
+
+        got = LanguageLoss.consume_token_avg_loss(1)
+        token_weighted, _ = _global_reference()
+        mtp_sum, mtp_n = _numpy_masked_ce(*_local_inputs(0))
+
+        np.testing.assert_allclose(
+            got["loss"], token_weighted, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            got["mtp_1_loss"], mtp_sum / mtp_n, rtol=1e-5, atol=1e-6
+        )
     finally:
         LanguageLoss.token_avg_tracker.clear()
 
@@ -224,3 +252,4 @@ if __name__ == "__main__":
     test_forward_returns_this_ranks_raw_sum()
     test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n()
     test_second_consume_is_a_no_op_that_still_runs_in_lockstep()
+    test_mtp_head_reduces_in_lockstep_even_where_absent()
