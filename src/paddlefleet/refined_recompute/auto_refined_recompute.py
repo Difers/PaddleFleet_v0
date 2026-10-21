@@ -17,10 +17,14 @@ Contract for the boundary function:
 
 * positional ``paddle.Tensor`` inputs only; capture constants by closure;
 * returns one Tensor, or a flat tuple/list of ``Tensor``/``None``;
-* pure computation with no random-state use -- the recompute pass never runs
-  the boundary, so an RNG-consuming op inside it (e.g. dropout) would advance
-  the first pass's random state but not the recompute pass's, silently
-  misaligning every random op that follows in the same recompute region;
+* draws random numbers (dropout, ...) only if the boundary is built with
+  ``uses_rng=True`` -- the recompute pass never runs the boundary, so a draw
+  inside it would advance the generators in the first pass but not in the
+  recompute pass, silently misaligning every random op that follows in the same
+  recompute region. ``uses_rng=True`` records the generators after the
+  boundary and puts them back when the boundary is skipped (``rng_state``),
+  which needs a recompute that restores the random state. The default promises
+  that the boundary draws nothing and costs nothing;
 * floating point inputs are treated as requiring gradient and non-floating ones
   as not, so a float input that is semantically constant belongs in the closure;
 * not nested inside another boundary.
@@ -42,6 +46,8 @@ from contextlib import contextmanager
 
 import paddle
 from paddle.base import framework
+
+from . import rng_state
 
 __all__ = ["AutoRefinedRecompute"]
 
@@ -85,17 +91,19 @@ def _unpack(tensors, spec):
 class _Frame:
     """One invocation's retained graph, consumed once in backward."""
 
-    __slots__ = ("graph_inputs", "graph_outputs", "spec")
+    __slots__ = ("graph_inputs", "graph_outputs", "spec", "rng_after")
 
-    def __init__(self, graph_inputs, graph_outputs, spec):
+    def __init__(self, graph_inputs, graph_outputs, spec, rng_after):
         self.graph_inputs = graph_inputs
         self.graph_outputs = graph_outputs
         self.spec = spec
+        self.rng_after = rng_after
 
     def release(self):
         self.graph_inputs = ()
         self.graph_outputs = ()
         self.spec = None
+        self.rng_after = None
 
 
 class _Reconnect(paddle.autograd.PyLayer):
@@ -164,10 +172,14 @@ class AutoRefinedRecompute:
     The instance is the boundary's identity, so frames carry no point id or
     layer number. The queue holds more than one frame while several invocations
     are in flight, as under pipeline parallelism.
+
+    ``uses_rng`` declares that the boundary draws random numbers; see the module
+    docstring.
     """
 
-    def __init__(self, name):
+    def __init__(self, name, uses_rng=False):
         self.name = name
+        self._uses_rng = uses_rng
         self._frames = deque()
 
     @property
@@ -209,12 +221,15 @@ class AutoRefinedRecompute:
 
         graph_outputs, spec = _pack(outputs)
         detached = tuple(output.detach() for output in graph_outputs)
+        rng_after = rng_state.capture() if self._uses_rng else None
 
         # Drop the input data; the recompute pass shares its own buffers back
         # in. The graph and its saved tensors stay alive.
         for graph_input in graph_inputs:
             graph_input._clear_data()
-        self._frames.append(_Frame(graph_inputs, graph_outputs, spec))
+        self._frames.append(
+            _Frame(graph_inputs, graph_outputs, spec, rng_after)
+        )
         return _unpack(detached, spec)
 
     def _recompute_forward(self, inputs):
@@ -223,7 +238,12 @@ class AutoRefinedRecompute:
         frame = self._frames.popleft()
         # Read before `apply`: `backward` releases the frame.
         spec = frame.spec
+        rng_after = frame.rng_after
         outputs = _Reconnect.apply(frame, *inputs)
+        if rng_after is not None:
+            # The boundary did not run, so the generators are still where the
+            # segment's own replay left them before it.
+            rng_state.restore(rng_after)
         if isinstance(outputs, paddle.Tensor):
             outputs = (outputs,)
         return _unpack(outputs, spec)

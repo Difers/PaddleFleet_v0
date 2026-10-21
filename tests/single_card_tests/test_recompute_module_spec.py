@@ -370,6 +370,20 @@ class TestMakeRefinedRecompute(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(boundary.name, "mla_o_proj")
 
+    def test_uses_rng_is_passed_to_the_boundary(self):
+        owner = _Owner(_rr_config(recompute_modules=["mla_o_proj"]))
+        _, default = make_refined_recompute(owner, "mla_o_proj")
+        _, declared = make_refined_recompute(owner, "mla_o_proj", uses_rng=True)
+        self.assertFalse(default._uses_rng)
+        self.assertTrue(declared._uses_rng)
+
+    def test_uses_rng_does_not_bypass_the_vetoes(self):
+        owner = _Owner(_config(recompute_modules=["mla_o_proj"]))
+        self.assertEqual(
+            make_refined_recompute(owner, "mla_o_proj", uses_rng=True),
+            (False, None),
+        )
+
     def test_absent_point_builds_no_boundary(self):
         owner = _Owner(_rr_config(recompute_modules=["flash_attn"]))
         self.assertEqual(

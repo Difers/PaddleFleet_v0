@@ -726,10 +726,12 @@ def mhc_chunk_layout_text(config):
     )
 
 
-def make_refined_recompute(owner, point, supported=True):
+def make_refined_recompute(owner, point, supported=True, uses_rng=False):
     """Return ``(enabled, boundary)`` for one refined-recompute point.
 
     ``supported`` is a point-specific precondition only the call site knows.
+    ``uses_rng`` declares that the point draws random numbers; it is passed to
+    the boundary (see ``AutoRefinedRecompute``).
 
     Two preconditions are checked here instead of per point: the layer must be
     under full recompute, or the boundary retains a frame no backward consumes;
@@ -759,7 +761,7 @@ def make_refined_recompute(owner, point, supported=True):
             f"virtual_pipeline={vpp}"
         )
         return False, None
-    return True, AutoRefinedRecompute(point)
+    return True, AutoRefinedRecompute(point, uses_rng=uses_rng)
 
 
 def validate_recompute_modules(config):
