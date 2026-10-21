@@ -179,6 +179,11 @@ class GlmMoeDsaConfig(PretrainedConfig):
         fd_fallback=False,
         **kwargs,
     ):
+        # GLM-5.2's config.json sets ``index_topk_pattern: null`` next to the
+        # explicit ``indexer_types``. TransformerConfig rejects that key in any
+        # form, so drop the null; a set pattern still fails there loudly.
+        if kwargs.get("index_topk_pattern", 0) is None:
+            kwargs.pop("index_topk_pattern")
         # Official checkpoints keep rope_scaling null and use rope_parameters.
         rope_parameters = kwargs.pop("rope_parameters", None)
         if rope_parameters is None:

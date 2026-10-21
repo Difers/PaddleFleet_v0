@@ -271,6 +271,13 @@ class SFTTrainingArguments(TrainingArguments):
         default="estimation_output.json",
         metadata={"help": "The output file of max_steps estimation result"},
     )
+    # LlmMetaConfig does not carry it, so only run_sft applies it.
+    bias_activation_fusion: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Fuse bias and activation; None preserves the model provider default."
+        },
+    )
 
 
 @dataclass

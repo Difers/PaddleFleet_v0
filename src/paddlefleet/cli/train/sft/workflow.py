@@ -93,6 +93,19 @@ from paddlefleet.cli.utils import (
 )
 
 
+def apply_bias_activation_fusion(model_config, training_args):
+    """Copy a configured bias_activation_fusion onto the model config.
+
+    LlmMetaConfig does not carry it, so set_llm_config leaves it out; None
+    keeps the model config's own value.
+    """
+    if training_args.bias_activation_fusion is None:
+        return
+    model_config.bias_activation_fusion = training_args.bias_activation_fusion
+    # A runtime kernel switch, not part of the exported HF config.json.
+    model_config.register_unsavable_keys("bias_activation_fusion")
+
+
 def freeze_param_except_mtp(model, config):
     logger.info("freeze_param_except_mtp.")
 
@@ -342,6 +355,7 @@ def run_sft(
         training_args.prediction_loss_only = True
 
     LlmMetaConfig.set_llm_config(model_config, training_args)
+    apply_bias_activation_fusion(model_config, training_args)
     model_config.use_fast_layer_norm = model_args.use_fast_layer_norm
 
     # autoregressive mtp training
@@ -559,6 +573,10 @@ def run_sft(
         "truncation_strategy": data_args.truncation_strategy,
         "skip_warmup": data_args.skip_warmup,
     }
+    # Only glm5_2 takes the CLI switch: GeneratingArguments defaults it to
+    # False, which would override other templates' registered value.
+    if data_args.template == "glm5_2":
+        dataset_config["enable_thinking"] = generating_args.enable_thinking
 
     if dataset_config["template_backend"] == "custom":
         template_instance = get_template_and_fix_tokenizer(dataset_config)

@@ -215,6 +215,14 @@ class GlmMoeDsaConfigRoundTripTests(unittest.TestCase):
         self.assertEqual(reloaded.rope_type, "rope")
         self.assertIsNone(reloaded.rope_scaling)
 
+    def test_official_null_index_topk_pattern_is_dropped(self):
+        # GLM-5.2's config.json carries it as null, and TransformerConfig
+        # rejects the key in any form; a set pattern must still reach it.
+        config = GlmMoeDsaConfig.from_dict({"index_topk_pattern": None})
+        self.assertNotIn("index_topk_pattern", config.to_dict())
+        config = GlmMoeDsaConfig.from_dict({"index_topk_pattern": "FS"})
+        self.assertEqual(config.index_topk_pattern, "FS")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,17 @@ def _training_function(config: dict[str, Any]) -> None:
         check_path(data_args.train_dataset_path)
         check_path(data_args.eval_dataset_path)
 
-    if model_args.stage in ["SFT", "PT", "VL-SFT", "VL-PT"]:
+    sft_stage = model_args.stage in ["SFT", "PT", "VL-SFT", "VL-PT"]
+    # Only run_sft applies bias_activation_fusion; other stages would drop it.
+    if (
+        not sft_stage
+        and getattr(finetuning_args, "bias_activation_fusion", None) is not None
+    ):
+        raise ValueError(
+            f"bias_activation_fusion is only supported by SFT stages, "
+            f"got stage={model_args.stage!r}."
+        )
+    if sft_stage:
         with paddle.amp.auto_cast(enable=False):
             run_sft(
                 model_args,
