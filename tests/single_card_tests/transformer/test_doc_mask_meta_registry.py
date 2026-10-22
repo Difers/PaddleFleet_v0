@@ -1004,6 +1004,10 @@ def _stub_indexer_loss_leaves(module):
     )
     module._attn_target = lambda *a, **k: paddle.zeros([1, 4, 128])
     module._indexer_loss_mask = lambda *a, **k: (None, None)
+    # This harness is a CPU build with no process group, and the sparse lookup
+    # test flips ``cp_enabled`` on directly, so the CP all-reduce inside the
+    # real logger has nothing to run on. Logging is not what these assert.
+    module._log_indexer_loss = lambda *a, **k: None
 
 
 _AUTOSCALER_PATCH = unittest.mock.patch(
@@ -1148,44 +1152,82 @@ class _ProbeBias(paddle.nn.Layer):
         return out[0] if isinstance(out, tuple) else out
 
 
+def _hyper_forward_attention_layer(layer_number):
+    """An mHC layer whose self-attention dispatch can be spied on.
+
+    Registered sublayers must stay paddle layer types; the real layernorms run
+    fine on CPU, the hyper-connection and cross attention are replaced, and the
+    fusion helpers (plain methods) are overridden. Returns the layer and the
+    white-box MLA probe bound as its ``self_attn``.
+    """
+    layer = _layer(share=False, layer_number=layer_number)
+    probe = _InferenceKwargsMLA(layer.config)
+    probe.core_attention = _StubCoreAttention()
+    layer.self_attn = probe
+    layer.self_attention_hyper_connection = _ProbeMHC()
+    layer.cross_attention = _ProbeCrossAttention()
+    layer.cross_attn_bda = _ProbeBias()
+    layer._fused_h_res_h_post_bda = lambda *a, **k: (
+        a[4][0] if isinstance(a[4], tuple) else a[4],
+        None,
+    )
+    layer._cast_and_discard_fused_bda = lambda out, *a, **k: out
+    return layer, probe
+
+
+def _run_hyper_forward_attention(layer, probe, **kwargs):
+    """Drive ``HyperConnectionTransformerLayer._forward_attention`` on CPU.
+
+    Only the qkv projections and the kernel core are patched; the kwargs the
+    layer builds are what the call mock records.
+    """
+    qkv = tuple(paddle.zeros([1, 8, 1, 4]) for _ in range(6))
+    with (
+        unittest.mock.patch.object(
+            probe, "get_query_key_value_tensors", return_value=qkv
+        ),
+        unittest.mock.patch.object(
+            probe, "forward", wraps=probe.forward
+        ) as fwd,
+    ):
+        layer._forward_attention(
+            paddle.zeros([1, 8, 8]), attention_mask=None, **kwargs
+        )
+    return fwd
+
+
 class TestLayerDocmaskSlotKwarg(unittest.TestCase):
     """``transformer_layer.py:1917-1920``: the mHC ``_forward_attention``
     forwards the shared docmask slot kwarg to an MLA-family self-attention
     module, backed by the white-box MLA probe."""
 
     def test_forward_attention_threads_slot_kwarg(self):
-        layer = _layer(share=False, layer_number=5)
-        probe = _InferenceKwargsMLA(layer.config)
-        probe.core_attention = _StubCoreAttention()
-        layer.self_attn = probe
-        # Registered sublayers must stay paddle layer types; the real
-        # layernorms run fine on CPU, the hyper-connection and cross attention
-        # are replaced, and the fusion helpers (plain methods) are overridden.
-        layer.self_attention_hyper_connection = _ProbeMHC()
-        layer.cross_attention = _ProbeCrossAttention()
-        layer.cross_attn_bda = _ProbeBias()
-        layer._fused_h_res_h_post_bda = lambda *a, **k: (
-            a[4][0] if isinstance(a[4], tuple) else a[4],
-            None,
-        )
-        layer._cast_and_discard_fused_bda = lambda out, *a, **k: out
-        qkv = tuple(paddle.zeros([1, 8, 1, 4]) for _ in range(6))
-        with (
-            unittest.mock.patch.object(
-                probe, "get_query_key_value_tensors", return_value=qkv
-            ),
-            unittest.mock.patch.object(
-                probe, "forward", wraps=probe.forward
-            ) as fwd,
-        ):
-            layer._forward_attention(
-                paddle.zeros([1, 8, 8]),
-                attention_mask=None,
-                docmask_mb_idx=0,
-            )
+        layer, probe = _hyper_forward_attention_layer(5)
+        fwd = _run_hyper_forward_attention(layer, probe, docmask_mb_idx=0)
         self.assertEqual(probe.core_attention.calls, 1)
         # the slot kwarg made it into the self-attention call (line 1920)
         self.assertEqual(fwd.call_args.kwargs["docmask_mb_idx"], 0)
+
+
+class TestLayerInputIdsKwarg(unittest.TestCase):
+    """The mHC ``_forward_attention`` must thread ``input_ids`` into an
+    MLA-family self-attention.
+
+    Both indexer-bearing cores build their indexer-loss row mask from
+    ``input_ids != pad_token_id``: ``attn_mask_startend_row_indices`` cannot
+    express the trailing padding of a packed sequence. Dropping this hop makes
+    ``_indexer_loss_mask`` return ``(None, None)``, and the KL then silently
+    falls back to the unmasked row mean (padding included) -- nothing about the
+    shapes or the loss value fails, so the call itself is what is pinned here.
+    """
+
+    def test_input_ids_reach_the_self_attention(self):
+        layer, probe = _hyper_forward_attention_layer(6)
+        # ``[1, 8]`` with the last row masked out, i.e. a real pad row.
+        input_ids = paddle.to_tensor([[1, 2, 3, 4, 5, 6, 7, 0]])
+        fwd = _run_hyper_forward_attention(layer, probe, input_ids=input_ids)
+        self.assertEqual(probe.core_attention.calls, 1)
+        self.assertIs(fwd.call_args.kwargs.get("input_ids"), input_ids)
 
 
 class TestPrebuildFromBatchedMicroBatch(unittest.TestCase):

@@ -52,6 +52,7 @@ import paddle
 
 from paddlefleet.transformer import indexer_loss_overlap
 from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
+from paddlefleet.transformer.mqa_latent_attention import MQALatentAttention
 
 from .hybrid_mla_utils import (
     _GPU,
@@ -1383,7 +1384,16 @@ class _BranchOwner:
     The target definition and the row mask are the layer's, so they are stubbed
     rather than reimplemented: what is under test is the reduction the branch
     builds on top of them and the gradient hand-off that follows.
+
+    The tracker write is the layer's own ``_log_indexer_loss``, bound here
+    rather than copied, because the logged value is one of the observables.
+    ``cp_enabled`` stays off: this harness has no process group to reduce over,
+    and the branch's own ``indexer_loss_coeff / cp_size`` already models the
+    per-rank shard.
     """
+
+    cp_enabled = False
+    _log_indexer_loss = MQALatentAttention._log_indexer_loss
 
     def __init__(self, loss_mask=None, valid_rows=None):
         self.indexer_loss_coeff = 0.5

@@ -107,10 +107,10 @@ _STRADDLE = H._STRADDLE
 _PAD_DOC_LEN = 475
 _N_PAD = S_GLOBAL - _PAD_DOC_LEN
 
-# The logged indexer loss is a bf16-fed fp32 KL reduction, so the per-rank sum
-# lands a few 1e-4 off the single-rank value. A wrong denominator is off by
-# ``cp_size`` (100% at CP=2), so this bound is three orders of magnitude away
-# from the failure it has to catch.
+# The logged indexer loss is a bf16-fed fp32 KL reduction and the layer's CP
+# sum reorders it, so it lands a few 1e-4 off the single-rank value. A wrong
+# denominator is off by ``cp_size`` (100% at CP=2), so this bound is three
+# orders of magnitude away from the failure it has to catch.
 LOSS_RTOL = 5e-3
 
 
@@ -264,22 +264,25 @@ class _CPChecks(unittest.TestCase):
         )
 
     def _assert_loss_cp_sum(self, res, tag):
-        """Sum the per-rank logged loss and compare to the CP=1 value."""
-        total = paddle.to_tensor([res["logged_cp"]], dtype="float64")
-        dist.all_reduce(total, group=H.CP_GROUP)
-        got, want = float(total[0]), res["logged_ref"]
+        """Compare this rank's logged loss to the CP=1 value.
+
+        ``_log_indexer_loss`` in ``mqa_latent_attention.py`` already SUMS the
+        per-rank partials over the CP group before ``save_loss_to_tracker``, so
+        every CP rank's tracker holds the replica-global loss. Reducing it here
+        again would count it ``cp_size`` times.
+        """
+        got, want = res["logged_cp"], res["logged_ref"]
         self.assertGreater(abs(want), 0.0, f"{tag}: reference logged no loss")
         rel = abs(got - want) / abs(want)
         print(
             f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: "
-            f"this_rank={res['logged_cp']:.6e} sum(loss)={got:.6e} "
-            f"ref={want:.6e} rel={rel:.3e}",
+            f"logged={got:.6e} ref={want:.6e} rel={rel:.3e}",
             flush=True,
         )
         self.assertLess(
             rel,
             LOSS_RTOL,
-            f"{tag}: CP loss sum {got:.6e} != CP=1 {want:.6e} "
+            f"{tag}: CP loss {got:.6e} != CP=1 {want:.6e} "
             f"(rel {rel:.3e}); a per-rank denominator would be off by "
             f"~{H.CP_SIZE}x",
         )
@@ -411,7 +414,7 @@ class TestWarmupCP(_CPChecks):
 
     @H.U._GPU
     def test_4_indexer_loss_cp_normalisation(self):
-        """The logged indexer loss must sum to the CP=1 value across the group.
+        """The logged indexer loss must equal the CP=1 value on every rank.
 
         Read straight out of ``DSAIndexerLossLoggingHelper``, so it observes the
         denominator itself rather than its shadow in the gradients. Phase 2
@@ -419,7 +422,8 @@ class TestWarmupCP(_CPChecks):
         always a real tensor -- ``_indexer_loss_mask``'s global-count mask when
         ``input_ids`` reached the layer, an all-ones mask over ``b * s_global``
         when it did not -- so every rank contributes its own rows to one global
-        mean and the per-rank losses are partial sums. Phase 3
+        mean; ``_log_indexer_loss`` sums those per-rank partials over the CP
+        group before handing them to the tracker. Phase 3
         (``sparse_loss=True``) still keeps the two-branch form (global count when
         masked, a local mean times ``1 / cp_size`` when not); both must land on
         the CP=1 value. ``sparse_loss`` is swept so a failure can be attributed:
@@ -456,7 +460,7 @@ class TestWarmupCP(_CPChecks):
         Phase 2's KL spans the whole per-document causal set (up to 512 columns
         on this layout) while phase 3's spans window(128) + top-k(128), so the
         two logged losses must differ -- that is the non-vacuity control for
-        ``test_4`` -- while each still normalises across the CP group.
+        ``test_4`` -- while each still lands on the CP=1 value.
         """
         logged = {}
         for sparse in (False, True):
@@ -662,8 +666,9 @@ class TestWarmupKLBackendsCP(_CPChecks):
 
     * the CP=N-vs-CP=1 contract of ``run_core_cp`` on the cuDNN backend
       (``_check``: forward plus every gradient, the indexer parameters included);
-    * the logged KL summing across the group to the CP=1 value
-      (``_assert_loss_cp_sum``) -- a per-rank denominator is off by ``cp_size``;
+    * the logged KL matching the CP=1 value on every rank
+      (``_assert_loss_cp_sum``; ``_log_indexer_loss`` CP-sums it first) -- a
+      per-rank denominator is off by ``cp_size``;
     * the two backends agreeing on that CP-summed scalar, which is what makes
       this a *dense-THD-under-CP* claim rather than a self-consistency one: both
       backends would have to mis-slice identically to pass.
@@ -675,9 +680,10 @@ class TestWarmupKLBackendsCP(_CPChecks):
 
     # Both backends reduce a bf16-fed fp32 KL over the same candidate set, but
     # in different orders (tilelang: per-row over a column table; dense: chunked
-    # over the raw score matrix), and the CP sum adds ``cp_size`` partial sums on
-    # top. Measured 1.5e-8..1.4e-7 for a backend against its own CP=1 value and
-    # ~1e-4 between backends, so this is three orders off a wrong denominator.
+    # over the raw score matrix), and ``_log_indexer_loss`` adds ``cp_size``
+    # partial sums on top. Measured 1.5e-8..1.4e-7 for a backend against its own
+    # CP=1 value and ~1e-4 between backends, so this is three orders off a wrong
+    # denominator.
     BACKEND_RTOL = 5e-3
 
     # ``dense_indexer_backward_wrapper`` reduces ``d_index_k`` through fp32
@@ -691,7 +697,7 @@ class TestWarmupKLBackendsCP(_CPChecks):
     # therefore measures the atomics rather than CP, so give these two a bound
     # above the floor and keep the strict one everywhere else. What CP failures
     # look like by comparison: a wrong loss denominator is 100% at CP=2, and a
-    # mislocalised THD border moves the loss sum itself, which
+    # mislocalised THD border moves the logged loss itself, which
     # ``_assert_loss_cp_sum`` pins to 6e-8.
     DK_GRAD_RTOL = 2e-1
     _DK_PARAMS = ("indexer.wk.", "indexer.k_norm.")
@@ -788,12 +794,13 @@ class TestWarmupKLBackendsCP(_CPChecks):
     def test_2_cudnn_and_tilelang_agree_on_the_cp_summed_loss(self):
         """Cross-backend: the same objective, the same THD/table slicing.
 
-        Both losses are summed over the CP group first, so a border that is
-        wrong on one rank only still shows up here.
+        ``_log_indexer_loss`` sums the loss over the CP group before the
+        tracker, so every rank's logged value is the replica-global one and a
+        border that is wrong on one rank only still shows up here.
         """
         for label, doc_lens, masked, row_end in self._layouts():
             with self.subTest(layout=label):
-                sums = {}
+                logged = {}
                 for backend in ("tilelang", "cudnn"):
                     res = self._run(
                         backend=backend,
@@ -801,12 +808,8 @@ class TestWarmupKLBackendsCP(_CPChecks):
                         masked=masked,
                         row_end=row_end,
                     )
-                    total = paddle.to_tensor(
-                        [res["logged_cp"]], dtype="float64"
-                    )
-                    dist.all_reduce(total, group=H.CP_GROUP)
-                    sums[backend] = float(total[0])
-                got, want = sums["cudnn"], sums["tilelang"]
+                    logged[backend] = res["logged_cp"]
+                got, want = logged["cudnn"], logged["tilelang"]
                 rel = abs(got - want) / max(abs(want), 1e-30)
                 print(
                     f"[kl-backends-cp{H.CP_SIZE} rank{H.CP_RANK}] {label}: "
@@ -816,8 +819,8 @@ class TestWarmupKLBackendsCP(_CPChecks):
                 self.assertLess(
                     rel,
                     self.BACKEND_RTOL,
-                    f"{label}: the dense cuDNN KL sums to {got:.6e} across the "
-                    f"CP group where tilelang sums to {want:.6e} "
+                    f"{label}: the dense cuDNN KL logs {got:.6e} where "
+                    f"tilelang logs {want:.6e} "
                     f"(rel {rel:.3e}) -- the two candidate sets differ",
                 )
 

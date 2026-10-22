@@ -210,10 +210,12 @@ def _logged_indexer_loss(layer_number=1):
 
     ``_forward_warmup`` / ``_forward_sparse`` reduce the KL with the coefficient
     and denominator their phase picked (phase 2 always the global row count;
-    phase 3 the global valid-row count when masked, ``/cp_size`` when not) and
-    hand exactly that scalar to ``DSAIndexerLossLoggingHelper``, so the tracker
-    is a direct read of the normalisation -- no gradient indirection. ``0.0``
-    when the step attached no loss.
+    phase 3 the global valid-row count when masked, ``/cp_size`` when not), then
+    ``_log_indexer_loss`` SUMS those per-rank partials over the CP group before
+    handing the scalar to ``DSAIndexerLossLoggingHelper``. The tracker is
+    therefore a direct read of the CP-global normalisation -- no gradient
+    indirection, and the same value on every rank of the group. ``0.0`` when the
+    step attached no loss.
     """
     values = DSAIndexerLossLoggingHelper.tracker.get("values")
     if values is None:

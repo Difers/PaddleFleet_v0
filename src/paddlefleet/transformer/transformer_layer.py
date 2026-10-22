@@ -2344,8 +2344,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Self-attention
         extra_kwargs = {}
+        # ``input_ids`` feeds the indexer-loss row mask of the non-absorbed MQA
+        # core, exactly as in the base ``TransformerLayer._forward_attention``.
+        # Without it ``_indexer_loss_mask`` returns ``(None, None)`` and the
+        # indexer KL falls back to the unmasked row mean, padding included.
         if kwargs.get("input_ids") is not None and isinstance(
-            self.self_attn, (DSv4HybridAttention, KimiDeltaAttention)
+            self.self_attn,
+            (DSv4HybridAttention, MultiLatentAttention, KimiDeltaAttention),
         ):
             extra_kwargs["input_ids"] = kwargs["input_ids"]
         if isinstance(self.self_attn, KimiDeltaAttention):

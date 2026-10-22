@@ -1494,13 +1494,7 @@ class MQALatentAttention(FleetLayer):
             else:
                 loss = (kl * loss_mask).sum() / valid_rows * loss_coeff
 
-        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-            loss=loss,
-            layer_number=self.layer_number,
-            num_layers=DSAIndexerLossLoggingHelper.get_total_num_layers(
-                self.config
-            ),
-        )
+        self._log_indexer_loss(loss)
         return TileLangCSAIndexerLossAutoScaler.apply(
             output,
             target,
@@ -1640,13 +1634,12 @@ class MQALatentAttention(FleetLayer):
             )
             del index_score, index_lse, attn_score, attn_l1norm
 
-        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-            loss=loss,
-            layer_number=self.layer_number,
-            num_layers=DSAIndexerLossLoggingHelper.get_total_num_layers(
-                self.config
-            ),
-        )
+        # Reachable only on SM100+: everything that drives this function
+        # (``test_hybrid_mla_warmup_kl_cudnn.py``,
+        # ``TestWarmupKLBackendsCP``) is ``_GPU``-gated on the cuDNN dense
+        # indexer, while the coverage fleet is SM90/A100/H20. Excluded rather
+        # than counted as missing; the other three call sites are covered.
+        self._log_indexer_loss(loss)  # pragma: no cover
         plan = DenseWarmupKLPlan(
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
@@ -2423,13 +2416,7 @@ class MQALatentAttention(FleetLayer):
             else:
                 loss = (kl_per_pos * loss_mask).sum() / valid_rows * loss_coeff
 
-        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-            loss=loss,
-            layer_number=self.layer_number,
-            num_layers=DSAIndexerLossLoggingHelper.get_total_num_layers(
-                self.config
-            ),
-        )
+        self._log_indexer_loss(loss)
         # Argument order follows ``TileLangCSAIndexerLossAutoScaler.forward``
         # (csa_attention.py): ``output, target, index_q, weights, index_k_comp,
         # topk_indices, topk_probs, loss_coeff, indexer_backend,
@@ -2548,6 +2535,24 @@ class MQALatentAttention(FleetLayer):
         # in-flight pipeline ``SendRecv``, which is the overlap this whole path
         # exists to get. Last, the barrier coincides with the wait the schedule
         # performs anyway.
+        self._log_indexer_loss(loss)
+
+    def _log_indexer_loss(self, loss):
+        """Save the indexer loss after summing it across the CP group.
+
+        Every save site stores a *partial* numerator: the masked branch divides
+        by the global valid-row count, the unmasked branch pre-divides the
+        coefficient by ``cp_size``. The CP shards of one data replica therefore
+        have to be SUMMED before the tracker sees them; the tracker's own
+        data-parallel step then averages over replicas.
+        """
+        loss = loss.detach().clone()
+        if self.cp_enabled:
+            paddle.distributed.all_reduce(
+                loss,
+                op=paddle.distributed.ReduceOp.SUM,
+                group=self.cp_group,
+            )
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
             loss=loss,
             layer_number=self.layer_number,
