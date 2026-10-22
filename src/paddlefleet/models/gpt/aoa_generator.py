@@ -17,9 +17,13 @@
 :func:`gen_whole_model_aoa` / :func:`gen_whole_model_inv_aoa` forward it to each
 live child through the standard ``Layer.gen_aoa_statements`` /
 ``gen_inv_aoa_statements`` protocol, which is the component dispatch point;
-:func:`_globalize_statements` all-gathers the pipeline-local results into the
+:func:`globalize_statements` all-gathers the pipeline-local results into the
 globally complete config both consumers require. The two directions are
 generated independently.
+
+A model whose regions are rooted at different single-name prefixes needs one
+context per region; that lives in :mod:`aoa_multi_tower`, which reuses the
+context builder and the live-unit walk from here.
 """
 
 from __future__ import annotations
@@ -48,7 +52,22 @@ if TYPE_CHECKING:
 DEFAULT_CHECKPOINT_NAME_PREFIX = "model"
 
 
-def build_aoa_context(model, config) -> AOAContext:
+def _resolved(override, config, attribute, default):
+    """First non-``None`` of the override, the config's declaration, default."""
+    for value in (override, getattr(config, attribute, None), default):
+        if value is not None:
+            return value
+    return default
+
+
+def build_aoa_context(
+    model,
+    config,
+    *,
+    model_name_prefix=None,
+    checkpoint_name_prefix=None,
+    checkpoint_name_mapping=None,
+) -> AOAContext:
     """Builds the read-only ``AOAContext`` for a whole-model pass.
 
     Takes the single-name mapping from the live model's
@@ -56,21 +75,32 @@ def build_aoa_context(model, config) -> AOAContext:
     and the model root from ``_model_name_prefix()``, the value
     ``get_layer_desc_list`` names its pipeline layers with, so pipeline naming
     and AOA name resolution never diverge.
+
+    The three keyword arguments are the per-tower overrides (see
+    :class:`~.aoa_multi_tower.AOATower`); ``None`` means "not overridden" and
+    keeps the single-tower source, so a tower needing only its own model root
+    still inherits the config's checkpoint declarations.
     """
-    if model._pipeline_name_mapping is None:
+    # Keyed off ``_pp_to_single_mapping``, the field this function actually
+    # reads: a model keeping the reverse map under another name (HyperBody's
+    # ``_single_to_pp_mapping``) would fail a check on the field it lacks.
+    if model._pp_to_single_mapping is None:
         model._set_pipeline_name_mapping()
-    # A model declares its own checkpoint-name mapping through
-    # ``aoa_checkpoint_name_mapping``; an absent or ``None`` attribute leaves it
-    # empty, so every name resolves through the identity fallback. The
-    # checkpoint prefix, by contrast, has a shared default.
-    name_mapping = getattr(config, "aoa_checkpoint_name_mapping", None)
-    if name_mapping is None:
-        name_mapping = {}
-    name_prefix = getattr(config, "aoa_checkpoint_name_prefix", None)
-    if name_prefix is None:
-        name_prefix = DEFAULT_CHECKPOINT_NAME_PREFIX
-    checkpoint_name_mapping = dict(name_mapping)
-    model_name_prefix = model._model_name_prefix()
+    # An absent / ``None`` mapping declaration leaves the table empty, so every
+    # name resolves through the identity fallback. The checkpoint prefix, by
+    # contrast, has a shared default.
+    checkpoint_name_mapping = _resolved(
+        checkpoint_name_mapping, config, "aoa_checkpoint_name_mapping", {}
+    )
+    checkpoint_name_prefix = _resolved(
+        checkpoint_name_prefix,
+        config,
+        "aoa_checkpoint_name_prefix",
+        DEFAULT_CHECKPOINT_NAME_PREFIX,
+    )
+    if model_name_prefix is None:
+        model_name_prefix = model._model_name_prefix()
+    checkpoint_name_mapping = dict(checkpoint_name_mapping)
     validate_checkpoint_name_mapping(
         checkpoint_name_mapping,
         model_name_prefix=model_name_prefix,
@@ -80,7 +110,7 @@ def build_aoa_context(model, config) -> AOAContext:
         pp_to_single_mapping=model._pp_to_single_mapping or {},
         model_name_prefix=model_name_prefix,
         checkpoint_name_mapping=checkpoint_name_mapping,
-        checkpoint_name_prefix=name_prefix,
+        checkpoint_name_prefix=checkpoint_name_prefix,
     )
 
 
@@ -110,7 +140,7 @@ def _iter_pipeline_units(model) -> Iterator[tuple[str, object]]:
             yield f"{name}.", unit
 
 
-def _globalize_statements(config, local_statements: list[str]) -> list[str]:
+def globalize_statements(config, local_statements: list[str]) -> list[str]:
     """All-gathers the pipeline-local statements into the whole-model set.
 
     The walk covers only the stage this rank owns, while both consumers need the
@@ -169,6 +199,11 @@ def _iter_unique_units(units) -> Iterator[tuple[str, object]]:
         yield structured_prefix, unit
 
 
+def iter_live_units(model) -> Iterator[tuple[str, object]]:
+    """The deduped live-unit walk both whole-model paths recurse through."""
+    return _iter_unique_units(_iter_pipeline_units(model))
+
+
 def gen_whole_model_aoa(model, ctx) -> dict[str, list[str]]:
     """Whole-model checkpoint->model generation.
 
@@ -178,13 +213,11 @@ def gen_whole_model_aoa(model, ctx) -> dict[str, list[str]]:
     """
     statements = []
     # The boundary owns no parameters, so recursion starts one level down.
-    for structured_prefix, unit in _iter_unique_units(
-        _iter_pipeline_units(model)
-    ):
+    for structured_prefix, unit in iter_live_units(model):
         statements += unit.gen_aoa_statements(
             ctx, structured_name_prefix=structured_prefix
         )
-    return {"aoa_statements": _globalize_statements(ctx.config, statements)}
+    return {"aoa_statements": globalize_statements(ctx.config, statements)}
 
 
 def gen_whole_model_inv_aoa(model, ctx) -> dict[str, list[str]]:
@@ -195,10 +228,8 @@ def gen_whole_model_inv_aoa(model, ctx) -> dict[str, list[str]]:
     """
     statements = []
     # Reverse order mirrors the checkpoint->model pass; cosmetic for statements.
-    for structured_prefix, unit in reversed(
-        list(_iter_unique_units(_iter_pipeline_units(model)))
-    ):
+    for structured_prefix, unit in reversed(list(iter_live_units(model))):
         statements += unit.gen_inv_aoa_statements(
             ctx, structured_name_prefix=structured_prefix
         )
-    return {"aoa_statements": _globalize_statements(ctx.config, statements)}
+    return {"aoa_statements": globalize_statements(ctx.config, statements)}

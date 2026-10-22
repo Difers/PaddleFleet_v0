@@ -51,8 +51,9 @@ class _Cfg:
 class _FakeModel:
     """Duck-types the attributes ``build_aoa_context`` reads.
 
-    ``_pipeline_name_mapping`` is pre-populated (non-None) so the idempotent
-    ``_set_pipeline_name_mapping`` side effect is skipped in the happy path.
+    ``_pp_to_single_mapping`` is pre-populated (non-None) so the idempotent
+    ``_set_pipeline_name_mapping`` side effect is skipped in the happy path; the
+    real method fills both maps in one call, so the fake does too.
     ``_model_name_prefix()`` stands in for the live model's single-name root,
     which is where the context takes it from; the value is held in a separately
     named attribute so it does not shadow the method.
@@ -65,6 +66,7 @@ class _FakeModel:
 
     def _set_pipeline_name_mapping(self):
         self._pipeline_name_mapping = {}
+        self._pp_to_single_mapping = {}
 
     def _model_name_prefix(self):
         return self._model_name_prefix_value
@@ -152,10 +154,14 @@ class TestBuildAOAContextOverrides(unittest.TestCase):
             build_aoa_context(_FakeModel(), cfg)
 
     def test_none_pipeline_mapping_triggers_side_effect(self):
+        # The lazy rebuild is keyed off ``_pp_to_single_mapping`` -- the field
+        # the context actually reads -- not off the reverse map, so a model that
+        # keeps the reverse map under another name (HyperBody's
+        # ``_single_to_pp_mapping``) still works.
         model = _FakeModel()
-        model._pipeline_name_mapping = None
+        model._pp_to_single_mapping = None
         ctx = build_aoa_context(model, _Cfg())
-        self.assertIsNotNone(model._pipeline_name_mapping)
+        self.assertIsNotNone(model._pp_to_single_mapping)
         self.assertIsInstance(ctx, AOAContext)
 
 

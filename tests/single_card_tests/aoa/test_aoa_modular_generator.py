@@ -440,7 +440,7 @@ class TestGatherGuardedOnLivePipelineGroup(unittest.TestCase):
                 paddle.distributed, "all_gather_object", _no_gather
             ),
         ):
-            self.assertEqual(gen._globalize_statements(_Cfg(), local), local)
+            self.assertEqual(gen.globalize_statements(_Cfg(), local), local)
 
     def test_no_group_stays_rank_local(self):
         self._local_only(None)
@@ -459,7 +459,7 @@ class TestGatherGuardedOnLivePipelineGroup(unittest.TestCase):
             mock.patch.object(paddle.distributed, "all_gather_object", _gather),
         ):
             self.assertEqual(
-                gen._globalize_statements(_Cfg(), ["hf.b -> model.b"]),
+                gen.globalize_statements(_Cfg(), ["hf.b -> model.b"]),
                 ["hf.a -> model.a", "hf.b -> model.b"],
             )
 
