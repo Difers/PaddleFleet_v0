@@ -92,6 +92,7 @@ from .token_dispatcher import (
     AllToAllTokenDispatcher,
     MoEFlexTokenDispatcher,
     RingMoETokenDispatcher,
+    _sync_free_metadata_ignores_counts,
     is_hybrid_ep_backend_selected,
 )
 
@@ -1530,15 +1531,28 @@ class MoELayer(nn.Layer):
                 fp8_scale = None
                 if fp8_dispatched_handle is not None:
                     fp8_scale = fp8_dispatched_handle["scale"]
+                # 'allgather' sizes the SonicMoE metadata sync-free, as the
+                # ring does: every rank holds all experts and every gathered
+                # token, so the shape bound T_global * K is exact up to
+                # padding lanes, and it drops the blocking D2H of the counts.
+                sync_free = self.moe_token_dispatcher_type == "allgather"
+                expert_counts = (
+                    None
+                    if sync_free and _sync_free_metadata_ignores_counts()
+                    else tokens_per_expert
+                )
                 hidden_states = self.grouped_gemm_experts(
                     dispatched_hidden_states,
                     dispatched_indices,
                     dispatched_probs,
                     use_fp8,
-                    tokens_per_expert=tokens_per_expert,
+                    tokens_per_expert=expert_counts,
                     fp8_scale=fp8_scale,
                     recompute_moe_gate_up=self.recompute_moe_gate_up,
                     fp8_combine_grad_handle=fp8_combine_grad_handle,
+                    # Only passed when set, so other expert classes keep
+                    # seeing the old call.
+                    **({"sync_free_sizing": True} if sync_free else {}),
                 )
             else:
                 hidden_states = FusionMoePyLayer.apply(

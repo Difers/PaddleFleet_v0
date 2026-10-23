@@ -2345,6 +2345,17 @@ class AllGatherTokenDispatcher(nn.Layer):
         self._global_topk_weights = None
         self._fp8_dispatch_scale = None
         self._overlap_combined = None
+        # The routing mask/cast and the histogram use the ring's Triton
+        # kernels when Triton is available, else their eager equivalents.
+        # Importing any triton_ops submodule runs the package __init__, which
+        # imports triton, so without triton the import itself fails; this
+        # dispatcher must stay usable then, on the eager path.
+        try:
+            from paddlefleet.triton_ops.utils import is_triton_available
+        except ImportError:
+            self._use_triton = False
+        else:
+            self._use_triton = is_triton_available()
 
     def pre_allgather(self, hidden_states: paddle.Tensor):
         """Issue an async AllGather of hidden_states on the comm stream.
@@ -2477,9 +2488,24 @@ class AllGatherTokenDispatcher(nn.Layer):
                 "AllGatherTokenDispatcher requires topk_indices and "
                 "topk_weights to be provided."
             )
+        if self._use_triton:
+            # One fused kernel casts the indices to int32 and the weights to
+            # probs dtype and zeroes the weights (and their grads) of padding
+            # lanes (idx < 0), on the local [T_local, K] pair before the
+            # gathers instead of on the EP-times larger gathered one.
+            from paddlefleet.triton_ops.mask_cast_routing_w import (
+                mask_cast_routing_w,
+            )
+
+            topk_indices_i32, topk_weights = mask_cast_routing_w(
+                topk_indices.detach(), topk_weights, probs.dtype
+            )
+        else:
+            topk_indices_i32 = topk_indices.detach().cast("int32")
+            topk_weights = topk_weights.cast(probs.dtype)
         # AllGather indices as int32 on comm stream (async, no gradient).
         # Issued before weights AllGather so both collectives are in flight.
-        topk_indices_i32 = topk_indices.detach().cast("int32").contiguous()
+        topk_indices_i32 = topk_indices_i32.contiguous()
         if self.moe_group is None or self.moe_group.nranks == 1:
             self._global_topk_indices = topk_indices_i32.clone()
             _idx_task = None
@@ -2498,18 +2524,19 @@ class AllGatherTokenDispatcher(nn.Layer):
             )
         # AllGather router weights on calc stream (has gradient).
         self._global_topk_weights = _RouterAllGather.apply(
-            topk_weights.cast(probs.dtype), self.moe_group
+            topk_weights, self.moe_group
         )
         # Wait for indices AllGather right before its first consumer.
         if _idx_task is not None:
             _idx_task.wait()
-        # Build padding mask and zero corresponding weights.
-        padding_mask = self._global_topk_indices < 0
-        self._global_topk_weights = paddle.where(
-            padding_mask,
-            paddle.zeros_like(self._global_topk_weights),
-            self._global_topk_weights,
-        )
+        if not self._use_triton:
+            # Build padding mask and zero corresponding weights.
+            padding_mask = self._global_topk_indices < 0
+            self._global_topk_weights = paddle.where(
+                padding_mask,
+                paddle.zeros_like(self._global_topk_weights),
+                self._global_topk_weights,
+            )
         self.tokens_per_expert = None
         return global_hidden_states
 
@@ -2541,11 +2568,17 @@ class AllGatherTokenDispatcher(nn.Layer):
     def get_dispatched_routing(self):
         """Return (global_indices, global_weights, tokens_per_expert).
 
-        tokens_per_expert uses a sync-free scatter histogram
-        (:func:`_tokens_per_expert_histogram`) — no GPU->CPU sync, no
-        full one-hot materialization.
+        tokens_per_expert uses a sync-free histogram (the fused Triton
+        kernel when available, else :func:`_tokens_per_expert_histogram`) —
+        no GPU->CPU sync, no full one-hot materialization.
         """
-        tokens_per_expert = _tokens_per_expert_histogram(
+        if self._use_triton:
+            from paddlefleet.triton_ops.tokens_per_expert_hist import (
+                tokens_per_expert_histogram_triton as histogram,
+            )
+        else:
+            histogram = _tokens_per_expert_histogram
+        tokens_per_expert = histogram(
             self._global_topk_indices, self.num_experts
         )
         return (

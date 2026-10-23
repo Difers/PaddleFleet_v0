@@ -194,5 +194,82 @@ class HybridEPBackendSelectionTest(unittest.TestCase):
         self.assertTrue(td.is_hybrid_ep_backend_selected("hybridep"))
 
 
+@unittest.skipUnless(_HAVE_DEPS, _SKIP_REASON)
+class AllGatherDispatcherWithoutTritonTest(unittest.TestCase):
+    """Without triton the AllGather dispatcher still builds and routes eagerly.
+
+    Importing anything under ``paddlefleet.triton_ops`` imports triton, so a
+    triton-free environment is simulated by blocking ``triton`` in
+    ``sys.modules`` and dropping the already-imported ``triton_ops`` modules.
+    """
+
+    def _without_triton(self):
+        from unittest import mock
+
+        # ``None`` entries make the import raise ImportError, as importing
+        # triton_ops does without triton. The package and ``utils`` are
+        # blocked by name: a failed package import can leave already-loaded
+        # submodules cached, which would let a later import succeed.
+        blocked = {
+            "triton": None,
+            "paddlefleet.triton_ops": None,
+            "paddlefleet.triton_ops.utils": None,
+        }
+        for name in list(sys.modules):
+            if name.startswith("paddlefleet.triton_ops."):
+                blocked[name] = None
+        return mock.patch.dict(sys.modules, blocked)
+
+    def test_builds_and_routes_on_eager_path(self):
+        from unittest import mock
+
+        with self._without_triton():
+            with self.assertRaises(ImportError):
+                import paddlefleet.triton_ops.utils  # noqa: F401
+            disp = td.AllGatherTokenDispatcher(
+                moe_group=None,
+                expert_model_parallel_size=1,
+                num_experts=4,
+            )
+            self.assertFalse(disp._use_triton)
+
+            # Single rank: the token gather is the identity; the routing
+            # cast/mask and the histogram must take the eager path.
+            idx = paddle.to_tensor([[0, 3], [2, -1], [-1, 1]], dtype="int64")
+            w = paddle.to_tensor(
+                [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype="float32"
+            )
+            w.stop_gradient = False
+            probs = paddle.zeros([3, 4], dtype="bfloat16")
+            x = paddle.ones([3, 8], dtype="bfloat16")
+            with mock.patch.object(
+                td.AllGatherGroupOp, "apply", lambda t, g: t
+            ):
+                disp.dispatch_preprocess(
+                    x, probs, None, topk_weights=w, topk_indices=idx
+                )
+            g_idx, g_w, counts = disp.get_dispatched_routing()
+
+        self.assertEqual(g_idx.dtype, paddle.int32)
+        self.assertEqual(g_w.dtype, paddle.bfloat16)
+        np.testing.assert_array_equal(
+            g_idx.numpy(), np.array([[0, 3], [2, -1], [-1, 1]])
+        )
+        # Padding lanes carry a zero weight; the rest keep theirs.
+        np.testing.assert_allclose(
+            g_w.astype("float32").numpy(),
+            np.array([[0.1, 0.2], [0.3, 0.0], [0.0, 0.6]], dtype="float32"),
+            rtol=1e-2,
+        )
+        # Hand-derived counts per expert, padding dropped.
+        np.testing.assert_array_equal(counts.numpy(), np.array([1, 1, 1, 1]))
+        # Grads reach only the real lanes.
+        g_w.astype("float32").sum().backward()
+        np.testing.assert_array_equal(
+            w.grad.numpy(),
+            np.array([[1, 1], [1, 0], [0, 1]], dtype="float32"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
