@@ -28,8 +28,7 @@ collectives (CP / TP sizes are patched where a guard reads them):
   * ``LanguageLoss.forward`` without MTP and with MTP (use_erndata per-doc
     roll), including the MTP renormalisation to ``lm_tok / mtp_tok`` and the
     display stats from ``_record_per_token_display``;
-  * ``MainLanguageLoss`` / ``MTPLanguageLoss`` separate head-loss classes;
-  * ``ContextParallelScatterOp.backward`` 1/cp grad scaling switch.
+  * ``MainLanguageLoss`` / ``MTPLanguageLoss`` separate head-loss classes.
 
 Expected values come from independent NumPy cross-entropy, never from the code
 under test.
@@ -45,7 +44,6 @@ import numpy as np
 import paddle
 import paddle.nn.functional as F
 
-import paddlefleet.context_parallel_utils as cpu_mod
 import paddlefleet.models.common.language_loss.language_loss as ll_mod
 from paddlefleet.models.common.language_loss.language_loss import (
     LanguageLoss,
@@ -840,53 +838,6 @@ class TestSeparateHeadLoss(_Base):
                 float(out["mtp_loss"][d]), ref_sum, rtol=1e-5
             )
         self.assertEqual(_pop_count(), 0)
-
-
-class TestCPScatterGradScale(unittest.TestCase):
-    """``ContextParallelScatterOp.backward`` divides by cp only when both the
-    call site opts in and the global per-token switch is on."""
-
-    def setUp(self):
-        self.prev_device = paddle.get_device()
-        paddle.set_device("cpu")
-
-    def tearDown(self):
-        cpu_mod.set_per_token_grad_scale(False)
-        paddle.set_device(self.prev_device)
-
-    def _backward(self, mode, scale_grad_by_cp, nranks=4):
-        ctx = SimpleNamespace(
-            mode=mode,
-            axis=1,
-            group=SimpleNamespace(nranks=nranks),
-            scale_grad_by_cp=scale_grad_by_cp,
-        )
-        identity = lambda g, group=None, axis=0: g
-        with (
-            mock.patch.object(cpu_mod, "all_gather_balance", identity),
-            mock.patch.object(cpu_mod, "all_gather_contiguous", identity),
-        ):
-            grad = paddle.full([1, 4, 2], 8.0, dtype="float32")
-            return float(
-                cpu_mod.ContextParallelScatterOp.backward(ctx, grad).mean()
-            )
-
-    def test_switch_toggles(self):
-        cpu_mod.set_per_token_grad_scale(1)
-        self.assertIs(cpu_mod._per_token_grad_scale_enabled(), True)
-        cpu_mod.set_per_token_grad_scale(0)
-        self.assertIs(cpu_mod._per_token_grad_scale_enabled(), False)
-
-    def test_scaling_matrix(self):
-        for mode in ("dualchunk_allgather", "contiguous_allgather"):
-            with self.subTest(mode=mode):
-                cpu_mod.set_per_token_grad_scale(False)
-                self.assertEqual(self._backward(mode, True), 8.0)
-                cpu_mod.set_per_token_grad_scale(True)
-                self.assertEqual(self._backward(mode, False), 8.0)
-                self.assertEqual(self._backward(mode, True), 2.0)
-                # A single-rank group is never rescaled.
-                self.assertEqual(self._backward(mode, True, nranks=1), 8.0)
 
 
 if __name__ == "__main__":

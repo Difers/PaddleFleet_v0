@@ -1661,10 +1661,7 @@ class MultiTokenPredictionLayer(FleetLayer):
                 ]
 
                 # CP/SP scatter, mirroring what GPTEmbedding does per chunk
-                # Embedding output, see ContextParallelScatterOp.
-                decoder_input = to_cp_local(
-                    decoder_input, self.config, scale_grad_by_cp=True
-                )
+                decoder_input = to_cp_local(decoder_input, self.config)
                 if self.config.sequence_parallel:
                     batch_size, local_seq_len, hidden_size = decoder_input.shape
                     decoder_input = decoder_input.reshape(

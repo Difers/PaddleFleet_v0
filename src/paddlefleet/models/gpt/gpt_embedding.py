@@ -634,10 +634,7 @@ class GPTEmbedding(FleetLayer):
 
                         # Apply the same SP scatter as the non-magic-send path to ensure
                         # bit-for-bit identical main embedding output.
-                        # Embedding output, see ContextParallelScatterOp.
-                        decoder_input = to_cp_local(
-                            decoder_input, self.config, scale_grad_by_cp=True
-                        )
+                        decoder_input = to_cp_local(decoder_input, self.config)
                         if (
                             self.config.gpt_model_use_experimental_version
                             and self.config.sequence_parallel
@@ -676,10 +673,7 @@ class GPTEmbedding(FleetLayer):
                             inputs_embeds.shape
                         )
 
-                        # Embedding output, see ContextParallelScatterOp.
-                        inputs_embeds = to_cp_local(
-                            inputs_embeds, self.config, scale_grad_by_cp=True
-                        )
+                        inputs_embeds = to_cp_local(inputs_embeds, self.config)
 
                         if self.sequence_parallel:
                             inputs_embeds = inputs_embeds.reshape(
@@ -715,11 +709,8 @@ class GPTEmbedding(FleetLayer):
                                     axis=1,
                                 )
 
-                            # Embedding output, see ContextParallelScatterOp.
                             inputs_embeds_mtp = to_cp_local(
-                                inputs_embeds_mtp,
-                                self.config,
-                                scale_grad_by_cp=True,
+                                inputs_embeds_mtp, self.config
                             )
 
                             if self.sequence_parallel:
@@ -801,10 +792,7 @@ class GPTEmbedding(FleetLayer):
                         f"{cp_shard_source(self.config)!r}). Set "
                         "sequence_parallel=False."
                     )
-                # Embedding output, see ContextParallelScatterOp.
-                decoder_input = to_cp_local(
-                    decoder_input, self.config, scale_grad_by_cp=True
-                )
+                decoder_input = to_cp_local(decoder_input, self.config)
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
