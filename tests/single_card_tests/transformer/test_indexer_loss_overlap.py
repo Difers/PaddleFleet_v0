@@ -1412,6 +1412,14 @@ class _BranchOwner:
     def _indexer_loss_mask(self, input_ids, batch, seqlen):
         return self._loss_mask, self._valid_rows
 
+    def _log_indexer_loss(self, loss):
+        # Same contract as the layer's, minus the CP reduction (CP=1 here).
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss.detach().clone(),
+            layer_number=self.layer_number,
+            num_layers=self.config.num_hidden_layers,
+        )
+
 
 class TestDeferredBranchArithmetic(unittest.TestCase):
     """``_run_indexer_loss_branch`` without the sparse forward in front of it.

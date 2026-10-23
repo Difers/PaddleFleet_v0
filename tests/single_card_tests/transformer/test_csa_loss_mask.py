@@ -281,6 +281,102 @@ class TestTransformerLayerInputIdsRouting(unittest.TestCase):
         self.assertNotIn("input_ids", extra_kwargs)
 
 
+class _RecordingAttention(paddle.nn.Layer):
+    """Records the kwargs the mHC layer hands its attention."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, hidden, **kwargs):
+        self.seen = kwargs
+        return paddle.zeros([1, 4, 8]), None
+
+
+class TestHyperConnectionInputIdsRouting(unittest.TestCase):
+    """The mHC layer must forward ``input_ids`` to the MLA core.
+
+    ``HyperConnectionTransformerLayer._forward_attention`` overrides the base
+    routing and used to omit ``MultiLatentAttention`` from its isinstance
+    tuple. On a ``-2`` (latent MQA) layer that left ``MQALatentAttention``'s
+    ``input_ids`` at ``None``, so ``_indexer_loss_mask`` returned
+    ``(None, None)`` and the indexer KL silently took the unmasked row mean,
+    padding included. The mHC machinery is stubbed: only the kwarg hand-off is
+    under test.
+    """
+
+    def _layer_with(self, attn):
+        from paddlefleet.transformer.transformer_config import (
+            TransformerConfig,
+        )
+        from paddlefleet.transformer.transformer_layer import (
+            HyperConnectionTransformerLayer,
+            IdentityFuncOp,
+            TransformerLayerSublayersSpec,
+        )
+
+        from .hybrid_mla_utils import _FakePGCollection
+
+        cfg = TransformerConfig(
+            num_hidden_layers=2, hidden_size=8, num_attention_heads=1
+        )
+        spec = TransformerLayerSublayersSpec(
+            self_attention_hyper_connection=IdentityFuncOp,
+            mlp_hyper_connection=IdentityFuncOp,
+        )
+        layer = HyperConnectionTransformerLayer(
+            config=cfg,
+            sublayers_spec=spec,
+            layer_number=1,
+            pg_collection=_FakePGCollection(),
+        )
+        layer.self_attn = attn
+        layer._mhc_head = lambda *a, **k: (
+            paddle.zeros([1, 4, 8]),
+            None,
+            None,
+            None,
+        )
+        layer._mhc_layernorm = lambda norm, x, *a, **k: x
+        layer._fused_h_res_h_post_bda = lambda *a, **k: (
+            paddle.zeros([1, 4, 8]),
+            None,
+        )
+        return layer
+
+    def test_mla_core_receives_input_ids(self):
+        from paddlefleet.transformer.multi_latent_attention import (
+            MultiLatentAttention,
+        )
+
+        class _MLA(_RecordingAttention, MultiLatentAttention):
+            # ``isinstance`` is what the routing rule reads; the heavy
+            # ``MultiLatentAttention.__init__`` is deliberately skipped.
+            def __init__(self):
+                paddle.nn.Layer.__init__(self)
+                self.seen = None
+
+            def get_query_key_value_tensors(self, *a, **k):
+                raise NotImplementedError
+
+        attn = _MLA()
+        layer = self._layer_with(attn)
+        input_ids = paddle.to_tensor([[1, 2, 3, 0]])
+        layer._forward_attention(paddle.zeros([1, 4, 8]), input_ids=input_ids)
+
+        self.assertIsNotNone(attn.seen)
+        self.assertIs(attn.seen.get("input_ids"), input_ids)
+
+    def test_other_attention_does_not_receive_input_ids(self):
+        attn = _RecordingAttention()
+        layer = self._layer_with(attn)
+        input_ids = paddle.to_tensor([[1, 2, 3, 0]])
+        layer._forward_attention(paddle.zeros([1, 4, 8]), input_ids=input_ids)
+
+        self.assertIsNotNone(attn.seen)
+        self.assertNotIn("input_ids", attn.seen)
+
+
 # =========================================================================
 # Test: CompressedSparseAttention.forward loss_mask computation from input_ids
 # =========================================================================

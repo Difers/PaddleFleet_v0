@@ -490,6 +490,37 @@ class TestWarmupCP(_CPChecks):
             "test_4 is width-blind",
         )
 
+    @H.U._GPU
+    def test_6_per_token_indexer_grads_sum_to_the_cp1_value(self):
+        """Per-token: the CP shards must *add up*, not average.
+
+        Per-token turns the in-graph indexer loss into a raw row sum
+        (``num_rows_override=1.0``, and no ``/cp`` on the unmasked branch), so
+        the CP group's SUM of parameter gradients is the single-rank
+        ``coeff * sum(dKL)`` -- the same quantity the CP=1 reference produces.
+        Any surviving ``/cp`` or ``1/(b*s)`` shows up here as an O(cp) or
+        O(b*s) ``param_err``. The logged scalar is deliberately *not* changed
+        by the mode, so ``test_4``'s loss-sum assertion still holds.
+        """
+        for sparse in (False, True):
+            for masked in (True, False):
+                with self.subTest(sparse_loss=sparse, masked=masked):
+                    tag = f"per-token/sparse={sparse}/masked={masked}"
+                    res = H.run_core_cp(
+                        "mqa_dsa",
+                        _STRADDLE,
+                        loss_coeff=0.1,
+                        with_input_ids=masked,
+                        sparse_loss=sparse,
+                        per_token=True,
+                    )
+                    self.assertTrue(
+                        any(n.startswith("indexer.") for n in res["param_err"]),
+                        f"{tag}: the indexer received no gradient",
+                    )
+                    self._check(res, tag)
+                    self._assert_loss_cp_sum(res, tag)
+
 
 class TestPadRowsCP(_CPChecks):
     """``[475] @ s=512``: 37 real pad rows, all on the last CP rank.

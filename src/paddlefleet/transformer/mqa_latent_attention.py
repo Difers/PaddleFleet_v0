@@ -169,6 +169,43 @@ _KL_CHUNK_ELEMS = 1 << 26
 logger = logging.getLogger(__name__)
 
 
+def per_token_indexer_num_rows(config, valid_rows):
+    """Backward row count for the indexer loss in per-token mode.
+
+    Per-token mode wants the in-graph indexer loss to be a **raw sum over this
+    rank's rows**: the trainer then divides every parameter gradient by
+    ``T_global`` exactly once, at the step boundary, the same way it does for
+    the LM loss (and the way ``moe_router``'s aux/z losses do it). Returning
+    ``1.0`` removes every other denominator, including the backward kernels'
+    ``1/(b*s)`` fallback that would otherwise apply when ``valid_rows`` is
+    ``None`` (no ``input_ids`` reached the layer).
+
+    Legacy mode keeps ``valid_rows`` -- and therefore ``None`` when there is no
+    mask, which leaves the kernel's own mean in place.
+    """
+    if getattr(config, "calculate_per_token_loss", False):
+        return 1.0
+    return valid_rows
+
+
+def per_token_indexer_backward_coeff(config, loss_coeff, cp_size, has_mask):
+    """Backward coefficient for the indexer loss.
+
+    The unmasked branch folds ``/cp_size`` into ``loss_coeff`` because CP
+    *sums* parameter gradients while the legacy reduction is a per-row mean
+    over the CP-global row count. Per-token mode instead lets the CP shards sum
+    into the trainer's ``1/T_global``, so that ``/cp_size`` has to be undone.
+
+    The masked branch already carries no CP division -- its denominator is the
+    global valid-row count -- and the logged loss keeps the legacy coefficient
+    on both branches either way (the auto-scaler never consumes the loss
+    scalar).
+    """
+    if getattr(config, "calculate_per_token_loss", False) and not has_mask:
+        return loss_coeff * cp_size
+    return loss_coeff
+
+
 def _dense_pylayer_inputs(
     query: Tensor, key: Tensor, value: Tensor, sink: Tensor | None
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
@@ -1493,6 +1530,13 @@ class MQALatentAttention(FleetLayer):
                 loss = kl.mean() * loss_coeff
             else:
                 loss = (kl * loss_mask).sum() / valid_rows * loss_coeff
+            # Per-token: the in-graph loss has to be a raw row sum so the
+            # trainer's single ``1/T_global`` is the only divisor. The logged
+            # ``loss`` above keeps the legacy mean on purpose.
+            bwd_loss_coeff = per_token_indexer_backward_coeff(
+                self.config, loss_coeff, self.cp_size, loss_mask is not None
+            )
+            bwd_num_rows = per_token_indexer_num_rows(self.config, valid_rows)
 
         self._log_indexer_loss(loss)
         return TileLangCSAIndexerLossAutoScaler.apply(
@@ -1503,9 +1547,9 @@ class MQALatentAttention(FleetLayer):
             index_k,
             columns,
             probs,
-            loss_coeff,
+            bwd_loss_coeff,
             "tilelang",
-            valid_rows,
+            bwd_num_rows,
             loss_mask,
         )
 
@@ -1640,6 +1684,13 @@ class MQALatentAttention(FleetLayer):
         # indexer, while the coverage fleet is SM90/A100/H20. Excluded rather
         # than counted as missing; the other three call sites are covered.
         self._log_indexer_loss(loss)  # pragma: no cover
+        # Per-token: the backward has to be a raw row sum, and the kernel's
+        # hardcoded ``/ total_q`` is re-pointed at that denominator below. The
+        # forward ``loss`` above keeps the legacy mean.
+        bwd_num_rows = per_token_indexer_num_rows(self.config, num_rows)
+        bwd_coeff = per_token_indexer_backward_coeff(
+            self.config, coeff, self.cp_size, loss_mask is not None
+        )
         plan = DenseWarmupKLPlan(
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
@@ -1650,7 +1701,7 @@ class MQALatentAttention(FleetLayer):
             # inside the kernel, so pre-multiply to land on the ``/ num_rows``
             # this forward actually used. Same compensation as
             # ``csa_attention.py:1338-1349``.
-            loss_coeff=coeff * s_local / num_rows,
+            loss_coeff=bwd_coeff * s_local / bwd_num_rows,
             softmax_scale=self.softmax_scale,
         )
         return DenseWarmupIndexerLossAutoScaler.apply(
@@ -2415,6 +2466,13 @@ class MQALatentAttention(FleetLayer):
                 loss = kl_per_pos.mean() * loss_coeff
             else:
                 loss = (kl_per_pos * loss_mask).sum() / valid_rows * loss_coeff
+            # Per-token: swap the mean denominators above for a raw row sum, so
+            # the trainer's single ``1/T_global`` is the only divisor. The
+            # logged ``loss`` keeps the legacy mean.
+            bwd_loss_coeff = per_token_indexer_backward_coeff(
+                self.config, loss_coeff, self.cp_size, loss_mask is not None
+            )
+            bwd_num_rows = per_token_indexer_num_rows(self.config, valid_rows)
 
         self._log_indexer_loss(loss)
         # Argument order follows ``TileLangCSAIndexerLossAutoScaler.forward``
@@ -2431,13 +2489,14 @@ class MQALatentAttention(FleetLayer):
             k_idx,
             topk_indices,
             topk_probs,
-            loss_coeff,
+            bwd_loss_coeff,
             self.indexer_backend,
             # ``num_rows_override`` + ``loss_mask``: the backward zeroes the pad
             # rows and rescales the cuDNN kernel's built-in ``1/(B*Sq)`` into
             # ``1/valid_rows``, matching the forward reduction above. Both
             # ``None`` (no ``input_ids``) leaves the kernel's own mean in place.
-            valid_rows,
+            # Per-token passes ``1.0`` (raw row sum).
+            bwd_num_rows,
             loss_mask,
         )
 
@@ -2498,6 +2557,12 @@ class MQALatentAttention(FleetLayer):
                 loss = kl_per_pos.mean() * loss_coeff
             else:
                 loss = (kl_per_pos * loss_mask).sum() / valid_rows * loss_coeff
+            # Same per-token swap as the inline path: raw row sum for the
+            # gradient, legacy mean for the logged scalar.
+            bwd_loss_coeff = per_token_indexer_backward_coeff(
+                self.config, loss_coeff, self.cp_size, loss_mask is not None
+            )
+            bwd_num_rows = per_token_indexer_num_rows(self.config, valid_rows)
 
         grad_q, grad_weights, grad_k = compute_csa_indexer_grads(
             work.index_q,
@@ -2506,9 +2571,9 @@ class MQALatentAttention(FleetLayer):
             target,
             topk_probs,
             work.topk_indices,
-            loss_coeff=loss_coeff,
+            loss_coeff=bwd_loss_coeff,
             indexer_backend=self.indexer_backend,
-            num_rows=valid_rows,
+            num_rows=bwd_num_rows,
             loss_mask=loss_mask,
         )
 

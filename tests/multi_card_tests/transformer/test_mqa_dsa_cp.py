@@ -139,7 +139,15 @@ def tearDownModule():
     _FA4_PIN.__exit__(None, None, None)
 
 
-def _build(mode, cp_group, loss_coeff=0.0, sink=None, sparse_loss=True, seed=7):
+def _build(
+    mode,
+    cp_group,
+    loss_coeff=0.0,
+    sink=None,
+    sparse_loss=True,
+    seed=7,
+    per_token=False,
+):
     """CP=1 reference (``cp_group is None``) or CP layer, identical weights."""
     cfg = U._create_mqa_config(mode=mode, loss_coeff=loss_coeff)
     cfg.dsa_indexer_use_sparse_loss = sparse_loss
@@ -149,6 +157,9 @@ def _build(mode, cp_group, loss_coeff=0.0, sink=None, sparse_loss=True, seed=7):
     # (same branch as csa_attention.py:2419-2428).
     cfg.experimental_dataflow = True
     cfg.pad_token_id = 0
+    # Assigned after construction: this fixture deliberately bypasses
+    # ``__post_init__`` (see ``_create_mqa_config``).
+    cfg.calculate_per_token_loss = per_token
     cfg.context_parallel_size = 1 if cp_group is None else cp_group.nranks
     paddle.seed(seed)
     return U._build_module(
@@ -243,6 +254,7 @@ def run_core_cp(
     with_input_ids=False,
     sparse_loss=True,
     row_end=None,
+    per_token=False,
 ):
     """CP=1 reference then CP layer, on the same global batch.
 
@@ -263,8 +275,15 @@ def run_core_cp(
     inp = _inputs(s_global)
     ids = _input_ids(s_global) if with_input_ids else None
 
-    ref = _build(mode, None, loss_coeff, sink, sparse_loss)
-    cpl = _build(mode, CP_GROUP, loss_coeff, sink, sparse_loss)
+    ref = _build(mode, None, loss_coeff, sink, sparse_loss, per_token=per_token)
+    cpl = _build(
+        mode,
+        CP_GROUP,
+        loss_coeff,
+        sink,
+        sparse_loss,
+        per_token=per_token,
+    )
     cpl.set_state_dict(ref.state_dict())
 
     U._CAPTURED.clear()

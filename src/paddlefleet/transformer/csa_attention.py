@@ -1445,10 +1445,17 @@ def compute_csa_indexer_grads(
 
     ``num_rows`` defaults to ``target.shape[0] * target.shape[1]``, i.e. the
     kernel's own ``1/(B*Sq)``. Passing the global valid-row count together with
-    ``loss_mask`` reproduces the masked reduction of the forward.
+    ``loss_mask`` reproduces the masked reduction of the forward. Passing an
+    explicit ``num_rows`` *without* a mask (the ``calculate_per_token_loss``
+    raw-sum path, which uses ``1.0``) is honoured as well: the cuDNN kernel's
+    built-in ``1/(B*Sq)`` is compensated for it exactly like it is for the
+    masked branch.
     """
     if num_rows is None:
         num_rows = float(target.shape[0] * target.shape[1])
+        num_rows_given = False
+    else:
+        num_rows_given = True
 
     scale = DSAIndexerLossAutoScaler._main_loss_backward_scale
 
@@ -1474,12 +1481,14 @@ def compute_csa_indexer_grads(
             bwd_target = target * lm
             bwd_topk_probs = topk_probs * lm
 
-        # cuDNN kernel internally divides by (B * S_q). When loss_mask is
-        # provided, we want 1/global_valid_count instead. Compensate by
+        # cuDNN kernel internally divides by (B * S_q). When a denominator is
+        # supplied -- the masked branch's global valid count, or per-token's
+        # raw-sum ``1.0`` -- we want ``1/num_rows`` instead. Compensate by
         # scaling loss_coeff so the kernel's internal division yields the
-        # correct normalization.
+        # correct normalization. A ``num_rows`` that was never given (legacy
+        # unmasked) already defaults to ``B*Sq`` and needs no compensation.
         cudnn_loss_coeff = loss_coeff
-        if loss_mask is not None:
+        if loss_mask is not None or num_rows_given:
             B_Sq = float(target.shape[0] * target.shape[1])
             cudnn_loss_coeff = loss_coeff * B_Sq / max(num_rows, 1.0)
 
@@ -3844,6 +3853,17 @@ class CompressedSparseAttention(FleetLayer):
                 weights_for_loss = weights_indexer * self.indexer.softmax_scale
                 mask_for_loss = causal_mask.unsqueeze(1)
 
+                # ``FusedDSAIndexerLoss``' backward hard-codes ``/(B*Sq)``;
+                # per-token support is implemented only for
+                # ``TileLangCSAIndexerLossAutoScaler``. Fail loudly rather than
+                # silently mis-scaling (see
+                # ``TransformerConfig.__post_init__``).
+                assert not getattr(
+                    self.config, "calculate_per_token_loss", False
+                ), (
+                    "calculate_per_token_loss is not supported on the "
+                    "FusedDSAIndexerLoss (CSA indexer) path"
+                )
                 indexer_loss = FusedDSAIndexerLoss.apply(
                     q_indexer,
                     weights_for_loss,
@@ -4274,6 +4294,13 @@ class CompressedSparseAttention(FleetLayer):
                 )
                 weights_for_loss = (
                     weights_indexer_bf * self.indexer.softmax_scale
+                )
+                # See the unfused branch above: not ported to per-token.
+                assert not getattr(
+                    self.config, "calculate_per_token_loss", False
+                ), (
+                    "calculate_per_token_loss is not supported on the "
+                    "FusedDSAIndexerLoss (CSA indexer) path"
                 )
                 indexer_loss = FusedDSAIndexerLoss.apply(
                     q_indexer_bf,
@@ -4793,6 +4820,14 @@ class CompressedSparseAttention(FleetLayer):
             indexcache_producer_loss_fused,
         )
         if indexcache_served_loss_state is not None:
+            # Index-cache served/distill losses keep their legacy
+            # normalization; per-token is not implemented for them.
+            assert not getattr(
+                self.config, "calculate_per_token_loss", False
+            ), (
+                "calculate_per_token_loss is not supported with "
+                "index-cache served/distill losses"
+            )
             output = IndexCacheServedDistillLossAutoScaler.apply(
                 output, *indexcache_served_loss_state
             )
@@ -5275,6 +5310,14 @@ class CompressedSparseAttention(FleetLayer):
             indexcache_producer_loss_fused,
         )
         if indexcache_served_loss_state is not None:
+            # Index-cache served/distill losses keep their legacy
+            # normalization; per-token is not implemented for them.
+            assert not getattr(
+                self.config, "calculate_per_token_loss", False
+            ), (
+                "calculate_per_token_loss is not supported with "
+                "index-cache served/distill losses"
+            )
             output = IndexCacheServedDistillLossAutoScaler.apply(
                 output, *indexcache_served_loss_state
             )

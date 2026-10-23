@@ -325,12 +325,17 @@ class TestPerTokenLossValidation(unittest.TestCase):
                 sequence_parallel=True,
             )
 
-    def test_rejects_csa_compress_ratios(self):
-        with self.assertRaisesRegex(ValueError, "csa_compress_ratios"):
+    def test_rejects_real_csa_indexer(self):
+        # 1 < ratio < 128 with csa_dense_mode=False is the condition under
+        # which csa_attention.py actually builds a CSAIndexer, and that path's
+        # per-token normalisation is not implemented.
+        with self.assertRaisesRegex(ValueError, "real CSA indexer"):
             _make_config(
-                calculate_per_token_loss=True, csa_compress_ratios=[0, 0]
+                calculate_per_token_loss=True,
+                csa_compress_ratios=[4],
+                csa_dense_mode=False,
             )
-        with self.assertRaisesRegex(ValueError, "csa_compress_ratios"):
+        with self.assertRaisesRegex(ValueError, "real CSA indexer"):
             _make_config(
                 calculate_per_token_loss=True, csa_compress_ratios=[-2, 4]
             )
@@ -357,6 +362,25 @@ class TestPerTokenLossValidation(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "pipeline parallel"),
             ):
                 _make_config(calculate_per_token_loss=True, **kwargs)
+
+    def test_allows_hca_only_and_dsa_layers(self):
+        # 128 = HCA (no indexer), -2 = latent MQA/DSA (supported through
+        # TileLangCSAIndexerLossAutoScaler). This is the production layout.
+        cfg = _make_config(
+            calculate_per_token_loss=True,
+            csa_compress_ratios=[128, 128, -2],
+            csa_dense_mode=False,
+        )
+        self.assertTrue(cfg.calculate_per_token_loss)
+
+    def test_allows_csa_ratios_in_dense_mode(self):
+        # csa_dense_mode=True builds no CSA indexer at all, so any ratio passes.
+        cfg = _make_config(
+            calculate_per_token_loss=True,
+            csa_compress_ratios=[4, 128],
+            csa_dense_mode=True,
+        )
+        self.assertTrue(cfg.calculate_per_token_loss)
 
     def test_plain_layout_accepted(self):
         cfg = _make_config(calculate_per_token_loss=True)

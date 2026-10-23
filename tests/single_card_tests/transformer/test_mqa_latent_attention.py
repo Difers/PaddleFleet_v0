@@ -1099,6 +1099,103 @@ class TestMQADSA(unittest.TestCase):
         # 0/3/4/7/11 (two-doc layout is bit-reproducible); delta 2e-3 -> 5e-4.
         self.assertAlmostEqual(loss_512 / loss_448, 1.0, delta=5e-4)
 
+    def test_per_token_loss_keeps_the_logged_kl_and_sums_the_gradient(self):
+        """Per-token: same logged KL, ``#rows``x the indexer gradient.
+
+        The trainer divides every parameter gradient by ``T_global`` once, at
+        the step boundary, under per-token mode. The indexer loss must therefore
+        enter the graph as a **raw sum over this rank's rows** -- the same
+        convention as the MoE router aux/z losses -- while the *logged* scalar
+        stays the legacy per-row mean so the curve is comparable.
+
+        Two modules with the same weights run on the same batch, one in each
+        mode: the tracked losses must match, and the indexer gradient must grow
+        by exactly the legacy denominator (``b*s = seqlen`` here: ``b == 1`` and
+        no ``input_ids``, so ``valid_rows`` is ``None`` and the backward falls
+        back to ``b*s``).
+        """
+        seqlen = WINDOW + INDEX_TOPK
+        query, key, w_v, x, qr = self._inputs(seqlen, seed=5)
+
+        def run(per_token, state=None):
+            config = _create_mqa_config("mqa_dsa", loss_coeff=0.01)
+            # Assigned after construction: this fixture bypasses
+            # ``__post_init__`` on purpose (same convention as
+            # ``_create_mqa_config`` itself).
+            config.calculate_per_token_loss = per_token
+            module = _build_module(config, bf16=True)
+            if state is not None:
+                module.set_state_dict(state)
+            module.train()
+            DSAIndexerLossLoggingHelper.tracker.clear()
+            tensors = [t.clone() for t in (query, key, x, qr)]
+            for tensor in tensors:
+                tensor.stop_gradient = False
+            out = module(
+                tensors[0],
+                tensors[1],
+                None,
+                None,
+                _row_end([seqlen], seqlen),
+                v_b_proj_weight=w_v,
+                x=tensors[2],
+                qr=tensors[3],
+            )
+            out.cast("float32").sum().backward()
+            loss = float(DSAIndexerLossLoggingHelper.tracker["values"][0])
+            grad = module.indexer.wq_b.linear.weight.grad.cast(
+                "float32"
+            ).clone()
+            return loss, grad, module.state_dict()
+
+        loss_legacy, grad_legacy, state = run(False)
+        loss_pt, grad_pt, _ = run(True, state)
+
+        self.assertGreater(loss_legacy, 0.0)
+        self.assertAlmostEqual(loss_pt / loss_legacy, 1.0, delta=1e-6)
+        ratio = float(grad_pt.norm()) / float(grad_legacy.norm())
+        self.assertAlmostEqual(ratio / float(seqlen), 1.0, delta=1e-4)
+
+    def test_masked_and_unmasked_indexer_loss_agree_on_dense_batches(self):
+        """Phase 1b is a no-op when the batch has no pad rows.
+
+        ``HyperConnectionTransformerLayer`` now hands ``input_ids`` to the MLA
+        core, so the masked branch runs in production. On a batch whose
+        ``input_ids`` are all real tokens the mask is all ones and the two
+        reductions (``mean`` vs ``sum / global_valid_rows``) must coincide --
+        the padding-only behaviour change is the one the ratio test measures.
+        """
+        seqlen = WINDOW + INDEX_TOPK
+        query, key, w_v, x, qr = self._inputs(seqlen, seed=6)
+
+        def run(with_input_ids):
+            DSAIndexerLossLoggingHelper.tracker.clear()
+            tensors = [t.clone() for t in (query, key, x, qr)]
+            for tensor in tensors:
+                tensor.stop_gradient = False
+            input_ids = None
+            if with_input_ids:
+                # 1 = real token (``config.pad_token_id`` defaults to 0).
+                input_ids = paddle.ones([1, seqlen], dtype="int64")
+            self.module.train()
+            out = self.module(
+                tensors[0],
+                tensors[1],
+                None,
+                None,
+                _row_end([seqlen], seqlen),
+                v_b_proj_weight=w_v,
+                x=tensors[2],
+                qr=tensors[3],
+                input_ids=input_ids,
+            )
+            out.cast("float32").sum().backward()
+            return float(DSAIndexerLossLoggingHelper.tracker["values"][0])
+
+        masked, unmasked = run(True), run(False)
+        self.assertGreater(unmasked, 0.0)
+        self.assertAlmostEqual(masked / unmasked, 1.0, delta=1e-5)
+
     def test_use_sparse_loss_switches_both_attention_and_loss_width(self):
         """``dsa_indexer_use_sparse_loss`` picks the whole training phase.
 

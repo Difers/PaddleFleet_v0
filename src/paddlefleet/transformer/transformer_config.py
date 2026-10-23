@@ -2512,14 +2512,25 @@ class TransformerConfig(ModelParallelConfig):
                     "yet. Got calculate_per_token_loss=True, use_erndata="
                     f"{self.use_erndata}; set use_erndata=False."
                 )
-            # All -2 (MLA) builds no CSA/HCA layer, so only that layout is allowed.
-            if self.csa_compress_ratios is not None and not all(
-                int(r) == -2 for r in self.csa_compress_ratios
+            # A real CSA indexer (``1 < ratio < 128`` with
+            # ``csa_dense_mode=False``, the construction condition at
+            # ``csa_attention.py:2869``) is served by ``FusedDSAIndexerLoss`` /
+            # the CSA-indexer losses, whose per-token normalization is not
+            # implemented. HCA-only (``128``), latent MQA/DSA (``-2``) and
+            # ``csa_dense_mode=True`` layouts are supported and pass. This
+            # subsumes (and replaces) the earlier "all -2" restriction.
+            if (
+                self.csa_compress_ratios is not None
+                and not self.csa_dense_mode
+                and any(1 < int(r) < 128 for r in self.csa_compress_ratios)
             ):
                 raise ValueError(
-                    "calculate_per_token_loss requires csa_compress_ratios to be "
-                    "None or all -2 (MLA): the per-token normalisation has not "
-                    "been validated for CSA. Got calculate_per_token_loss=True, "
+                    "calculate_per_token_loss + a real CSA indexer "
+                    "(1 < csa_compress_ratios < 128 with csa_dense_mode=False) "
+                    "is unsupported: that path uses FusedDSAIndexerLoss / "
+                    "CSA-indexer losses, whose per-token normalization is not "
+                    "implemented. Got calculate_per_token_loss=True, "
+                    f"csa_dense_mode={self.csa_dense_mode}, "
                     f"csa_compress_ratios={self.csa_compress_ratios!r}."
                 )
             if self.pipeline_model_parallel_size != 1:
