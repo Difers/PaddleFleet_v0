@@ -77,13 +77,18 @@ NativeLinear = nn.Linear
 
 
 try:
-    from paddle.nn.functional.flash_attention import flash_attention
+    # FA3 goes through paddlefleet_ops (cutedsl), Paddle's built-in FA3 is deprecated.
+    from paddlefleet_ops.flash_mask_facade import flash_attention
+except (ImportError, ModuleNotFoundError):
+    try:
+        from paddle.nn.functional.flash_attention import flash_attention
+    except (ImportError, ModuleNotFoundError):
+        flash_attention = None
 
+if flash_attention is not None:
     logger.warning(
         "Use flash attention in scaled-dot-product. Attention mask is deprecated"
     )
-except (ImportError, ModuleNotFoundError):
-    flash_attention = None
 
 try:
     from paddle.nn.functional.flash_attention import flash_attention_with_mask
@@ -97,9 +102,12 @@ except (ImportError, ModuleNotFoundError):
 
 
 try:
-    from paddle.nn.functional.flash_attention import flashmask_attention
+    from paddlefleet_ops.flash_mask_facade import flashmask_attention
 except (ImportError, ModuleNotFoundError):
-    flashmask_attention = None
+    try:
+        from paddle.nn.functional.flash_attention import flashmask_attention
+    except (ImportError, ModuleNotFoundError):
+        flashmask_attention = None
 
 try:
     from paddle.incubate.nn.functional import (
