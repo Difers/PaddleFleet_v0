@@ -47,6 +47,7 @@ from paddlefleet.refined_recompute import (
     RefinedRcomputeFlashMaskAttention as rr_flashmask_attention,
     RefinedRcomputeFlashMaskCpAttention as rr_flashmask_attention_cp,
 )
+from paddlefleet.refined_recompute.probe import PROBE
 from paddlefleet.transformer.enums import AttnMaskType
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.transformer.utils import (
@@ -635,6 +636,9 @@ class DotProductAttention(FleetLayer):
             else:
                 flashmask_attention_func = flashmask_attention
 
+            flashmask_attention_func = PROBE.wrap(
+                flashmask_attention_func, "flash_attn", self
+            )
             fm_kwargs = (
                 {"softmax_scale": self.softmax_scale}
                 if self._has_custom_softmax_scale
@@ -809,6 +813,10 @@ class DotProductAttention(FleetLayer):
                 )
             else:
                 flashmask_attention_func = flashmask_attention
+
+            flashmask_attention_func = PROBE.wrap(
+                flashmask_attention_func, "flash_attn", self
+            )
 
             if self.sliding_window is not None:
                 attn_mask_startend_row_indices = (

@@ -22,6 +22,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from paddlefleet.refined_recompute.probe import PROBE
+from paddlefleet.refined_recompute.probe_callback import ProbeWindowCallback
 from paddlefleet.trainer import (
     DefaultFlowCallback,
     InternalMedicineCallback,
@@ -358,3 +360,14 @@ class TrainerCallbackTest(unittest.TestCase):
                 callbacks=[MyTestTrainerCallback, MyTestTrainerCallback],
             )
             assert str(MyTestTrainerCallback) in warn_mock.call_args[0][0]
+
+    def test_probe_callback_is_registered_from_the_yaml_section(self):
+        self.addCleanup(PROBE.deactivate)
+        trainer = self.get_trainer(auto_refined_recompute={"mode": "profile"})
+        self.assertTrue(PROBE.active)
+        self.assertTrue(
+            any(
+                isinstance(cb, ProbeWindowCallback)
+                for cb in trainer.callback_handler.callbacks
+            )
+        )

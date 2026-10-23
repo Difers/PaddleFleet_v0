@@ -692,6 +692,15 @@ class Trainer:
             if self.args.disable_tqdm
             else DEFAULT_PROGRESS_CALLBACK
         )
+        # Local import: refined_recompute pulls in the attention kernels.
+        from paddlefleet.refined_recompute.probe import PROBE
+
+        if PROBE.active:
+            from paddlefleet.refined_recompute.probe_callback import (
+                ProbeWindowCallback,
+            )
+
+            self.add_callback(ProbeWindowCallback())
 
         def _save_ckpt_func(state_dict, path, signal_path=None):
             if self.args.enable_auto_parallel:

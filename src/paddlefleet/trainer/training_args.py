@@ -1089,6 +1089,14 @@ class TrainingArguments:
         default=None, metadata={"help": "The submodules to recompute"}
     )
 
+    auto_refined_recompute: Optional[dict] = field(
+        default=None,
+        metadata={
+            "help": "Refined-recompute calibration. mode: train (default) or profile; "
+            "calibration: {warmup_steps: 3, measure_steps: 12}."
+        },
+    )
+
     recompute_num_layers: Optional[int] = field(
         default=None,
         metadata={
@@ -2302,6 +2310,11 @@ class TrainingArguments:
             and not isinstance(self.recompute_modules, dict)
         ):
             raise ValueError("recompute_modules must be list, dict or None")
+        if self.auto_refined_recompute:
+            # Before any model is built: the probe is read at construction.
+            from paddlefleet.refined_recompute.probe import PROBE
+
+            PROBE.configure(self.auto_refined_recompute, self.output_dir)
         # check recompute:
         if (
             self.recompute_mtp_modules is not None

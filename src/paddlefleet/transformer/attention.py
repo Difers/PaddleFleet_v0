@@ -52,6 +52,7 @@ from paddlefleet.recompute_utils import (
     module_needs_recompute,
     module_needs_refined_recompute,
 )
+from paddlefleet.refined_recompute.probe import PROBE
 from paddlefleet.tensor_parallel import RecomputeWithoutOutput
 from paddlefleet.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
@@ -370,7 +371,8 @@ class Attention(FleetLayer, ABC):
                 is_mtp_layer=self.is_mtp_layer,
             )
         if (
-            self.config.recompute_modules is not None
+            not PROBE.active
+            and self.config.recompute_modules is not None
             and "flash_attn" in self.config.recompute_modules
         ):
             assert self.config.recompute_granularity is not None, (

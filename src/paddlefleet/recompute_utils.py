@@ -347,6 +347,13 @@ def logical_layer_index(config, layer_number, is_mtp_layer=False):
     return layer_number - head_offset
 
 
+def layer_index_of(layer):
+    """``logical_layer_index`` of a layer module."""
+    return logical_layer_index(
+        layer.config, layer.layer_number, getattr(layer, "is_mtp_layer", False)
+    )
+
+
 def _get_module_recompute_config(module_name, config):
     """Return whether ``module_name`` is configured, and its layer selector.
 
@@ -738,12 +745,17 @@ def make_refined_recompute(owner, point, supported=True, uses_rng=False):
     and there must be no virtual pipeline, which reorders replay against the
     first forward and would pair frames across chunks. A vetoed point warns
     rather than raises -- it only costs the speedup.
+
+    When ``refined_recompute.probe`` is active, every supported point gets a
+    measuring boundary regardless of ``recompute_modules``.
     """
     # Local import: recompute_utils is imported nearly everywhere, while
     # refined_recompute pulls in flash_attn and paddlefleet_ops.
     from paddlefleet.refined_recompute import AutoRefinedRecompute
+    from paddlefleet.refined_recompute.probe import PROBE
 
-    if not module_needs_refined_recompute(
+    calibrating = PROBE.active
+    if not calibrating and not module_needs_refined_recompute(
         point,
         owner.layer_number,
         owner.config,
@@ -761,6 +773,8 @@ def make_refined_recompute(owner, point, supported=True, uses_rng=False):
             f"virtual_pipeline={vpp}"
         )
         return False, None
+    if calibrating:
+        return True, PROBE.boundary(point, layer_index_of(owner))
     return True, AutoRefinedRecompute(point, uses_rng=uses_rng)
 
 

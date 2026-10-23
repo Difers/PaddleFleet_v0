@@ -22,6 +22,7 @@ import unittest
 import paddle
 from paddle.distributed.fleet.utils import recompute
 
+from paddlefleet.refined_recompute.probe import PROBE
 from paddlefleet.transformer.dot_product_attention import DotProductAttention
 from paddlefleet.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -171,6 +172,17 @@ class TestDecision(unittest.TestCase):
         )
         self.assertFalse(attn.use_rr_o_proj)
         self.assertIsNone(attn._o_proj_rr)
+
+    def test_probe_keeps_hand_written_flash_attn_off(self):
+        PROBE.activate("unused")
+        self.addCleanup(PROBE.deactivate)
+        attn = _build(
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            recompute_modules=["flash_attn"],
+        )
+        self.assertFalse(attn.use_rr_flash_attention)
 
     def test_a_bias_vetoes_the_point(self):
         attn = _build(use_bias=True, **_RR_ON)
