@@ -217,6 +217,7 @@ jobs:
           else
             pip install "nvidia-nvshmem-cu13>=3.3.9,<3.5"
           fi
+          source ci/setup_ops_toolchain.sh || exit 1
           uv build --wheel --package paddlefleet-ops --out-dir dist --no-build-isolation -v
           '
 
@@ -391,6 +392,7 @@ jobs:
           # HybridEP links against NVML by soname; install dev stubs for libnvidia-ml.so.1.
           apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev
           rm -rf /var/lib/apt/lists/*
+          source ci/setup_ops_toolchain.sh || exit 1
           uv build --wheel --package paddlefleet-ops --out-dir dist --no-build-isolation -v
           '
 

@@ -65,6 +65,12 @@ bash scripts/install_ops_wheel.sh
 
 如果需要开发自定义算子，可以使用 editable 方式安装。
 
+编译 `paddlefleet_ops` 需要 GCC >= 13（DeepGEMM 依赖 C++20 `<format>`）和 elfutils 头文件。可以执行以下脚本检查并准备工具链（需要 root 权限，支持 yum/dnf 和 apt）：
+
+```bash
+source ci/setup_ops_toolchain.sh
+```
+
 ###### 系统环境
 
 ```bash

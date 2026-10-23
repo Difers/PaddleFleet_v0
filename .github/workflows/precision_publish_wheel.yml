@@ -88,6 +88,7 @@ jobs:
           git submodule update --init --recursive
           export UV_PYTHON="3.10"
           uv build --wheel --package paddlefleet --out-dir dist --clear -v
+          source ci/setup_ops_toolchain.sh || exit 1
           uv build --wheel --package paddlefleet-ops --out-dir dist -v
           '
       - name: Upload wheel (and update precision)

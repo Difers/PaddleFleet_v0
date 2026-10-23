@@ -232,6 +232,32 @@ def check_patchelf_exists():
         sys.exit(1)
 
 
+def check_host_toolchain():
+    """Checks the host compiler can build DeepGEMM (DeepJIT).
+
+    DeepJIT requires C++20 ``<format>`` (GCC >= 13) and elfutils headers.
+    """
+    if not backends.IS_NVIDIA:
+        return
+    cxx = os.environ.get("CXX", "c++")
+    snippet = "#include <elfutils/libdwfl.h>\n#include <format>\n"
+    result = subprocess.run(
+        [cxx, "-std=c++20", "-fsyntax-only", "-x", "c++", "-"],
+        input=snippet,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error(
+            f"\033[31m Error: host compiler '{cxx}' cannot build DeepGEMM.\033[0m\n"
+            f"\033[31m GCC >= 13 (C++20 <format>) and elfutils headers are required, "
+            f"e.g. `source ci/setup_ops_toolchain.sh`, or install gcc-toolset-13 + "
+            f"elfutils-devel (yum/dnf) / g++-13 + libdw-dev (apt).\033[0m\n"
+            f"{result.stderr.strip()}"
+        )
+        sys.exit(1)
+
+
 _SUPPORTED_CUDA_ARCHS = {"8.0", "9.0", "10.0", "10.3"}
 
 
@@ -394,8 +420,8 @@ def get_libs():
             ],
             include_dirs=[
                 "deep_gemm/include",
+                "third-party/deep_jit/include",
                 "third-party/cutlass/include",
-                "third-party/fmt/include",
             ],
         ),
         EcosystemLibrary(

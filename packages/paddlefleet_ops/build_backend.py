@@ -22,6 +22,7 @@ from pathlib import Path
 import backends
 from build_utils import (
     check_cuda_arch_list,
+    check_host_toolchain,
     check_patchelf_exists,
     check_submodule_updated,
     get_libs,
@@ -256,6 +257,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     check_cuda_arch_list()
     check_patchelf_exists()
     check_submodule_updated()
+    check_host_toolchain()
     _prepare_ecosystem(use_symlinks=False)
     return orig.build_wheel(
         wheel_directory, config_settings, metadata_directory
@@ -268,6 +270,7 @@ def build_editable(
     check_cuda_arch_list()
     check_patchelf_exists()
     check_submodule_updated()
+    check_host_toolchain()
     _prepare_ecosystem(use_symlinks=True)
     return orig.build_editable(
         wheel_directory, config_settings, metadata_directory

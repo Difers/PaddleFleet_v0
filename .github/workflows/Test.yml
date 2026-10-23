@@ -98,6 +98,7 @@ jobs:
           PACKAGES_CHANGED=$(git diff --name-only origin/${BRANCH}...HEAD | grep "^packages/" || true)
           if [ -n "$PACKAGES_CHANGED" ]; then
             echo "packages/ changed, building paddlefleet-ops from source"
+            source ci/setup_ops_toolchain.sh || exit 1
             uv build --wheel --package paddlefleet-ops --out-dir dist
           else
             echo "packages/ not changed, downloading paddlefleet-ops from latest/"
