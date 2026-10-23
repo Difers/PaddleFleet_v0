@@ -47,8 +47,10 @@ def balanced_gather_reorder_kernel(
     dst layout: [S0, ..., S_{axis-1}, 2*N*chunk_size, S_{axis+1}, ..., S_last]
       - dst_outer_stride = 2*N*chunk_size * inner_size
     """
-    pid_x = tl.program_id(0)
-    outer_idx = tl.program_id(1)
+    pid_x = tl.program_id(0).to(tl.int64)
+    outer_idx = tl.program_id(1).to(tl.int64)
+    chunk_size = tl.cast(chunk_size, tl.int64)
+    inner_size = tl.cast(inner_size, tl.int64)
 
     chunk_idx = pid_x // num_blocks_per_chunk
     block_idx = pid_x % num_blocks_per_chunk
@@ -57,7 +59,7 @@ def balanced_gather_reorder_kernel(
     src_rank = tl.where(is_start, chunk_idx, 2 * N - 1 - chunk_idx)
     src_axis_base = tl.where(is_start, 0, chunk_size)
 
-    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < chunk_size * inner_size
 
     axis_local = offsets // inner_size
@@ -105,8 +107,10 @@ def balanced_scatter_reorder_kernel(
       - dst_rank_stride = outer_size * 2*chunk_size * inner_size
       - dst_outer_stride = 2*chunk_size * inner_size
     """
-    pid_x = tl.program_id(0)
-    outer_idx = tl.program_id(1)
+    pid_x = tl.program_id(0).to(tl.int64)
+    outer_idx = tl.program_id(1).to(tl.int64)
+    chunk_size = tl.cast(chunk_size, tl.int64)
+    inner_size = tl.cast(inner_size, tl.int64)
 
     slot_idx = pid_x // num_blocks_per_chunk
     block_idx = pid_x % num_blocks_per_chunk
@@ -114,7 +118,7 @@ def balanced_scatter_reorder_kernel(
     rank_idx = slot_idx // 2
     is_start = (slot_idx % 2) == 0
 
-    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < chunk_size * inner_size
 
     axis_local = offsets // inner_size

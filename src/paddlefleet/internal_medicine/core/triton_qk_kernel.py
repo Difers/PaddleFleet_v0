@@ -106,7 +106,7 @@ def qk_stats_kernel(
     ``max_logit`` is an extremum over the visited rows; with ROW_STRIDE>1 it
     is a (typically tight) lower bound on the true max.
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     batch_idx = pid // num_heads
     head_idx = pid % num_heads
     kv_head_idx = head_idx // heads_per_group
@@ -125,7 +125,7 @@ def qk_stats_kernel(
     # Stride between consecutive visited query rows within a block.
     m_block_span = BLOCK_M * ROW_STRIDE
     for m_start in range(0, seq_len_q, m_block_span):
-        m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
+        m_offsets = m_start + tl.arange(0, BLOCK_M).to(tl.int64) * ROW_STRIDE
         m_mask = m_offsets < seq_len_q
         # Global row index used for causal masking against K columns
         m_global = m_offsets + q_row_offset
@@ -148,7 +148,7 @@ def qk_stats_kernel(
             n_stop = seq_len_k
 
         for n_start in range(0, n_stop, BLOCK_N):
-            n_offsets = n_start + tl.arange(0, BLOCK_N)
+            n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
             n_mask = n_offsets < seq_len_k
 
             acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -339,7 +339,7 @@ def qk_stats_partial_kernel(
     pinned to 0. Without this the reported distribution is renormalised over the
     real keys only, which is not the distribution the model computes.
     """
-    pid_bh = tl.program_id(0)
+    pid_bh = tl.program_id(0).to(tl.int64)
     pid_m = tl.program_id(1)
 
     batch_idx = pid_bh // num_heads
@@ -352,7 +352,7 @@ def qk_stats_partial_kernel(
     m_block_span = BLOCK_M * ROW_STRIDE
     m_start = pid_m * m_block_span
 
-    m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
+    m_offsets = m_start + tl.arange(0, BLOCK_M).to(tl.int64) * ROW_STRIDE
     m_mask = m_offsets < seq_len_q
     # Global row index used for causal masking against K columns
     m_global = m_offsets + q_row_offset
@@ -375,7 +375,7 @@ def qk_stats_partial_kernel(
         n_stop = seq_len_k
 
     for n_start in range(0, n_stop, BLOCK_N):
-        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
         n_mask = n_offsets < seq_len_k
 
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -545,7 +545,7 @@ def _accumulate_segment(
     online-softmax state composes across disjoint column ranges.
     """
     for n_start in range(seg_start, seg_stop, BLOCK_N):
-        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
         n_mask = n_offsets < seq_len_k
 
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -692,7 +692,7 @@ def qk_stats_sparse_partial_kernel(
     to the softmax denominator; it is folded in after both segments so entropy
     and sink ratios match the distribution the layer actually computes.
     """
-    pid_bh = tl.program_id(0)
+    pid_bh = tl.program_id(0).to(tl.int64)
     pid_m = tl.program_id(1)
 
     batch_idx = pid_bh // num_heads
@@ -705,7 +705,7 @@ def qk_stats_sparse_partial_kernel(
     m_block_span = BLOCK_M * ROW_STRIDE
     m_start = pid_m * m_block_span
 
-    m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
+    m_offsets = m_start + tl.arange(0, BLOCK_M).to(tl.int64) * ROW_STRIDE
     m_mask = m_offsets < seq_len_q
 
     bound_ptr = (
@@ -916,7 +916,7 @@ def qk_stats_packed_kernel(
     subsampling are intentionally unsupported here — packed monitoring does not
     yet compose with either. Add them only alongside a correctness test.
     """
-    pid_head = tl.program_id(0)
+    pid_head = tl.program_id(0).to(tl.int64)
     pid_m = tl.program_id(1)
 
     head_idx = pid_head
@@ -925,7 +925,7 @@ def qk_stats_packed_kernel(
     k_base = K_ptr + head_idx * stride_k_head
 
     m_start = pid_m * BLOCK_M
-    m_offsets = m_start + tl.arange(0, BLOCK_M)
+    m_offsets = m_start + tl.arange(0, BLOCK_M).to(tl.int64)
     m_mask = m_offsets < total_tokens
 
     # Per-row sequence boundaries (int32). Padding rows -> [0, 0) empty range.
@@ -952,7 +952,7 @@ def qk_stats_packed_kernel(
         n_stop = tl.minimum(tl.max(tl.where(m_mask, seq_end, 0)), total_tokens)
 
     for n_start in range(n_start_init, n_stop, BLOCK_N):
-        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
         n_mask = n_offsets < total_tokens
 
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
