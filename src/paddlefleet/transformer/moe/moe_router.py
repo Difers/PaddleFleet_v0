@@ -2107,6 +2107,14 @@ class TopKRouter(StandardMoERouter):
 
         _log_moe_md5(logits, "gate_logits", self._layer_number)
 
+        if not use_split:
+            logits = inspect_tensor(
+                "moe_gate_logits_presigmoid",
+                self._layer_number,
+                logits,
+                load=True,
+            )
+
         # ---- Hash routing branch ----
         if self.is_hash_layer:
             if self.sequence_parallel:
@@ -2189,9 +2197,13 @@ class TopKRouter(StandardMoERouter):
 
         _log_moe_md5(gates, "gate_probs_sigmoid", self._layer_number)
 
-        gates = inspect_tensor(
-            "moe_gate_logits", self._layer_number, gates, load=True
-        )
+        # `gates` is the post-sigmoid router logits, which only lines up with the
+        # infer side under split routing; the single-gate path aligns at
+        # moe_gate_logits_presigmoid above. Exactly one gate probe per mode.
+        if use_split:
+            gates = inspect_tensor(
+                "moe_gate_logits", self._layer_number, gates, load=True
+            )
 
         # Use clone() to ensure that the execution order of the grad nodes is consistent with EC.
         if self.use_accuracy_compatible and not use_split:

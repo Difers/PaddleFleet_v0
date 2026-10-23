@@ -41,6 +41,7 @@ reason rather than reported as passing.
 
 import types
 import unittest
+from unittest.mock import MagicMock, patch
 
 try:
     import numpy as np
@@ -273,6 +274,98 @@ class TestAuxLossComputeLatentProjection(unittest.TestCase):
         np.testing.assert_array_equal(
             out.numpy(), hidden.reshape([2, 3, self.hidden_size]).numpy()
         )
+
+
+@unittest.skipUnless(
+    _IMPORT_ERROR is None,
+    f"paddle/paddlefleet unavailable: {_IMPORT_ERROR!r}",
+)
+class TestForwardSingleCardLatentProbes(unittest.TestCase):
+    """Drive the real ``MoELayer.forward`` single-card latent path so its two
+    latent ``inspect_tensor`` probes are exercised.
+
+    ``expert_model_parallel_size == 1`` selects the single-card branch;
+    ``use_latent_moe`` with a non-``None`` ``latent_norm`` makes ``forward``
+    project down via ``fc1_latent_proj`` (emitting ``moe_latent_input``), and,
+    after the single-card expert, normalise and project back up via
+    ``fc2_latent_proj`` (emitting ``moe_latent_norm_output``). The router
+    (``gate``) and expert compute are stubbed so only the latent projection
+    control flow runs; ``inspect_tensor`` is replaced by a recorder that passes
+    tensors through untouched and captures the tags, so the test pins that the
+    two latent probes fire on this path (and only there -- the generic
+    ``moe_combine_output`` probe is a separate concern).
+    """
+
+    def setUp(self):
+        paddle.set_device("cpu")
+        paddle.seed(2026)
+
+    def test_latent_input_and_norm_probes_fire(self):
+        from paddlefleet.transformer.moe import moe_layer as moe_layer_mod
+
+        b, s, h, latent = 2, 3, 4, 2
+
+        def _expert(reshaped_input, topk_indices, topk_weights):
+            # Shape-preserving stand-in for single-card expert compute; keeps
+            # the tensor in latent width so the fc2 up-projection is observable.
+            return reshaped_input
+
+        fake_self = types.SimpleNamespace(
+            expert_model_parallel_size=1,
+            sequence_parallel=False,
+            use_accuracy_compatible=False,
+            layer_number=0,
+            training=False,
+            router_aux_loss_coef=0.0,
+            use_latent_moe=True,
+            latent_norm=lambda x: x,  # identity: reaches 2130 and the 2131 probe
+            moe_expert_fusion=False,
+            shared_experts=None,
+            config=_DeferralOffConfig(),
+            fc1_latent_proj=nn.Linear(h, latent),  # down-project at line 2083
+            fc2_latent_proj=nn.Linear(latent, h),  # up-project at line 2134
+            _maybe_pre_allgather_overlap=lambda hs: None,
+            _prepare_gate_input=lambda hs, residual: hs,
+            _prepare_expert_input=lambda hs, residual: hs,
+            _post_routed_output=lambda o: o,
+            _supports_three_path_clone=lambda: False,
+            _forward_single_card_moe=_expert,
+            gate=MagicMock(
+                return_value=(
+                    None,
+                    paddle.ones([b * s, 1]),
+                    paddle.zeros([b * s, 1], dtype="int64"),
+                    paddle.ones([b * s, 4]),
+                    paddle.ones([b * s, 4]),
+                    None,
+                    None,
+                    None,
+                )
+            ),
+        )
+
+        hidden_states = paddle.zeros([b, s, h], dtype="float32")
+        hidden_states.stop_gradient = True
+
+        seen_tags = []
+
+        def _record(tag, layer_idx, tensor, *args, **kwargs):
+            seen_tags.append(tag)
+            return tensor
+
+        with (
+            patch.object(moe_layer_mod, "targets_hf", return_value=False),
+            patch.object(moe_layer_mod, "inspect_tensor", side_effect=_record),
+            patch.object(moe_layer_mod, "inspect_tensor_set_current_layer"),
+            patch.object(moe_layer_mod, "log_moe_losses"),
+        ):
+            output, _bias = MoELayer.forward(fake_self, hidden_states)
+
+        # Both latent-path probes fired on the single-card branch.
+        self.assertIn("moe_latent_input", seen_tags)
+        self.assertIn("moe_latent_norm_output", seen_tags)
+        # Output is restored to hidden width and folded into [b, s, h].
+        self.assertEqual(output.shape, [b, s, h])
 
 
 if __name__ == "__main__":

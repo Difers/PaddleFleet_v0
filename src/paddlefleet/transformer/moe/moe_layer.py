@@ -2100,6 +2100,9 @@ class MoELayer(nn.Layer):
                     self.fc1_latent_proj,
                     reshaped_input,
                 )
+                reshaped_input = inspect_tensor(
+                    "moe_latent_input", layer_idx, reshaped_input
+                )
             if self.moe_expert_fusion:
                 _pre_permuted = None
                 if _hf_bitexact_paths:
@@ -2134,10 +2137,14 @@ class MoELayer(nn.Layer):
                 output = self._forward_single_card_moe(
                     reshaped_input, topk_indices, topk_weights
                 )
+            output = inspect_tensor("moe_combine_output", layer_idx, output)
             # Latent MoE: project back from latent space
             if self.use_latent_moe:
                 if self.latent_norm is not None:
                     output = self.latent_norm(output)
+                    output = inspect_tensor(
+                        "moe_latent_norm_output", layer_idx, output
+                    )
                 output = deferrable_linear_bare(
                     self.config, "moe_latent_proj", self.fc2_latent_proj, output
                 )
