@@ -19,7 +19,7 @@ trainer divides by ``T_global`` (main-head non-padded label tokens, summed over
 accumulation micro-batches and all-reduced). Covered here, all on CPU with no
 collectives (CP / TP sizes are patched where a guard reads them):
 
-  * module-level counters: ``accumulate/pop_per_token_local_count``,
+  * tracker bookkeeping: ``accumulate_per_token_local_count`` / ``pop_per_token_stats``,
     ``suppress_per_token_count`` / ``_per_token_count_enabled`` (recompute
     replay and MTP heads are not counted), and the display accumulators;
   * ``LanguageLoss.__init__`` config guards;
@@ -92,10 +92,36 @@ def _make(cls=LanguageLoss, **overrides):
 
 
 def _reset_counters():
-    ll_mod.pop_per_token_local_count()
-    ll_mod.pop_per_token_display()
     LanguageLoss.token_avg_tracker.clear()
     LanguageLoss._cu_seqlens_q_stash = None
+
+
+# Per-token stats live in LanguageLoss.token_avg_tracker under ll_mod._PT_KEYS.
+# These helpers pop one group at a time so a test can check the T_global count
+# and the display stats separately; the trainer pops all of them together via
+# LanguageLoss.pop_per_token_stats().
+_DISP_KEYS = {
+    "lm_sum": ("pt_lm_sum", float),
+    "lm_tok": ("pt_lm_tok", int),
+    "mtp_sum": ("pt_mtp_sum", float),
+    "mtp_tok": ("pt_mtp_tok", int),
+    "loss_mean_sum": ("pt_mom_sum", float),
+    "loss_mean_cnt": ("pt_mom_cnt", int),
+}
+
+
+def _pop_count():
+    value = LanguageLoss.token_avg_tracker.pop("pt_t_local", None)
+    return 0 if value is None else int(value)
+
+
+def _pop_disp():
+    tr = LanguageLoss.token_avg_tracker
+    out = {}
+    for name, (key, cast) in _DISP_KEYS.items():
+        value = tr.pop(key, None)
+        out[name] = cast(0) if value is None else cast(value)
+    return out
 
 
 def _np_ce_sum(logits, labels):
@@ -136,20 +162,65 @@ class _FakeFusedCE:
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        # Restore the device afterwards: later test modules in the same
+        # process (e.g. the eval observer tests) need the original one.
+        self.prev_device = paddle.get_device()
         paddle.set_device("cpu")
         paddle.seed(2026)
         _reset_counters()
 
     def tearDown(self):
         _reset_counters()
+        paddle.set_device(self.prev_device)
 
 
 class TestModuleCounters(_Base):
     def test_local_count_accumulates_and_pop_resets(self):
         ll_mod.accumulate_per_token_local_count(3)
         ll_mod.accumulate_per_token_local_count(paddle.to_tensor(4))
-        self.assertEqual(ll_mod.pop_per_token_local_count(), 7)
-        self.assertEqual(ll_mod.pop_per_token_local_count(), 0)
+        # Stored as a device tensor in the tracker, not a python int.
+        self.assertIsInstance(
+            LanguageLoss.token_avg_tracker["pt_t_local"], paddle.Tensor
+        )
+        self.assertEqual(_pop_count(), 7)
+        self.assertEqual(_pop_count(), 0)
+
+    def test_pop_per_token_stats_returns_all_keys_and_resets(self):
+        ll_mod.accumulate_per_token_local_count(5)
+        ll_mod._per_token_tracker_add("pt_lm_sum", paddle.to_tensor(6.0))
+        ll_mod._per_token_tracker_add("pt_lm_sum", 4.0)
+        ll_mod._per_token_tracker_add("pt_mom_cnt", 1)
+        stats = LanguageLoss.pop_per_token_stats()
+        self.assertEqual(set(stats), set(ll_mod._PT_KEYS))
+        for key, dtype in ll_mod._PT_KEYS.items():
+            self.assertEqual(stats[key].dtype, getattr(paddle, dtype))
+            self.assertEqual(stats[key].shape, [])
+        self.assertEqual(int(stats["pt_t_local"]), 5)
+        self.assertAlmostEqual(float(stats["pt_lm_sum"]), 10.0)
+        self.assertEqual(int(stats["pt_mom_cnt"]), 1)
+        # Unwritten keys come back as zeros.
+        self.assertEqual(float(stats["pt_mtp_sum"]), 0.0)
+        self.assertEqual(int(stats["pt_mtp_tok"]), 0)
+        self.assertEqual(LanguageLoss.token_avg_tracker, {})
+        empty = LanguageLoss.pop_per_token_stats()
+        self.assertTrue(all(float(v) == 0.0 for v in empty.values()))
+
+    def test_per_token_and_token_avg_keys_do_not_clear_each_other(self):
+        # log_global_token_avg_loss's (S, n) are consumed per log interval and
+        # the per-token keys per step; neither consumer may drop the other's.
+        tr = LanguageLoss.token_avg_tracker
+        tr["S"] = paddle.to_tensor(8.0)
+        tr["n"] = paddle.to_tensor(4.0)
+        ll_mod.accumulate_per_token_local_count(3)
+        LanguageLoss.pop_per_token_stats()
+        self.assertEqual(set(tr), {"S", "n"})
+
+        ll_mod.accumulate_per_token_local_count(3)
+        self.assertAlmostEqual(
+            LanguageLoss.consume_token_avg_loss()["loss"], 2.0
+        )
+        self.assertEqual(set(tr), {"pt_t_local"})
+        self.assertEqual(_pop_count(), 3)
 
     def test_count_enabled_respects_config_replay_and_suppress(self):
         on = _cfg()
@@ -176,19 +247,29 @@ class TestModuleCounters(_Base):
         self.assertTrue(ll_mod._per_token_count_enabled(on))
 
     def test_display_accumulates_and_pop_resets(self):
-        ll_mod.accumulate_per_token_disp_lm(paddle.to_tensor(6.0), 3)
-        ll_mod.accumulate_per_token_disp_lm(4.0, 2)
-        ll_mod.accumulate_per_token_disp_mtp(5.0, 4)
-        ll_mod.accumulate_per_token_disp_loss_mean(2.0)
-        ll_mod.accumulate_per_token_disp_loss_mean(3.0)
-        d = ll_mod.pop_per_token_display()
+        loss = _make(mtp_loss_scaling_factor=1.0)
+        # Two microbatches, each with one MTP head.
+        loss._record_per_token_display(
+            paddle.to_tensor(6.0),
+            paddle.to_tensor(3),
+            [paddle.to_tensor(2.0)],
+            [paddle.to_tensor(1)],
+        )
+        loss._record_per_token_display(
+            paddle.to_tensor(4.0),
+            paddle.to_tensor(2),
+            [paddle.to_tensor(3.0)],
+            [paddle.to_tensor(3)],
+        )
+        d = _pop_disp()
         self.assertAlmostEqual(d["lm_sum"], 10.0)
         self.assertEqual(d["lm_tok"], 5)
         self.assertAlmostEqual(d["mtp_sum"], 5.0)
         self.assertEqual(d["mtp_tok"], 4)
-        self.assertAlmostEqual(d["loss_mean_sum"], 5.0)
+        # (6/3 + 1.0 * 2/1) + (4/2 + 1.0 * 3/3) = 4 + 3
+        self.assertAlmostEqual(d["loss_mean_sum"], 7.0)
         self.assertEqual(d["loss_mean_cnt"], 2)
-        empty = ll_mod.pop_per_token_display()
+        empty = _pop_disp()
         self.assertEqual(
             empty,
             {
@@ -226,31 +307,18 @@ class TestInitGuards(_Base):
             _make(calculate_per_token_loss=False).calculate_per_token_loss
         )
 
-    def test_no_mtp_cp_requires_experimental_dataflow(self):
-        with self.assertRaisesRegex(AssertionError, "experimental_dataflow"):
-            self._make_cp(2)
+    def test_no_mtp_cp_layouts_pass(self):
+        # The loader-sharded source counts display tokens on the gathered
+        # labels, so CP>1 no longer requires experimental_dataflow.
+        self._make_cp(2)
         self._make_cp(2, experimental_dataflow=True)
         self._make_cp(1)
-        # Disabled: no guard at all.
-        self._make_cp(2, calculate_per_token_loss=False)
 
     def test_mtp_guards(self):
         mtp = {"num_nextn_predict_layers": 1}
         cases = [
-            ({}, "use_erndata=True or"),
-            ({"use_erndata": True, "train_mtp_only": True}, "train_mtp_only"),
-            (
-                {"use_erndata": True, "mtp_distillation_loss": True},
-                "mtp_distillation_loss",
-            ),
-            (
-                {
-                    "use_erndata": True,
-                    "gpt_model_use_experimental_version": True,
-                    "fused_linear_ce_loss_chunk": 0,
-                },
-                "fused_linear_ce_loss_chunk<=0",
-            ),
+            ({"train_mtp_only": True}, "train_mtp_only"),
+            ({"mtp_distillation_loss": True}, "mtp_distillation_loss"),
         ]
         for extra, msg in cases:
             with (
@@ -259,32 +327,19 @@ class TestInitGuards(_Base):
             ):
                 self._make_cp(1, **mtp, **extra)
 
-        cp_cases = [
-            (
-                {"use_erndata": True, "experimental_dataflow": True},
-                "experimental_dataflow with",
-            ),
-            ({"use_erndata": True}, "requires separate_mtp_headloss"),
-        ]
-        for extra, msg in cp_cases:
-            with (
-                self.subTest(extra=extra),
-                self.assertRaisesRegex(AssertionError, msg),
-            ):
-                self._make_cp(2, **mtp, **extra)
-
     def test_mtp_supported_layouts_pass(self):
         mtp = {"num_nextn_predict_layers": 1}
         self._make_cp(1, use_erndata=True, **mtp)
-        self._make_cp(1, separate_mtp_headloss=True, **mtp)
-        self._make_cp(2, use_erndata=True, separate_mtp_headloss=True, **mtp)
-        self._make_cp(
-            1,
-            use_erndata=True,
-            gpt_model_use_experimental_version=True,
-            fused_linear_ce_loss_chunk=128,
-            **mtp,
-        )
+        # Fused (non-separate) legacy L+K layout.
+        self._make_cp(1, **mtp)
+        self._make_cp(2, experimental_dataflow=True, **mtp)
+        for chunk in (0, 128):
+            self._make_cp(
+                1,
+                gpt_model_use_experimental_version=True,
+                fused_linear_ce_loss_chunk=chunk,
+                **mtp,
+            )
         # mtp_load_weight_only disables MTP, so the MTP guards are skipped.
         self._make_cp(1, mtp_load_weight_only=True, **mtp)
 
@@ -306,7 +361,7 @@ class TestForwardImpl(_Base):
         ref_sum, ref_tok = _np_ce_sum(logits.numpy(), labels_np)
         out = _make().forward_impl(logits, labels)
         np.testing.assert_allclose(float(out), ref_sum, rtol=1e-5)
-        self.assertEqual(ll_mod.pop_per_token_local_count(), ref_tok)
+        self.assertEqual(_pop_count(), ref_tok)
         # Raw sum skips _reduce_loss_by_tokens, so the legacy tracker is empty.
         self.assertEqual(LanguageLoss.token_avg_tracker, {})
 
@@ -315,7 +370,7 @@ class TestForwardImpl(_Base):
         ref_sum, ref_tok = _np_ce_sum(logits.numpy(), labels_np)
         out = _make(calculate_per_token_loss=False).forward_impl(logits, labels)
         np.testing.assert_allclose(float(out), ref_sum / ref_tok, rtol=1e-5)
-        self.assertEqual(ll_mod.pop_per_token_local_count(), 0)
+        self.assertEqual(_pop_count(), 0)
 
     def test_suppressed_call_is_not_counted(self):
         logits, labels, labels_np = self._inputs()
@@ -323,7 +378,7 @@ class TestForwardImpl(_Base):
         with ll_mod.suppress_per_token_count():
             out = _make().forward_impl(logits, labels)
         np.testing.assert_allclose(float(out), ref_sum, rtol=1e-5)
-        self.assertEqual(ll_mod.pop_per_token_local_count(), 0)
+        self.assertEqual(_pop_count(), 0)
 
     def test_eval_forward_is_rejected(self):
         logits, labels, _ = self._inputs()
@@ -347,14 +402,14 @@ class TestForwardImpl(_Base):
         with mock.patch(_FUSED_CE, _FakeFusedCE):
             out = loss.forward_impl((hidden, weight, None), labels)
             np.testing.assert_allclose(float(out), ref_sum, rtol=1e-5)
-            self.assertEqual(ll_mod.pop_per_token_local_count(), ref_tok)
+            self.assertEqual(_pop_count(), ref_tok)
 
             legacy = _make(
                 calculate_per_token_loss=False, fused_linear_ce_loss_chunk=128
             )
             out = legacy.forward_impl((hidden, weight, None), labels)
             np.testing.assert_allclose(float(out), ref_sum / ref_tok, rtol=1e-5)
-            self.assertEqual(ll_mod.pop_per_token_local_count(), 0)
+            self.assertEqual(_pop_count(), 0)
 
 
 class TestForwardNoMTP(_Base):
@@ -377,8 +432,8 @@ class TestForwardNoMTP(_Base):
         ):
             out = _make().forward(logits, paddle.to_tensor(labels_np))
         np.testing.assert_allclose(float(out), ref_sum, rtol=1e-5)
-        self.assertEqual(ll_mod.pop_per_token_local_count(), ref_tok)
-        d = ll_mod.pop_per_token_display()
+        self.assertEqual(_pop_count(), ref_tok)
+        d = _pop_disp()
         np.testing.assert_allclose(d["lm_sum"], ref_sum, rtol=1e-5)
         self.assertEqual(d["lm_tok"], ref_tok)
         self.assertEqual(d["mtp_tok"], 0)
@@ -387,11 +442,33 @@ class TestForwardNoMTP(_Base):
             d["loss_mean_sum"], ref_sum / ref_tok, rtol=1e-5
         )
 
+    def test_loader_source_counts_gathered_labels(self):
+        # Loader-sharded CP: labels arrive CP-local and forward_impl gathers
+        # the loss sum. Emulate cp=2 by tiling (both ranks hold the same
+        # shard), so the gathered sum and token count are both doubled.
+        logits = paddle.randn([1, 4, 6], dtype="float32")
+        labels_np = np.array([[1, 2, IGNORED, 3]], dtype="int64")
+        _, ref_tok = _np_ce_sum(logits.numpy(), labels_np)
+        with (
+            mock.patch.object(ll_mod, "cp_shard_source", return_value="loader"),
+            mock.patch.object(
+                ll_mod, "to_cp_local", side_effect=lambda x, cfg, **kw: x
+            ),
+            mock.patch.object(
+                ll_mod,
+                "to_cp_global",
+                side_effect=lambda x, cfg, **kw: paddle.concat([x, x], axis=1),
+            ),
+        ):
+            _make().forward(logits, paddle.to_tensor(labels_np))
+        self.assertEqual(_pop_disp()["lm_tok"], 2 * ref_tok)
+        _pop_count()
+
     def test_disabled_leaves_display_empty(self):
         logits = paddle.randn([1, 4, 6], dtype="float32")
         labels = paddle.to_tensor([[1, 2, 3, 4]], dtype="int64")
         _make(calculate_per_token_loss=False).forward(logits, labels)
-        self.assertEqual(ll_mod.pop_per_token_display()["loss_mean_cnt"], 0)
+        self.assertEqual(_pop_disp()["loss_mean_cnt"], 0)
 
 
 class TestForwardMTPErndata(_Base):
@@ -425,9 +502,17 @@ class TestForwardMTPErndata(_Base):
         expected = lm_sum + (self.SCALE * renorm if add_mtp_loss else 0.0)
         np.testing.assert_allclose(float(out), expected, rtol=1e-5)
         # Only the main head feeds T_global.
-        self.assertEqual(ll_mod.pop_per_token_local_count(), lm_tok)
+        self.assertEqual(_pop_count(), lm_tok)
+        # mtp_i_loss is displayed as a per-token mean over its own tokens, the
+        # same as the separate-headloss path.
+        for i, (s, t) in enumerate(heads):
+            np.testing.assert_allclose(
+                float(LanguageLoss.mtp_loss_tracker[f"mtp_{i + 1}_loss"]),
+                s / t,
+                rtol=1e-5,
+            )
 
-        d = ll_mod.pop_per_token_display()
+        d = _pop_disp()
         np.testing.assert_allclose(d["lm_sum"], lm_sum, rtol=1e-5)
         self.assertEqual(d["lm_tok"], lm_tok)
         np.testing.assert_allclose(
@@ -482,6 +567,18 @@ class TestForwardMTPErndata(_Base):
             )
         self._check(out, [paddle.matmul(h, weight).numpy() for h in hidden])
 
+    def test_experimental_version_unfused_branch(self):
+        # The experimental per-token matrix reduction must return the raw
+        # masked sum (not the per-head mean) under per-token loss.
+        logits = [
+            paddle.randn([self.B, self.L, self.V], dtype="float32")
+            for _ in range(self.K + 1)
+        ]
+        out = self._make_mtp(gpt_model_use_experimental_version=True).forward(
+            logits, paddle.to_tensor(self.labels_np)
+        )
+        self._check(out, [x.numpy() for x in logits])
+
     def test_experimental_version_accuracy_kernel_keeps_mtp_out_of_value(self):
         hidden = [
             paddle.randn([self.B, self.L, self.H], dtype="float32")
@@ -509,6 +606,107 @@ class TestForwardMTPErndata(_Base):
             add_mtp_loss=False,
         )
 
+    def test_display_counts_full_sequence_under_cp(self):
+        # Emulate one CP rank: to_cp_local keeps the first half of the
+        # sequence, to_cp_global is the identity (no peer to gather from). The
+        # display token counts must still be taken on the full labels, since
+        # in a real run the sums they divide are CP-gathered.
+        half = self.L // 2
+        logits = [
+            paddle.randn([self.B, half, self.V], dtype="float32")
+            for _ in range(self.K + 1)
+        ]
+        with (
+            mock.patch.object(
+                ll_mod,
+                "to_cp_local",
+                side_effect=lambda x, cfg, **kw: x[:, :half],
+            ),
+            mock.patch.object(
+                ll_mod, "to_cp_global", side_effect=lambda x, cfg, **kw: x
+            ),
+        ):
+            self._make_mtp().forward(logits, paddle.to_tensor(self.labels_np))
+        full_lm_tok = int((self.labels_np != IGNORED).sum())
+        full_mtp_tok = sum(
+            int((_np_roll_per_doc(self.labels_np, self.CU, d) != IGNORED).sum())
+            for d in range(self.K)
+        )
+        d = _pop_disp()
+        self.assertEqual(d["lm_tok"], full_lm_tok)
+        self.assertEqual(d["mtp_tok"], full_mtp_tok)
+        _pop_count()
+
+
+class TestForwardMTPLegacy(TestForwardMTPErndata):
+    """Fused ``LanguageLoss.forward`` MTP list path, legacy L+K slice layout.
+
+    Reuses the erndata checks with the reference swapped: labels carry K
+    trailing positions, the main head uses ``labels[:, :L]`` and depth d the
+    window ``[d + 1, d + 1 + L)``. In particular the main-head token count
+    (renorm numerator and display) must not include the trailing K positions.
+    """
+
+    def setUp(self):
+        _Base.setUp(self)
+        # Valid labels in the trailing K positions, so counting them shows up.
+        self.labels_np = np.array([[1, 2, 3, 4, IGNORED, 5, 0, 2, 3, 1]])
+
+    def _reference(self, logits_np_list):
+        lm_sum, lm_tok = _np_ce_sum(
+            logits_np_list[0], self.labels_np[:, : self.L]
+        )
+        heads = [
+            _np_ce_sum(
+                logits_np_list[d + 1],
+                self.labels_np[:, d + 1 : d + 1 + self.L],
+            )
+            for d in range(self.K)
+        ]
+        return lm_sum, lm_tok, heads
+
+    def _make_mtp(self, **overrides):
+        return _make(
+            num_nextn_predict_layers=self.K,
+            mtp_loss_scaling_factor=self.SCALE,
+            **overrides,
+        )
+
+    def test_display_counts_full_sequence_under_cp(self):
+        self.skipTest("CP emulation is covered by the erndata layout.")
+
+    def test_experimental_fused_never_cp_gathers_a_scalar(self):
+        # The per-token fused head returns a 0-d raw sum; the legacy
+        # experimental reduction used to CP-gather it along axis 1.
+        hidden = [
+            paddle.randn([self.B, self.L, self.H], dtype="float32")
+            for _ in range(self.K + 1)
+        ]
+        weight = paddle.randn([self.H, self.V], dtype="float32")
+        loss = self._make_mtp(
+            gpt_model_use_experimental_version=True,
+            fused_linear_ce_loss_chunk=128,
+        )
+        gathered_ndims = []
+
+        def record_gather(x, cfg, **kw):
+            gathered_ndims.append(x.ndim)
+            return x
+
+        with (
+            mock.patch(_FUSED_CE, _FakeFusedCE),
+            mock.patch.object(
+                ll_mod, "to_cp_global", side_effect=record_gather
+            ),
+        ):
+            out = loss.forward(
+                [(h, weight, None) for h in hidden],
+                paddle.to_tensor(self.labels_np),
+            )
+        self.assertTrue(gathered_ndims)
+        self.assertNotIn(0, gathered_ndims)
+        self._check(out, [paddle.matmul(h, weight).numpy() for h in hidden])
+
 
 class TestRecordPerTokenDisplay(_Base):
     def test_train_mtp_only_float_lm_and_accuracy_kernel(self):
@@ -517,7 +715,7 @@ class TestRecordPerTokenDisplay(_Base):
         toks = [paddle.to_tensor(3), paddle.to_tensor(0)]
         # lm_loss is the python float 0.0 under train_mtp_only.
         loss._record_per_token_display(0.0, paddle.to_tensor(0), mtp, toks)
-        d = ll_mod.pop_per_token_display()
+        d = _pop_disp()
         self.assertEqual((d["lm_sum"], d["lm_tok"]), (0.0, 0))
         self.assertAlmostEqual(d["mtp_sum"], 10.0)
         self.assertEqual(d["mtp_tok"], 3)
@@ -531,9 +729,7 @@ class TestRecordPerTokenDisplay(_Base):
             loss._record_per_token_display(
                 paddle.to_tensor(8.0), paddle.to_tensor(4), mtp, toks
             )
-        self.assertAlmostEqual(
-            ll_mod.pop_per_token_display()["loss_mean_sum"], 2.0
-        )
+        self.assertAlmostEqual(_pop_disp()["loss_mean_sum"], 2.0)
 
 
 class TestSeparateHeadLoss(_Base):
@@ -563,7 +759,7 @@ class TestSeparateHeadLoss(_Base):
         np.testing.assert_allclose(
             float(out), lm_sum + self.SCALE * renorm, rtol=1e-5
         )
-        self.assertEqual(ll_mod.pop_per_token_local_count(), lm_tok)
+        self.assertEqual(_pop_count(), lm_tok)
         # mtp_i_loss is displayed as a per-token mean over its own tokens.
         for i, (s, t) in enumerate(zip(mtp_sums, mtp_toks)):
             np.testing.assert_allclose(
@@ -571,7 +767,7 @@ class TestSeparateHeadLoss(_Base):
                 s / t,
                 rtol=1e-6,
             )
-        d = ll_mod.pop_per_token_display()
+        d = _pop_disp()
         self.assertEqual(d["lm_tok"], lm_tok)
         self.assertEqual(d["mtp_tok"], sum(mtp_toks))
         np.testing.assert_allclose(d["mtp_sum"], sum(mtp_sums), rtol=1e-6)
@@ -643,7 +839,7 @@ class TestSeparateHeadLoss(_Base):
             np.testing.assert_allclose(
                 float(out["mtp_loss"][d]), ref_sum, rtol=1e-5
             )
-        self.assertEqual(ll_mod.pop_per_token_local_count(), 0)
+        self.assertEqual(_pop_count(), 0)
 
 
 class TestCPScatterGradScale(unittest.TestCase):
@@ -651,10 +847,12 @@ class TestCPScatterGradScale(unittest.TestCase):
     call site opts in and the global per-token switch is on."""
 
     def setUp(self):
+        self.prev_device = paddle.get_device()
         paddle.set_device("cpu")
 
     def tearDown(self):
         cpu_mod.set_per_token_grad_scale(False)
+        paddle.set_device(self.prev_device)
 
     def _backward(self, mode, scale_grad_by_cp, nranks=4):
         ctx = SimpleNamespace(

@@ -37,7 +37,6 @@ import functools
 import numpy as np
 import paddle
 
-import paddlefleet.models.common.language_loss.language_loss as ll_mod
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
 from paddlefleet.transformer.transformer_config import TransformerConfig
 from tests.multi_card_tests.tensor_parallel.test_utilities import Utils
@@ -50,7 +49,7 @@ BATCH_SIZE = 1
 VALID_PER_RANK = (3, 1)
 
 
-def _build_config(per_token=False, log_avg=True):
+def _build_config(per_token=False, log_avg=True, pp=2):
     """Minimal config for the plain TP=1 loss branch.
 
     The two switches are independent, so each test turns on only the one it is
@@ -62,7 +61,7 @@ def _build_config(per_token=False, log_avg=True):
         num_attention_heads=4,
         use_cpu_initialization=True,
         tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=2,
+        pipeline_model_parallel_size=pp,
         sequence_parallel=False,
         params_dtype=paddle.float32,
         parallel_output=True,
@@ -129,10 +128,12 @@ def _global_reference():
 def _forward_once():
     """One real training forward on this rank: ``(loss, loss_sum, count)``.
 
-    ``calculate_per_token_loss`` only, so the tracker must stay empty -- that is
-    the orthogonality assertion in ``test_forward_returns_this_ranks_raw_sum``.
+    ``calculate_per_token_loss`` is unsupported under PP, so this runs with both
+    switches off; the tracker must stay empty -- that is the orthogonality
+    assertion in ``test_forward_returns_this_ranks_local_mean``. The per-token
+    raw-sum forward is covered at PP=1 in test_language_loss_per_token_reduction.
     """
-    loss_fn = LanguageLoss(config=_build_config(per_token=True, log_avg=False))
+    loss_fn = LanguageLoss(config=_build_config(per_token=False, log_avg=False))
     logits_np, labels_np = _local_inputs(Utils.rank)
     logits = paddle.to_tensor(logits_np, dtype="float32").cuda()
     labels = paddle.to_tensor(labels_np, dtype="int64").cuda()
@@ -152,28 +153,29 @@ def _stash_local_terms():
     )
 
 
-def test_forward_returns_this_ranks_raw_sum():
-    """Per-token forward returns the raw masked sum and counts this rank's
-    tokens for T_global; the legacy (S, n) tracker is left untouched."""
+def test_forward_returns_this_ranks_local_mean():
+    """Without per-token loss the forward returns this rank's masked mean, and
+    neither the legacy (S, n) nor the per-token keys are written."""
     LanguageLoss.token_avg_tracker.clear()
-    ll_mod.pop_per_token_local_count()
-    ll_mod.pop_per_token_display()
     try:
         loss, loss_sum, count = _forward_once()
 
         assert count == VALID_PER_RANK[Utils.rank]
-        np.testing.assert_allclose(loss, loss_sum, rtol=1e-5, atol=1e-6)
-        assert ll_mod.pop_per_token_local_count() == count
-        disp = ll_mod.pop_per_token_display()
-        np.testing.assert_allclose(
-            disp["lm_sum"], loss_sum, rtol=1e-5, atol=1e-6
-        )
-        assert disp["lm_tok"] == count
+        np.testing.assert_allclose(loss, loss_sum / count, rtol=1e-5, atol=1e-6)
         assert LanguageLoss.token_avg_tracker == {}
     finally:
         LanguageLoss.token_avg_tracker.clear()
-        ll_mod.pop_per_token_local_count()
-        ll_mod.pop_per_token_display()
+
+
+def test_per_token_rejects_pipeline_parallel():
+    """calculate_per_token_loss is unsupported under PP, so the PP=2 config
+    must be rejected at construction instead of mis-scaling the loss."""
+    try:
+        _build_config(per_token=True, log_avg=False)
+    except ValueError as e:
+        assert "pipeline parallel" in str(e)
+    else:
+        raise AssertionError("calculate_per_token_loss + PP=2 was not rejected")
 
 
 def test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n():
@@ -249,7 +251,8 @@ if __name__ == "__main__":
     Utils.initialize_model_parallel(
         tensor_parallel_size=1, pipeline_parallel_size=2
     )
-    test_forward_returns_this_ranks_raw_sum()
+    test_forward_returns_this_ranks_local_mean()
+    test_per_token_rejects_pipeline_parallel()
     test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n()
     test_second_consume_is_a_no_op_that_still_runs_in_lockstep()
     test_mtp_head_reduces_in_lockstep_even_where_absent()

@@ -193,6 +193,10 @@ tests:
   - test_case: [tests/multi_card_tests/models/test_language_loss_token_avg_reduction.py]
     products:
       - num_gpus: 2
+  # models: calculate_per_token_loss raw sum / T_global reduction (PP=1, DP=2)
+  - test_case: [tests/multi_card_tests/models/test_language_loss_per_token_reduction.py]
+    products:
+      - num_gpus: 2
   # transformer: DSA sequence_parallel (TP=2)
   - test_case: [tests/multi_card_tests/transformer/test_dsa_attention_sp.py]
     products:

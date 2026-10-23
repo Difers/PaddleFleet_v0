@@ -318,7 +318,7 @@ class TestPerTokenLossValidation(unittest.TestCase):
 
     def test_rejects_sequence_parallel(self):
         # SP is silently dropped at tp=1, so use tp=2 to keep it on.
-        with self.assertRaisesRegex(AssertionError, "sequence_parallel"):
+        with self.assertRaisesRegex(ValueError, "sequence_parallel"):
             _make_config(
                 calculate_per_token_loss=True,
                 tensor_model_parallel_size=2,
@@ -326,10 +326,37 @@ class TestPerTokenLossValidation(unittest.TestCase):
             )
 
     def test_rejects_csa_compress_ratios(self):
-        with self.assertRaisesRegex(AssertionError, "csa_compress_ratios"):
+        with self.assertRaisesRegex(ValueError, "csa_compress_ratios"):
             _make_config(
                 calculate_per_token_loss=True, csa_compress_ratios=[0, 0]
             )
+        with self.assertRaisesRegex(ValueError, "csa_compress_ratios"):
+            _make_config(
+                calculate_per_token_loss=True, csa_compress_ratios=[-2, 4]
+            )
+
+    def test_accepts_all_mla_csa_compress_ratios(self):
+        _make_config(
+            calculate_per_token_loss=True, csa_compress_ratios=[-2, -2]
+        )
+
+    def test_rejects_use_erndata(self):
+        with self.assertRaisesRegex(ValueError, "use_erndata"):
+            _make_config(calculate_per_token_loss=True, use_erndata=True)
+
+    def test_rejects_pipeline_parallel(self):
+        for kwargs in (
+            {"pipeline_model_parallel_size": 2},
+            {
+                "pipeline_model_parallel_size": 2,
+                "virtual_pipeline_model_parallel_size": 2,
+            },
+        ):
+            with (
+                self.subTest(**kwargs),
+                self.assertRaisesRegex(ValueError, "pipeline parallel"),
+            ):
+                _make_config(calculate_per_token_loss=True, **kwargs)
 
     def test_plain_layout_accepted(self):
         cfg = _make_config(calculate_per_token_loss=True)

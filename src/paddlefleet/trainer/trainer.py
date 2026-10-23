@@ -3223,6 +3223,28 @@ class Trainer:
         resume_from_checkpoint,
         ignore_keys_for_eval,
     ):
+        # The loss module returns a raw token sum under calculate_per_token_loss,
+        # but this loop has no 1/T_global grad normalization for it. Look through
+        # the wrappers too: a wrapped model may not expose config at the top.
+        for layer in (
+            model,
+            getattr(self, "model", None),
+            getattr(self, "model_wrapped", None),
+        ):
+            while layer is not None:
+                if getattr(
+                    getattr(layer, "config", None),
+                    "calculate_per_token_loss",
+                    False,
+                ):
+                    raise NotImplementedError(
+                        "calculate_per_token_loss=True is not supported in the "
+                        "current trainer yet: the loss would be backpropagated "
+                        "as a raw token sum without 1/T_global normalization."
+                    )
+                layer = getattr(layer, "_layers", None) or getattr(
+                    layer, "module", None
+                )
         start_time = time.time()
         self._globalstep_last_start_time = time.time()
         self.state.epoch = 0

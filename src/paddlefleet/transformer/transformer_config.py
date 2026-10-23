@@ -2497,15 +2497,46 @@ class TransformerConfig(ModelParallelConfig):
         # calculate_per_token_loss: reject layouts whose token count is not
         # handled yet, instead of silently mis-scaling the loss.
         if self.calculate_per_token_loss:
-            assert not self.sequence_parallel, (
-                "calculate_per_token_loss + sequence_parallel is unsupported: "
-                "T_global counts TP-sharded labels but is not reduced over TP, "
-                "so it would be ~tp times too small."
-            )
-            assert self.csa_compress_ratios is None, (
-                "calculate_per_token_loss + csa_compress_ratios is unsupported: "
-                "the per-token normalisation has not been validated for CSA."
-            )
+            if self.sequence_parallel:
+                raise ValueError(
+                    "calculate_per_token_loss + sequence_parallel is unsupported: "
+                    "T_global counts TP-sharded labels but is not reduced over "
+                    "TP, so it would be ~tp times too small. Got "
+                    "calculate_per_token_loss=True, sequence_parallel="
+                    f"{self.sequence_parallel}."
+                )
+            # Not validated end to end yet; keep it off until it is.
+            if self.use_erndata:
+                raise ValueError(
+                    "calculate_per_token_loss + use_erndata is not validated "
+                    "yet. Got calculate_per_token_loss=True, use_erndata="
+                    f"{self.use_erndata}; set use_erndata=False."
+                )
+            # All -2 (MLA) builds no CSA/HCA layer, so only that layout is allowed.
+            if self.csa_compress_ratios is not None and not all(
+                int(r) == -2 for r in self.csa_compress_ratios
+            ):
+                raise ValueError(
+                    "calculate_per_token_loss requires csa_compress_ratios to be "
+                    "None or all -2 (MLA): the per-token normalisation has not "
+                    "been validated for CSA. Got calculate_per_token_loss=True, "
+                    f"csa_compress_ratios={self.csa_compress_ratios!r}."
+                )
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError(
+                    "calculate_per_token_loss + pipeline parallel is unsupported: "
+                    "the per-token loss/grad scaling is not wired into the PP "
+                    "schedule. Got calculate_per_token_loss=True, "
+                    "pipeline_model_parallel_size="
+                    f"{self.pipeline_model_parallel_size}."
+                )
+            vpp_size = self.virtual_pipeline_model_parallel_size
+            if vpp_size is not None and vpp_size != 1:
+                raise ValueError(
+                    "calculate_per_token_loss + virtual pipeline parallel is "
+                    "unsupported. Got calculate_per_token_loss=True, "
+                    f"virtual_pipeline_model_parallel_size={vpp_size}."
+                )
         # Validate DSpark topology and target layers.
         if dspark_layers_active(self):
             if int(getattr(self, "num_nextn_predict_layers", 0) or 0) != 0:
