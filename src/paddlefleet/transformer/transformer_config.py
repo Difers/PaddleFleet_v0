@@ -1117,6 +1117,23 @@ class TransformerConfig(ModelParallelConfig):
     Call ``paddlefleet.transformer.moe.finalize_moonep`` before destroying
     the process group when using MoonEP."""
 
+    ringmoe_use_zcomm: bool = True
+    """Whether the 'ringmoe' dispatcher runs its collectives on the low-SM
+    paddlefleet_ops zcomm ops instead of NCCL: intra-node token and
+    output-grad AllGathers on the copy engine (0 SM, the output is an ordinary
+    tensor), the intra-node ReduceScatters hidden behind a GEMM as a
+    copy-engine transpose plus a local sum (bitwise equal to NCCL), and the
+    inter-node ring shifts, combine all-to-all and backward AllGather as
+    NCCL-GIN puts. On by default; set False to use the NCCL collectives.
+
+    It needs paddlefleet_ops built with the zcomm ops, i.e. against NCCL >=
+    2.30.7 (symmetric memory + GIN), and the same NCCL loaded at runtime. The
+    dispatcher checks both when it is built and, if either is missing, warns
+    once and uses NCCL. Other dispatchers ignore the field, and so does an fp8
+    ring (``fp8_dispatch``), which always uses NCCL: the zcomm ReduceScatter
+    sums bf16 only. ``NCCL_NVLS_ENABLE=1`` lets the copy-engine handshakes use
+    one multicast write instead of seven."""
+
     moe_allgather_gate_overlap: bool = True
     """Whether to issue the AllGather before the gate so it overlaps with gate
     compute. Only honoured when ``moe_token_dispatcher_type='allgather'`` and

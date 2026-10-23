@@ -106,6 +106,8 @@ class BenchConfig:
     # Which MaxVio the targets refer to: "per_expert" or "per_rank" (the
     # load of each rank's expert block, i.e. the per-card imbalance).
     maxvio_metric: str = "per_expert"
+    # TransformerConfig.ringmoe_use_zcomm for the ringmoe dispatcher.
+    ringmoe_use_zcomm: bool = True
 
 
 @dataclass
@@ -196,6 +198,7 @@ def build_transformer_config(dispatcher: str, cfg: BenchConfig):
         topk_group=1,
         moe_shared_expert_overlap=cfg.n_shared_experts > 0,
         moe_token_dispatcher_type=dispatcher,
+        ringmoe_use_zcomm=cfg.ringmoe_use_zcomm,
         moe_expert_fusion=True,
         moe_use_fusion_node=True,
         using_sonic_moe=True,
@@ -582,6 +585,14 @@ def _parse_args(argv=None):
         default=default_cfg.maxvio_metric,
         help="MaxVio the --maxvio targets refer to (per_rank = per card)",
     )
+    parser.add_argument(
+        "--ringmoe-use-zcomm",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.ringmoe_use_zcomm,
+        help="run ringmoe's collectives on the paddlefleet_ops zcomm ops "
+        "(TransformerConfig.ringmoe_use_zcomm, on by default; "
+        "--no-ringmoe-use-zcomm = NCCL; other dispatchers ignore it)",
+    )
     return parser.parse_args(argv)
 
 
@@ -605,6 +616,7 @@ def main(argv=None):
         ],
         hot_placement=args.hot_placement,
         maxvio_metric=args.maxvio_metric,
+        ringmoe_use_zcomm=args.ringmoe_use_zcomm,
     )
     paddle.set_default_dtype("bfloat16")
     dispatchers = [

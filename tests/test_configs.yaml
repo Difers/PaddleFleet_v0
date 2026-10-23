@@ -95,6 +95,11 @@ tests:
   - test_case: [tests/multi_card_tests/moe/test_ring_dispatcher_two_level.py]
     products:
       - num_gpus: 8
+  # zcomm ops vs NCCL: the intra-node cases need one 8-GPU NVLink node; the
+  # inter-node cases skip below 2 nodes, and all of them skip without the ops.
+  - test_case: [tests/multi_card_tests/moe/test_zcomm_ops.py]
+    products:
+      - num_gpus: 8
   - test_case: [tests/multi_card_tests/moe/test_moonep.py]
     products:
       - num_gpus: 2

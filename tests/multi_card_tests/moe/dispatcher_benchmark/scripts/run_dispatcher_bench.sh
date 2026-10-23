@@ -24,6 +24,7 @@
 #   BENCH_NODES  space-separated node IPs, first = master (required for nnodes>1)
 #   PY           python with paddle + paddlefleet + paddlefleet_ops  (default: python)
 #   BENCH_ARGS   benchmark args (default: MaxVio 0..4 step 0.5, 3 dispatchers)
+#   RINGMOE_USE_ZCOMM  0 = pass --no-ringmoe-use-zcomm (ringmoe on NCCL; zcomm is the default)
 #   MODEL        optional MoE shape preset (ernie5.5-flash | deepseek-v3.1 |
 #                qwen3-30b-a3b | qwen3-235b-a22b); sets H/I_moe/E/topk
 #   PORT         master port (default 36997)
@@ -37,6 +38,8 @@ PY=${PY:-python}
 PORT=${PORT:-36997}
 BENCH_NODES=${BENCH_NODES:-$(hostname -I | awk '{print $1}')}
 BENCH_ARGS=${BENCH_ARGS:---maxvio 0,0.5,1,1.5,2,2.5,3,3.5,4 --warmup 3 --iters 10 --ring-gpus-per-node 8 --dispatchers allgather,deepep,ringmoe}
+# RINGMOE_USE_ZCOMM=0: run ringmoe on NCCL instead of the zcomm ops (TransformerConfig.ringmoe_use_zcomm, on by default).
+[ "${RINGMOE_USE_ZCOMM:-1}" = 0 ] && BENCH_ARGS="${BENCH_ARGS} --no-ringmoe-use-zcomm"
 # MoE layer shape (H, latent, I_moe, E, topk); empty MODEL keeps the bench default.
 # Only ernie5.5-flash has the latent projection; the others run experts at H.
 case "${MODEL:-}" in

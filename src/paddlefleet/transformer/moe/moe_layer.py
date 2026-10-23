@@ -794,12 +794,18 @@ class MoELayer(nn.Layer):
                     if self.use_ring_moe
                     else AllGatherTokenDispatcher
                 )
+                ring_kwargs = (
+                    {"use_zcomm": self.config.ringmoe_use_zcomm}
+                    if self.use_ring_moe
+                    else {}
+                )
                 self.token_dispatcher = dispatcher_cls(
                     self.moe_group,
                     self.expert_model_parallel_size,
                     self.num_experts,
                     fp8_dispatch=self.fp8_dispatch,
                     use_ue8m0=self.use_ue8m0,
+                    **ring_kwargs,
                 )
                 if self.use_ring_moe and hasattr(
                     getattr(self, "grouped_gemm_experts", None),

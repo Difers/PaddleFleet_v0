@@ -1806,6 +1806,77 @@ def _all_gather_async(input, group):
     return output, task
 
 
+# Low-SM communication for the ring (paddlefleet_ops zcomm ops, see zcomm_comm.py),
+# selected per dispatcher by ``TransformerConfig.ringmoe_use_zcomm``. Each helper
+# below takes that switch as ``zcomm`` and otherwise runs the NCCL collective.
+
+
+_ZCOMM_FALLBACK_WARNED = False
+
+
+def _warn_zcomm_fallback(reason):
+    """Warn (once per process) that ringmoe_use_zcomm falls back to NCCL."""
+    global _ZCOMM_FALLBACK_WARNED
+    if not _ZCOMM_FALLBACK_WARNED:
+        _ZCOMM_FALLBACK_WARNED = True
+        logger.warning(
+            "ringmoe_use_zcomm is on but the zcomm ops cannot run (%s); the "
+            "RingMoE dispatcher uses NCCL. Set ringmoe_use_zcomm=False to "
+            "silence this.",
+            reason,
+        )
+
+
+def _token_all_gather_async(input, group, zcomm=False):
+    """Intra AllGather of a token / output grad; copy-engine pull with ``zcomm``."""
+    if not zcomm:
+        return _all_gather_async(input, group)
+    from .zcomm_comm import IntraCE
+
+    return IntraCE.get(group).all_gather_async(input)
+
+
+def _intra_rs_async(input, group, out=None, zcomm=False, overlapped=True):
+    """Intra ReduceScatter; copy engine + local sum with ``zcomm`` where hidden.
+
+    ``overlapped`` marks a call site whose ReduceScatter a following GEMM hides.
+    Only those switch to the copy engine: it leaves the GEMM its SMs, but alone
+    it is a little slower than NCCL's ring, so exposed ones stay on NCCL.
+    """
+    if not (zcomm and overlapped and input.dtype == paddle.bfloat16):
+        return _reduce_scatter_async(input, group, out=out)
+    from .zcomm_comm import IntraCE
+
+    return IntraCE.get(group).reduce_scatter_async(input, out=out)
+
+
+def _inter_a2a_single(out_shape, x, out_split, in_split, group, zcomm=False):
+    """Async all_to_all_single on the inter group. Returns ``(out, task)``.
+
+    With ``zcomm`` the transfer is NCCL-GIN puts and ``out`` is a view of a
+    window slot that is reissued two calls of its size later, so the caller
+    must consume it within the ring round (or copy it).
+    """
+    if zcomm:
+        from .zcomm_comm import InterGin
+
+        return InterGin.get(group).all_to_all_single(x, out_split, in_split)
+    out = paddle.empty(out_shape, dtype=x.dtype)
+    task = group.process_group.all_to_all_single(
+        out, x.contiguous(), out_split, in_split, False
+    )
+    return out, task
+
+
+def _inter_all_gather_async(input, group, zcomm=False):
+    """Async AllGather on the inter group; NCCL-GIN puts with ``zcomm``."""
+    if not zcomm:
+        return _all_gather_async(input, group)
+    from .zcomm_comm import InterGin
+
+    return InterGin.get(group).all_gather_async(input)
+
+
 def _quantize_and_pack_fp8(x):
     """Quantize ``x`` to fp8 e4m3 + int32 1x128 block scale and pack into a
     single uint8 row ``[T_local, H + 4*num_scale_blocks]``
@@ -2050,7 +2121,7 @@ class _AllGatherCombineNoOverlap(paddle.autograd.PyLayer):
         return all_gather_group(grad_output, group=group)
 
 
-def _raw_inter_shift_async(x, group, dst, src, handle):
+def _raw_inter_shift_async(x, group, dst, src, handle, zcomm=False):
     """Async cyclic ring shift of ``x``: send to ``dst``, receive from ``src``.
 
     Value-only (no autograd node); the reverse is the same call with ``dst``
@@ -2064,12 +2135,22 @@ def _raw_inter_shift_async(x, group, dst, src, handle):
     in_split[dst] = rows
     out_split = [0] * nranks
     out_split[src] = rows
-    out = paddle.empty(x.shape, dtype=x.dtype)
-    # Direct ProcessGroup call, as in `_reduce_scatter_async`.
-    handle["task"] = group.process_group.all_to_all_single(
-        out, x.contiguous(), out_split, in_split, False
+    out, handle["task"] = _inter_a2a_single(
+        list(x.shape), x, out_split, in_split, group, zcomm=zcomm
     )
     return out
+
+
+def _add_hop(acc, hop):
+    """``acc + hop`` for a received reverse hop, never returning ``hop`` itself.
+
+    ``hop`` may be a view of a zcomm window slot that is reissued a couple of
+    transfers later, so it must not become a grad that outlives the backward
+    step; a missing ``acc`` copies it instead of aliasing it.
+    """
+    if hop is None:
+        return acc
+    return hop.clone() if acc is None else acc + hop
 
 
 def _raw_fp8_shift_async(data, scale, group, dst, src, handle):
@@ -2260,7 +2341,9 @@ class _RingTokHopJoin(paddle.autograd.PyLayer):
     The ring backward's final link hops the remote rounds' token grad back
     home. Waiting for it inside the ring op would hold back the router
     backward, which only needs the routing grad. Instead the ring op
-    leaves the hop in flight and records it in ``slot``. This op aliases both
+    leaves the hop in flight (with zcomm also the last token-grad
+    ReduceScatter, which the hop is ordered after on the comm side) and
+    records it in ``slot``. This op aliases both
     the carrier and the router input, so autograd runs its backward only
     after both grads arrived, i.e. after the router backward is enqueued. It
     then waits for the hop and adds its result to the carrier grad.
@@ -2277,6 +2360,12 @@ class _RingTokHopJoin(paddle.autograd.PyLayer):
         ctx.slot = None
         if slot:
             RingMoETokenDispatcher._drain([slot["hop"]])
+            # Waiting for the hop covers everything ordered before it on the
+            # comm side: the deferred ReduceScatter and the comm-stream add.
+            # Their zcomm tasks withdraw their stream registrations now.
+            for kept in slot.get("keep") or ():
+                if hasattr(kept, "covered"):
+                    kept.covered()
             rev = slot["rev"].reshape(carrier_grad.shape)
             if rev.dtype != carrier_grad.dtype:
                 rev = rev.astype(carrier_grad.dtype)
@@ -2929,7 +3018,7 @@ def _fp8_pair(data, scale, meta):
     }
 
 
-def _combine_a2a_issue(partials, group, handle, send=None):
+def _combine_a2a_issue(partials, group, handle, send=None, zcomm=False):
     """Issue the all-to-all half of the inter-node combine.
 
     The combine is a ReduceScatter split into an all-to-all plus a local sum:
@@ -2958,17 +3047,13 @@ def _combine_a2a_issue(partials, group, handle, send=None):
     for peer in peers:
         in_split[peer] = T
         out_split[peer] = T
-    recv = paddle.empty(
-        [T * len(peers), *partials[0].shape[1:]], dtype=partials[0].dtype
-    )
-    task = paddle.distributed.stream.alltoall_single(
-        recv,
-        send.contiguous(),
-        out_split_sizes=out_split,
-        in_split_sizes=in_split,
-        group=group,
-        sync_op=False,
-        use_calc_stream=False,
+    recv, task = _inter_a2a_single(
+        [T * len(peers), *partials[0].shape[1:]],
+        send,
+        out_split,
+        in_split,
+        group,
+        zcomm=zcomm,
     )
     handle.update(
         {
@@ -3003,7 +3088,7 @@ def _routing_unpair(pair, k, w_dtype):
     return idx, w
 
 
-def _prefetch_intra_ag(pair, group):
+def _prefetch_intra_ag(pair, group, zcomm=False):
     """Pre-issue an async intra AllGather of a non-fp8 token on the comm stream.
 
     The gather overlaps compute; :func:`_pre_ag_pair_value` consumes it
@@ -3013,7 +3098,7 @@ def _prefetch_intra_ag(pair, group):
     """
     if group is None or group.nranks == 1:
         return None
-    out, task = _all_gather_async(pair, group)
+    out, task = _token_all_gather_async(pair, group, zcomm=zcomm)
     return {
         "out": out,
         "task": task,
@@ -3188,6 +3273,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         num_experts: int,
         fp8_dispatch: bool = False,
         use_ue8m0: bool = False,
+        use_zcomm: bool = False,
     ):
         super().__init__(
             moe_group,
@@ -3199,6 +3285,18 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         # ``use_ue8m0`` needs no handling: as in the flat dispatcher, token
         # quantization always uses an int32 block scale.
         self.fp8_dispatch = fp8_dispatch
+        # ``TransformerConfig.ringmoe_use_zcomm``: run the ring's collectives on
+        # the paddlefleet_ops zcomm ops. The fp8 ring keeps NCCL (the zcomm
+        # ReduceScatter sums bf16 only), and so does a process whose
+        # paddlefleet_ops / NCCL cannot run them, after one warning.
+        self.use_zcomm = use_zcomm and not fp8_dispatch
+        if self.use_zcomm:
+            from .zcomm_comm import zcomm_unavailable_reason
+
+            reason = zcomm_unavailable_reason()
+            if reason is not None:
+                _warn_zcomm_fallback(reason)
+                self.use_zcomm = False
         # Set by the first ring_forward, which checks that token counts match
         # across the inter group; gates the remote-first pre-gate.
         self._equal_tokens_checked = False
@@ -3283,6 +3381,8 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             pending += list(_tasks_of(stale_remote["h"])) + list(
                 _tasks_of(stale_remote["pf"])
             )
+            for more in (stale_remote.get("pf_more") or {}).values():
+                pending += list(_tasks_of(more))
         self._gate_pf_handle = None
         self._gate_pack = None
         for task in pending:
@@ -3343,7 +3443,9 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         else:
             # bf16: the token itself is the carrier.
             data, scale = t, None
-            self._gate_pf_handle = _prefetch_intra_ag(t, self.intra_group)
+            self._gate_pf_handle = _prefetch_intra_ag(
+                t, self.intra_group, zcomm=self.use_zcomm
+            )
         self._gate_pack = {
             "meta": meta,
             "data": data,
@@ -3352,16 +3454,25 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         }
 
     def _pre_gate_remote(self, data, scale, meta):
-        """Issue the first remote round's token hop and intra gather.
+        """Issue the remote rounds' token transfers and intra gathers.
 
-        The forward runs the remote rounds first and the home round last:
-        round 1's token (on fp8, its data and scale) is hopped and gathered
-        here so both overlap the router, and the last peer slot's
-        ReduceScatter and the combine all-to-all can then overlap the home
-        round's GEMM. Returns ``{"data", "scale", "h", "pf"}`` (hop outputs,
-        hop handle, gather handle), or None before
-        :meth:`_check_equal_tokens` has run (a hop with mismatched sizes
-        hangs instead of raising) or without an intra routing group.
+        The forward runs the remote rounds first and the home round last, so
+        the last peer slot's ReduceScatter and the combine all-to-all can
+        overlap the home round's GEMM. With zcomm one inter AllGather
+        fetches every node's token here and every remote round's intra
+        gather is issued right behind it, all overlapping the router: no
+        round's gather then waits for the previous round's hop (with the
+        copy engine's and GIN's handshakes such a hop -> gather chain
+        outgrows the GEMM it should hide behind once there are several
+        hops). Otherwise round 1's token (on fp8, its data and scale) is
+        hopped and gathered here and later rounds hop in the loop.
+
+        Returns ``{"data", "scale", "h", "pf"}`` (round 1's token, the
+        transfer handle, round 1's gather handle) plus, with zcomm, ``"blk"``
+        (round k's token) and ``"pf_more"`` (later rounds' gather handles),
+        or None before :meth:`_check_equal_tokens` has run (a transfer with
+        mismatched sizes hangs instead of raising) or without an intra
+        routing group.
         """
         if not (self._equal_tokens_checked and self.intra_rt_group is not None):
             return None
@@ -3370,12 +3481,55 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         inter_rank = inter.rank
         dst, src = (inter_rank + 1) % self.N, (inter_rank - 1) % self.N
         handle = {}
+        if self.use_zcomm:
+            # Block d of the gather is node d's token; round k processes
+            # node (rank - k)'s. Round 1's block is gathered first, then the
+            # other remote rounds' together, each followed on the comm side
+            # by those rounds' intra gathers: round 1 runs right after the
+            # router, so its token should not share the NIC with the later
+            # rounds' tokens until all of them land.
+            from .zcomm_comm import InterGin
+
+            rows = data.shape[0]
+            blocks, pfs = {}, {}
+
+            def _on_part(ks, all_tok, task):
+                handle["task"] = task
+                if not _order_after(tok_group, inter):
+                    self._drain([handle])
+                for k in ks:
+                    blocks[k] = all_tok[
+                        (inter_rank - k) % self.N * rows : (
+                            (inter_rank - k) % self.N + 1
+                        )
+                        * rows
+                    ]
+                    pfs[k] = _prefetch_intra_ag(
+                        blocks[k], tok_group, zcomm=self.use_zcomm
+                    )
+
+            InterGin.get(inter).all_gather_by_distance_async(data, _on_part)
+            # On zcomm the gather output is a window slot, reissued two
+            # gathers of its size later; only its blocks are kept. Every
+            # block's intra gather is waited on before its round's GEMM, and
+            # any later transfer is issued after that, so ordered after it.
+            pf = pfs.pop(1)
+            return {
+                "data": blocks.pop(1),
+                "scale": None,
+                "h": handle,
+                "pf": pf,
+                "blk": blocks,
+                "pf_more": pfs,
+            }
         if self.fp8_dispatch:
             remote_data, remote_scale = _raw_fp8_shift_async(
                 data, scale, inter, dst, src, handle
             )
         else:
-            remote_data = _raw_inter_shift_async(data, inter, dst, src, handle)
+            remote_data = _raw_inter_shift_async(
+                data, inter, dst, src, handle, zcomm=False
+            )
             remote_scale = None
         # Order the gather after the hop on the comm side; if that is not
         # possible, wait for the hop instead.
@@ -3390,7 +3544,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     _fp8_pair(remote_data, remote_scale, meta), tok_group
                 )
                 if self.fp8_dispatch
-                else _prefetch_intra_ag(remote_data, tok_group)
+                else _prefetch_intra_ag(remote_data, tok_group, zcomm=False)
             ),
         }
 
@@ -3471,8 +3625,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
 
         The first call runs the home round first and takes every round's
         routing from one inter AllGather. Later calls run remote-first
-        (rounds 1..N-1, then home), hop the routing pair with the token, and
-        issue the combine before the home GEMM so it overlaps it.
+        (rounds 1..N-1, then home), hop the routing pair and the token (with
+        zcomm, every round's token comes from one inter AllGather issued
+        before the router instead), and issue the combine before the home
+        GEMM so it overlaps it.
 
         All rounds and the combine run inside one :class:`_RingRoundsExplicit`
         op whose backward is scheduled by hand. Requires an equal local token
@@ -3598,6 +3754,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             k_topk = local_idx.shape[1]
             w_dtype = home_w.dtype
             rs_group = self.intra_rs_group
+            zc = self.use_zcomm
 
             # partials[slot] is this node's output for the tokens of
             # inter rank ``slot``.
@@ -3620,6 +3777,14 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             # so they hop the pair on `inter` with the token instead.
             pair_pregather = not remote_first
             pair_inter_group = self.inter_cb_group
+            # zcomm: the pre-gate token gather keeps `inter` busy into the
+            # first rounds, so routing hops go on the combine communicator,
+            # beside it, instead of queueing behind it.
+            pair_hop_group = (
+                pair_inter_group
+                if zc and pair_inter_group is not None
+                else inter
+            )
             # Every node's gathered routing pair, [N*G*T, 2K].
             all_pairs = None
             steps = (
@@ -3637,9 +3802,17 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 if rs_group is None or rs_group.nranks == 1:
                     partials[slot] = y
                     return
+                # The forward output RS stays on NCCL: on the copy engine its
+                # local-sum kernel can only start once the next round's
+                # expert GEMM (a persistent kernel holding every SM) has
+                # finished, which delays the last peer slot's partial and so
+                # the combine behind it. NCCL's kernel is resident before the
+                # GEMM starts.
                 if slot == inter_rank:
                     # Home slot: stays local, own buffer.
-                    out, task = _reduce_scatter_async(y, rs_group)
+                    out, task = _intra_rs_async(
+                        y, rs_group, zcomm=False, overlapped=False
+                    )
                     partials[slot] = out
                     rs_tasks.append(task)
                     return
@@ -3651,9 +3824,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         dtype=y.dtype,
                     )
                 peer_idx = peer_index[slot]
-                out, task = _reduce_scatter_async(
+                out, task = _intra_rs_async(
                     y,
                     rs_group,
+                    zcomm=False,
                     out=combine_send[
                         peer_idx * scatter_rows : (peer_idx + 1) * scatter_rows
                     ],
@@ -3678,20 +3852,33 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             tok_ag_handle = home_tok_ag_handle
             home_pair_ag_handle = pair_ag_handle
             remote_pair_hop_handle = {}
+            pregather_blk, pregather_pf = None, {}
             if remote_first:
                 # Start with round 1. Its token was hopped and
                 # gathered under the router; hop its routing pair now and
                 # gather it after the hop (comm-side order if possible).
                 cur_pair = _raw_inter_shift_async(
-                    home_pair, inter, dst, src, remote_pair_hop_handle
+                    home_pair,
+                    pair_hop_group,
+                    dst,
+                    src,
+                    remote_pair_hop_handle,
+                    zcomm=zc,
                 )
-                if not _order_after(rt_group, inter):
+                if not _order_after(rt_group, pair_hop_group):
                     self._drain([remote_pair_hop_handle])
                 pair_ag_handle = _prefetch_routing_ag(cur_pair, rt_group)
                 cur_pair.stop_gradient = False
-                cur_data, cur_scale = remote["data"], remote["scale"]
+                # Pop rather than read: `remote` lives until the end of the
+                # forward, and with zcomm its hop output is a window view
+                # that must be released once the rounds move past it.
+                cur_data, cur_scale = remote.pop("data"), remote.pop("scale")
                 cur_data.stop_gradient = home_carrier.stop_gradient
                 tok_ag_handle = remote["pf"]
+                # zcomm: every remote round's token is a block of the
+                # pre-gate inter AllGather, already gathered intra-node.
+                pregather_blk = remote.pop("blk", None)
+                pregather_pf = remote.pop("pf_more", None) or {}
             # A round's output ReduceScatter is deferred until just before
             # the next round's GEMM, so it overlaps that GEMM; the last
             # one is issued after the loop.
@@ -3715,6 +3902,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     inter,
                     combine_handle,
                     send=combine_send,
+                    zcomm=zc,
                 )
 
             for pos, step in enumerate(steps):
@@ -3826,15 +4014,27 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                             # after this hop only on the comm side. If
                             # that fails, the next round gathers inline.
                             next_pair = _raw_inter_shift_async(
-                                cur_pair, inter, dst, src, pair_comm_handle
+                                cur_pair,
+                                pair_hop_group,
+                                dst,
+                                src,
+                                pair_comm_handle,
+                                zcomm=zc,
                             )
-                            if _order_after(rt_group, inter):
+                            if _order_after(rt_group, pair_hop_group):
                                 next_pair_ag_handle = _prefetch_routing_ag(
                                     next_pair, rt_group
                                 )
                         # Token hop, then its gather on `tok_group`,
                         # ordered after the `inter` hops on the comm side.
-                        if fp8_ring:
+                        # With the pre-gather both were issued under the
+                        # router.
+                        if pregather_blk is not None:
+                            next_data = pregather_blk.pop(steps[pos + 1])
+                            next_tok_ag_handle = pregather_pf.pop(
+                                steps[pos + 1]
+                            )
+                        elif fp8_ring:
                             next_data, next_scale = _raw_fp8_shift_async(
                                 cur_data,
                                 cur_scale,
@@ -3845,24 +4045,42 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                             )
                         else:
                             next_data = _raw_inter_shift_async(
-                                cur_data, inter, dst, src, tok_hop_handle
+                                cur_data,
+                                inter,
+                                dst,
+                                src,
+                                tok_hop_handle,
+                                zcomm=zc,
                             )
-                        if _order_after(tok_group, inter):
+                        if pregather_blk is None and _order_after(
+                            tok_group, inter
+                        ):
                             next_tok_ag_handle = (
                                 _prefetch_tok_ag_fp8(
                                     _fp8_pair(next_data, next_scale, meta),
                                     tok_group,
                                 )
                                 if fp8_ring
-                                else _prefetch_intra_ag(next_data, tok_group)
+                                else _prefetch_intra_ag(
+                                    next_data, tok_group, zcomm=zc
+                                )
                             )
 
                     res = _do_gemm()
 
                     return res[0] if isinstance(res, (tuple, list)) else res
 
+                seg_pair = cur_pair
+                if zc:
+                    # The pair is a GIN pool view and, as a leaf of the
+                    # manual backward, lives until this layer's backward;
+                    # copy it (~1 MiB) so the pool slot is free once the
+                    # round's prefetches have read it.
+                    with paddle.no_grad():
+                        seg_pair = cur_pair.clone()
+                    seg_pair.stop_gradient = cur_pair.stop_gradient
                 seg_bwd_fn, y = _manual_backward(
-                    _seg, is_first_fwd, gathered_tok, cur_pair
+                    _seg, is_first_fwd, gathered_tok, seg_pair
                 )
                 seg_bwd_fns[step] = seg_bwd_fn
                 # Round `step` processed the tokens of inter rank
@@ -3909,6 +4127,13 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     tok_ag_handle = next_tok_ag_handle
                     pair_ag_handle = next_pair_ag_handle
 
+            # `_seg` closes over these names and the segments' backward
+            # closures keep `_seg` alive until this layer's backward; drop
+            # the last hop outputs (pool views on the zcomm paths) now.
+            cur_data = cur_scale = cur_pair = None
+            # The pre-gathered tokens are a window view on zcomm as well.
+            pregather_blk, pregather_pf = None, {}
+
             # Issue the last ReduceScatter without waiting, so the shared
             # expert below overlaps it as well as the combine.
             if pending_rs is not None:
@@ -3926,7 +4151,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     for pending_task in rs_tasks:
                         pending_task.wait()
                 _combine_a2a_issue(
-                    partials, inter, combine_handle, send=combine_send
+                    partials, inter, combine_handle, send=combine_send, zcomm=zc
                 )
             if has_se:
                 se_bwf, se_out = _manual_backward(se_fn, is_first_fwd, res)
@@ -3945,8 +4170,11 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 # Home partial plus the received peer partials, in ascending
                 # peer order.
                 combine_handle["task"].wait()
+                # Pop the receive buffer: `combine_handle` is reachable from
+                # the rounds' closures until this layer's backward, and with
+                # zcomm the buffer is a window view reissued two layers later.
                 a2a_recv, chunk_rows = (
-                    combine_handle["recv"],
+                    combine_handle.pop("recv"),
                     combine_handle["T"],
                 )
                 combined = partials[combine_handle["r0"]]
@@ -3989,15 +4217,20 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 g_se_out = out_grads[1:] if has_se else ()
                 g_round_out = [None] * num_nodes
                 g_out_ag_tasks = [None] * num_nodes
-                g_round_out[0], g_out_ag_tasks[0] = _all_gather_async(
-                    g_combined.contiguous(), rs_group
+                g_round_out[0], g_out_ag_tasks[0] = _token_all_gather_async(
+                    g_combined.contiguous(), rs_group, zcomm=zc
                 )
-                g_all, g_all_task = _all_gather_async(
-                    g_combined.contiguous(), inter
+                g_all, g_all_task = _inter_all_gather_async(
+                    g_combined.contiguous(), inter, zcomm=zc
                 )
 
                 def _issue_remote_out_gathers():
-                    # Slices of g_all are views; no copy is enqueued.
+                    # Slices of g_all are views; no copy is enqueued. On
+                    # zcomm g_all is a window slot: drop it once sliced (each
+                    # slice's gather is waited on before its round's expert
+                    # backward, which precedes any transfer that could reuse
+                    # the slot).
+                    nonlocal g_all, g_all_task
                     for k in range(num_nodes - 1, 0, -1):
                         d = (inter_rank - k) % num_nodes
                         g_partial = g_all[
@@ -4005,9 +4238,13 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         ]
                         if list(g_partial.shape) != partial_shapes[d]:
                             g_partial = g_partial.reshape(partial_shapes[d])
-                        g_round_out[k], g_out_ag_tasks[k] = _all_gather_async(
-                            g_partial, rs_group
+                        g_round_out[k], g_out_ag_tasks[k] = (
+                            _token_all_gather_async(
+                                g_partial, rs_group, zcomm=zc
+                            )
                         )
+                    if zc:
+                        g_all = g_all_task = None
 
                 remote_ag_issued = _order_after(rs_group, inter)
                 if remote_ag_issued:
@@ -4027,18 +4264,29 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         else se_grads
                     )
 
-                # The output gathers above are already ordered on the comm
-                # side and the home round's expert backward covers the inter
-                # one, while the final reverse hop at the end of this function
-                # has no compute left after it. Moving the shared expert there
-                # trades a covered gather for a covered hop. Only safe when
-                # the remote gathers were issued without waiting; otherwise
-                # the wait below is what the shared expert has to cover.
-                se_late = remote_ag_issued
-                # With a token-hop join the router backward already covers
-                # the final hop, so the held-back shared expert covers the
-                # last remote round's token-grad ReduceScatter instead (see
-                # after the loop).
+                # zcomm with a token-hop join (see `join_token_hop`): the
+                # router backward covers the end of this backward. The last
+                # round's token-grad ReduceScatter is not waited on here, the
+                # final token hop is ordered after it on the comm side, and
+                # the join waits for the hop. The shared expert then has
+                # nothing to cover at the end and runs first, covering the
+                # home round's output-grad gather, which the home round's
+                # expert backward waits for right away. (The NCCL path keeps
+                # its schedule.)
+                defer_last_rs = zc and tok_hop_slot is not None
+                # Otherwise the output gathers above are already ordered on
+                # the comm side and the home round's expert backward covers
+                # the inter one, while the final reverse hop at the end of
+                # this function has no compute left after it. Moving the
+                # shared expert there trades a covered gather for a covered
+                # hop. Only safe when the remote gathers were issued without
+                # waiting; otherwise the wait below is what the shared expert
+                # has to cover.
+                se_late = remote_ag_issued and not defer_last_rs
+                # With a join the router backward already covers the final
+                # hop, so the held-back shared expert covers the last remote
+                # round's token-grad ReduceScatter instead (see after the
+                # loop).
                 se_covers_last_tok_rs = se_late and tok_hop_slot is not None
                 if not se_late:
                     _run_se_bwd()
@@ -4129,20 +4377,31 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     g_w_j = None if pair_pregather else _w_of(local_g_pair[j])
                     if pending_rev_hop is not None:
                         (tok_hop, tok_rev), (w_hop, w_rev) = pending_rev_hop
-                        self._drain([tok_hop, w_hop])
-                        g_tok_j = (
-                            tok_rev if g_tok_j is None else g_tok_j + tok_rev
-                        )
-                        if w_rev is not None:
-                            g_w_j = w_rev if g_w_j is None else g_w_j + w_rev
                         pending_rev_hop = None
+                        self._drain([tok_hop, w_hop])
+                        g_tok_j = _add_hop(g_tok_j, tok_rev)
+                        g_w_j = _add_hop(g_w_j, w_rev)
+                        # With zcomm the hop outputs are window views
+                        # reissued two hops of their size later, and the
+                        # next hop is issued below: drop them first.
+                        del tok_rev, w_rev
                     g_tok_chain[j] = g_tok_j
                     g_w_chain[j] = g_w_j
                     if j >= 2:
                         tok_hop, w_hop = {}, {}
+                        # The send buffer stays referenced by the handle: the
+                        # 2 -> 1 hop is not waited on the calc stream when the
+                        # last RS is deferred (see after the loop).
+                        if g_tok_j is not None:
+                            tok_hop["src"] = g_tok_j.contiguous()
                         tok_rev = (
                             _raw_inter_shift_async(
-                                g_tok_j.contiguous(), inter, src, dst, tok_hop
+                                tok_hop["src"],
+                                inter,
+                                src,
+                                dst,
+                                tok_hop,
+                                zcomm=zc,
                             )
                             if g_tok_j is not None
                             else None
@@ -4154,6 +4413,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                                 src,
                                 dst,
                                 w_hop,
+                                zcomm=zc,
                             )
                             if g_w_j is not None
                             else None
@@ -4162,7 +4422,8 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
 
                 # Home round first, then the remote rounds in descending
                 # order, which is the order the reverse-hop chain folds them.
-                for k in [0, *range(num_nodes - 1, 0, -1)]:
+                bwd_order = [0, *range(num_nodes - 1, 0, -1)]
+                for k in bwd_order:
                     g_out_ag_tasks[k].wait()
                     # Expert backward of round k; it overlaps the previous
                     # segment's token-grad ReduceScatter. The routing-pair
@@ -4197,8 +4458,12 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         else None
                     )
                     if tok_rs_src is not None:
-                        rs_out, rs_task = _reduce_scatter_async(
-                            tok_rs_src, tok_rs_group
+                        rs_out, rs_task = _intra_rs_async(
+                            tok_rs_src,
+                            tok_rs_group,
+                            zcomm=zc,
+                            # The last one is exposed unless deferred.
+                            overlapped=k != bwd_order[-1] or defer_last_rs,
                         )
                         pending_tok_rs = (k, rs_out, rs_task, tok_rs_src)
                     else:
@@ -4206,18 +4471,60 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         pending_tok_rs = None
                 # The loop ended on round 1: wait for its token-grad
                 # ReduceScatter (it overlapped any in-flight 2 -> 1 hop),
-                # then fold round 1 before the final link.
+                # then fold round 1 before the final link. With a join it is
+                # not waited on: the final hop is ordered after it below, and
+                # everything the comm streams still read or write (its input
+                # and output, the reverse hop and the add below) stays
+                # referenced until the join drains the hop; freed early, the
+                # calc stream could reuse that memory under them.
                 # The shared expert held back for the join is enqueued after
                 # that ReduceScatter was issued, so it overlaps it.
                 if se_covers_last_tok_rs:
                     _run_se_bwd()
+                deferred_rs = None
                 if pending_tok_rs is not None:
                     rs_round, rs_out, rs_task, _rs_input = pending_tok_rs
                     if rs_task is not None:
-                        rs_task.wait()
+                        if defer_last_rs:
+                            deferred_rs = (
+                                rs_task,
+                                tok_rs_groups[rs_round],
+                                _rs_input,
+                                rs_out,
+                            )
+                        else:
+                            rs_task.wait()
                         local_g_tok[rs_round] = rs_out
                     pending_tok_rs = None
-                _fold(1)
+                # zcomm: tasks of comm-stream adds that only the join's wait
+                # for the final hop covers (see `_RingTokHopJoin`).
+                add_tasks = []
+                if deferred_rs is not None and pending_rev_hop is not None:
+                    # Round 1's token grad is the RS output plus the reverse
+                    # hop from round 2. Add them on the inter comm stream,
+                    # after the RS (comm-side) and after the hop (same
+                    # stream), so the calc stream waits for neither.
+                    (tok_hop, tok_rev), (w_hop, w_rev) = pending_rev_hop
+                    pending_rev_hop = None
+                    self._drain([w_hop])
+                    g_w_1 = None if pair_pregather else _w_of(local_g_pair[1])
+                    g_w_chain[1] = _add_hop(g_w_1, w_rev)
+                    del w_rev
+                    if not _order_after(inter, deferred_rs[1]):
+                        deferred_rs[0].wait()
+                    if tok_rev is None:
+                        g_tok_chain[1] = local_g_tok[1]
+                    else:
+                        from .zcomm_comm import stream_add
+
+                        # Same bf16 add (and rounding) as `_add_hop`.
+                        g_tok_chain[1] = stream_add(
+                            local_g_tok[1], tok_rev, inter, tasks=add_tasks
+                        )
+                    deferred_rs = (*deferred_rs, tok_hop, tok_rev, *add_tasks)
+                    del tok_rev
+                else:
+                    _fold(1)
 
                 # Rounds 1..N-1 are folded. Seed the home round's grads.
                 g_w_chain[0] = _w_of(local_g_pair[0])
@@ -4226,15 +4533,29 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 # referenced until the hops are drained.
                 last_tok_hop, last_w_hop = {}, {}
                 last_tok_src = last_w_src = last_tok_rev = last_w_rev = None
+                if deferred_rs is not None and not _order_after(
+                    inter, deferred_rs[1]
+                ):
+                    deferred_rs[0].wait()
                 if g_tok_chain[1] is not None:
                     last_tok_src = g_tok_chain[1].contiguous()
                     last_tok_rev = _raw_inter_shift_async(
-                        last_tok_src, inter, src, dst, last_tok_hop
+                        last_tok_src,
+                        inter,
+                        src,
+                        dst,
+                        last_tok_hop,
+                        zcomm=zc,
                     )
                 if g_w_chain[1] is not None:
                     last_w_src = g_w_chain[1].contiguous()
                     last_w_rev = _raw_inter_shift_async(
-                        last_w_src, pair_inter_group, src, dst, last_w_hop
+                        last_w_src,
+                        pair_inter_group,
+                        src,
+                        dst,
+                        last_w_hop,
+                        zcomm=zc,
                     )
                 # The hops are in flight and every expert backward is done, so
                 # this is the one place in the backward with nothing left to
@@ -4251,7 +4572,8 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 g_home_tok = g_tok_chain[0]
                 # With a join (see `join_token_hop`), the token hop is left
                 # in flight: the join waits for it after the router backward
-                # is enqueued, and adds last_tok_rev itself.
+                # is enqueued, and adds last_tok_rev itself (into a new
+                # tensor, so a zcomm window view never becomes the grad).
                 defer_tok_hop = (
                     tok_hop_slot is not None
                     and last_tok_rev is not None
@@ -4259,24 +4581,23 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 )
                 if defer_tok_hop:
                     tok_hop_slot.update(
-                        hop=last_tok_hop, rev=last_tok_rev, src=last_tok_src
+                        hop=last_tok_hop,
+                        rev=last_tok_rev,
+                        src=last_tok_src,
+                        keep=deferred_rs,
                     )
                     self._drain([last_w_hop])
                 else:
                     self._drain([last_tok_hop, last_w_hop])
-                for g_w_extra in (last_w_rev, g_w_pregather):
-                    if g_w_extra is not None:
-                        g_w_chain[0] = (
-                            g_w_extra
-                            if g_w_chain[0] is None
-                            else g_w_chain[0] + g_w_extra
-                        )
-                if last_tok_rev is not None and not defer_tok_hop:
-                    g_home_tok = (
-                        last_tok_rev
-                        if g_home_tok is None
-                        else g_home_tok + last_tok_rev
+                g_w_chain[0] = _add_hop(g_w_chain[0], last_w_rev)
+                if g_w_pregather is not None:
+                    g_w_chain[0] = (
+                        g_w_pregather
+                        if g_w_chain[0] is None
+                        else g_w_chain[0] + g_w_pregather
                     )
+                if not defer_tok_hop:
+                    g_home_tok = _add_hop(g_home_tok, last_tok_rev)
                 leaf_grads = [g_home_tok, g_w_chain[0]]
                 if has_se:
                     leaf_grads.append(g_se)

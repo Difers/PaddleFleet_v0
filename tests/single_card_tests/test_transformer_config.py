@@ -310,6 +310,36 @@ class TestMoETokenDispatcherConfig(unittest.TestCase):
         # default rather than being force-corrected behind the user's back.
         self.assertTrue(config.moe_allgather_gate_overlap)
 
+    def test_ringmoe_use_zcomm_defaults_on(self):
+        self.assertTrue(
+            TransformerConfig(
+                num_hidden_layers=4,
+                n_routed_experts=8,
+                moe_token_dispatcher_type="ringmoe",
+            ).ringmoe_use_zcomm
+        )
+
+    def test_ringmoe_use_zcomm_can_be_turned_off(self):
+        config = TransformerConfig(
+            num_hidden_layers=4,
+            n_routed_experts=8,
+            moe_token_dispatcher_type="ringmoe",
+            ringmoe_use_zcomm=False,
+        )
+        self.assertFalse(config.ringmoe_use_zcomm)
+
+    def test_ringmoe_use_zcomm_does_not_block_other_configs(self):
+        # On by default, so it must not reject the configs it does not apply
+        # to: other dispatchers ignore it, and the fp8 ring falls back to NCCL.
+        for kwargs in (
+            {"moe_token_dispatcher_type": "allgather"},
+            {"moe_token_dispatcher_type": "ringmoe", "fp8": "e4m3"},
+        ):
+            config = TransformerConfig(
+                num_hidden_layers=4, n_routed_experts=8, **kwargs
+            )
+            self.assertTrue(config.ringmoe_use_zcomm, kwargs)
+
     def test_documented_dispatcher_types_are_all_accepted(self):
         """The field docstring is the only list of accepted values, so pin it.
 

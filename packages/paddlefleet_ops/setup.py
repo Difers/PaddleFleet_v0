@@ -152,6 +152,89 @@ def _build_gencode_flags(cuda_major: int, cuda_minor: int) -> list[str]:
     return flags
 
 
+# Oldest NCCL the zcomm ops are validated with (their device API first appears in
+# 2.29.7); keep in sync with zcomm_comm.MIN_NCCL_VERSION.
+_ZCOMM_MIN_NCCL = (2, 30, 7)
+
+
+def _nccl_header_version(include_dir):
+    """(major, minor, patch) from ``include_dir``/nccl.h, or None."""
+    import re
+
+    path = os.path.join(include_dir, "nccl.h")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        text = f.read()
+    parts = [
+        re.search(rf"#define\s+NCCL_{key}\s+(\d+)", text)
+        for key in ("MAJOR", "MINOR", "PATCH")
+    ]
+    if not all(parts):
+        return None
+    return tuple(int(m.group(1)) for m in parts)
+
+
+def _zcomm_nccl():
+    """Where to build the zcomm ops from: ``(include_dirs, library_dirs,
+    nccl_lib)``, or None to leave them out of the extension.
+
+    The ops use the NCCL device (LSA/GIN) API, whose struct layouts must match
+    the libnccl loaded at runtime, so NCCL_HOME should point at that NCCL.
+    Without it the first nccl.h the compiler would see is used. An NCCL older
+    than _ZCOMM_MIN_NCCL (or one without nccl_device.h) only drops the zcomm
+    ops; every other op still builds, and the RingMoE dispatcher reports why
+    ``ringmoe_use_zcomm`` cannot be used.
+    """
+    nccl_home = os.environ.get("NCCL_HOME", "").strip()
+    if nccl_home:
+        candidates = [
+            (os.path.join(nccl_home, "include"), os.path.join(nccl_home, "lib"))
+        ]
+    else:
+        # The pip NCCL (what Paddle loads at runtime when it is installed),
+        # then the system one.
+        candidates = []
+        try:
+            import nvidia.nccl
+
+            root = next(iter(nvidia.nccl.__path__))
+            candidates.append(
+                (os.path.join(root, "include"), os.path.join(root, "lib"))
+            )
+        except ImportError:
+            pass
+        candidates += [
+            ("/usr/local/cuda/include", None),
+            ("/usr/include", None),
+        ]
+    for inc, lib in candidates:
+        version = _nccl_header_version(inc)
+        if version is None:
+            continue
+        found = ".".join(map(str, version))
+        need = ".".join(map(str, _ZCOMM_MIN_NCCL))
+        if version < _ZCOMM_MIN_NCCL or not os.path.isfile(
+            os.path.join(inc, "nccl_device.h")
+        ):
+            logging.warning(
+                f"zcomm ops skipped: NCCL {found} at {inc} lacks the device "
+                f"API they need (>= {need}); set NCCL_HOME to a newer NCCL"
+            )
+            return None
+        logging.info(f"zcomm ops: building against NCCL {found} at {inc}")
+        # The pip wheel ships only libnccl.so.2 (no unversioned symlink).
+        nccl_lib = "nccl"
+        if lib and not os.path.exists(os.path.join(lib, "libnccl.so")):
+            nccl_lib = ":libnccl.so.2"
+        return [inc], ([lib] if lib else []), nccl_lib
+    logging.warning(
+        "zcomm ops skipped: nccl.h not found; set NCCL_HOME to an NCCL >= "
+        + ".".join(map(str, _ZCOMM_MIN_NCCL))
+    )
+    return None
+
+
 def setup_ops_extension():
     from build_utils import get_cuda_version
 
@@ -194,6 +277,20 @@ def setup_ops_extension():
     # setup() requires paths relative to the setup.py directory
     _ext_rel = "src/paddlefleet_ops/_extensions"
 
+    zcomm_nccl = _zcomm_nccl()
+    zcomm_sources = (
+        [
+            # zcomm: intra-node CE AllGather/ReduceScatter + inter-node NCCL-GIN copy
+            f"{_ext_rel}/zcomm/intra_comm.cu",
+            f"{_ext_rel}/zcomm/transport_nccl.cu",
+            f"{_ext_rel}/zcomm_intra_ops.cu",
+            f"{_ext_rel}/zcomm_gin_ops.cu",
+        ]
+        if zcomm_nccl
+        else []
+    )
+    nccl_include, nccl_libdir, nccl_lib = zcomm_nccl or ([], [], None)
+
     ext_module = CUDAExtension(
         sources=[
             f"{_ext_rel}/fuse_transpose_split_fp8_quant.cu",
@@ -212,8 +309,11 @@ def setup_ops_extension():
             f"{_ext_rel}/fuse_apply_rotary_pos_emb_vision.cu",
             f"{_ext_rel}/fused_swiglu_probs_bwd.cu",
             f"{_ext_rel}/w4a8_quant.cu",
+            *zcomm_sources,
         ],
-        include_dirs=[str(Path(__file__).parent / _ext_rel)],
+        include_dirs=[str(Path(__file__).parent / _ext_rel), *nccl_include],
+        library_dirs=nccl_libdir,
+        libraries=[nccl_lib, "cuda"] if zcomm_nccl else [],
         extra_compile_args={
             "cxx": [
                 "-O3",

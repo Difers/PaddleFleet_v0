@@ -97,7 +97,9 @@ def _ensure_fleet():
     return _pg_collection
 
 
-def _dispatcher(ep_group, num_experts, gpus_per_node=2, fp8_dispatch=False):
+def _dispatcher(
+    ep_group, num_experts, gpus_per_node=2, fp8_dispatch=False, use_zcomm=False
+):
     from paddlefleet.transformer.moe import token_dispatcher as td
 
     with mock.patch.object(td, "_RING_GPUS_PER_NODE", gpus_per_node):
@@ -106,7 +108,14 @@ def _dispatcher(ep_group, num_experts, gpus_per_node=2, fp8_dispatch=False):
             ep_group.nranks,
             num_experts=num_experts,
             fp8_dispatch=fp8_dispatch,
+            use_zcomm=use_zcomm,
         )
+
+
+def _zcomm_unavailable():
+    from paddlefleet.transformer.moe.zcomm_comm import zcomm_unavailable_reason
+
+    return zcomm_unavailable_reason()
 
 
 def _scale_expert_fn(scale):
@@ -189,8 +198,12 @@ class _TwoLevelBase(unittest.TestCase):
 
 
 class TestTwoLevelRing(_TwoLevelBase):
+    use_zcomm = False
+
     def test_topology_is_two_level(self):
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         self.assertEqual((disp.G, disp.N), (2, self.ep_size // 2))
         self.assertIsNotNone(disp.intra_group)
         self.assertIsNotNone(disp.inter_group)
@@ -199,7 +212,9 @@ class TestTwoLevelRing(_TwoLevelBase):
 
     def test_forward_returns_own_rows_scaled_by_ep(self):
         """Intra RS sums G partials, the combine sums N -> EP*scale*x."""
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens()
         idx, w = self._routing()
         disp.pre_gate_token_ag(x)  # required before every ring_forward
@@ -213,7 +228,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         )
 
     def test_backward_scales_token_grad_by_ep(self):
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens()
         idx, w = self._routing()
         disp.pre_gate_token_ag(x)
@@ -245,7 +262,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         for use_join in (False, True):
             paddle.seed(7)
             proj = paddle.nn.Linear(self.d_latent, self.d_latent)
-            disp = _dispatcher(self.ep_group, self.num_experts)
+            disp = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+            )
             for step in range(2):
                 idx, w0 = self._routing()
                 x = self._tokens()
@@ -287,7 +306,9 @@ class TestTwoLevelRing(_TwoLevelBase):
     def test_join_skips_router_input_without_grad(self):
         # A router input that takes no grad has no backward to overlap, so
         # the join must hand both inputs back and leave the hop to the ring.
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens()
         gate_in = self._tokens(requires_grad=False)
         carrier, gate_out = disp.join_token_hop(x, gate_in)
@@ -298,7 +319,9 @@ class TestTwoLevelRing(_TwoLevelBase):
     def test_join_clones_non_contiguous_input(self):
         # The join aliases contiguous inputs and clones strided ones. Without
         # a ring backward its slot stays empty, so its backward is identity.
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         base = paddle.arange(
             self.T_local * self.d_latent, dtype="float32"
         ).reshape([self.d_latent, self.T_local])
@@ -325,7 +348,9 @@ class TestTwoLevelRing(_TwoLevelBase):
 
         grads = {}
         for use_join in (False, True):
-            disp = _dispatcher(self.ep_group, self.num_experts)
+            disp = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+            )
             for step in range(2):
                 hs = self._tokens()
                 idx, w0 = self._routing()
@@ -395,7 +420,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         for use_join in (False, True):
             paddle.seed(7)
             proj = paddle.nn.Linear(2 * self.d_latent, self.d_latent)
-            disp = _dispatcher(self.ep_group, self.num_experts)
+            disp = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+            )
             for step in range(2):
                 hs = paddle.concat([self._tokens(False)] * 2, axis=-1)
                 hs.stop_gradient = False
@@ -447,7 +474,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         for use_join in (False, True):
             paddle.seed(7)
             se = paddle.nn.Linear(self.d_latent, self.d_latent)
-            disp = _dispatcher(self.ep_group, self.num_experts)
+            disp = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+            )
             for step in range(2):
                 x = self._tokens()
                 # Leading batch dim, like the MoE layer's residual.
@@ -487,7 +516,12 @@ class TestTwoLevelRing(_TwoLevelBase):
         # G==1 (one GPU per node group) is an inter-only ring; construction
         # must raise RuntimeError (survives ``python -O``), not run it.
         with self.assertRaisesRegex(RuntimeError, "two-level ring"):
-            _dispatcher(self.ep_group, self.num_experts, gpus_per_node=1)
+            _dispatcher(
+                self.ep_group,
+                self.num_experts,
+                gpus_per_node=1,
+                use_zcomm=self.use_zcomm,
+            )
 
     def test_token_grad_is_routed_elementwise(self):
         # Stronger than the symmetric 2*EP constant: with expert_fn(t)=t*scale
@@ -495,7 +529,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         # per-(rank,element) cotangent pins x.grad=scale*EP*g_out and exposes a
         # grad routed to the wrong round/rank/row.
         scale = 2.0
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens()
         idx, w = self._routing()
         disp.pre_gate_token_ag(x)
@@ -516,7 +552,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         # pair's reverse path (not just its magnitude):
         #   x.grad[i,j] = EP*s[i]*g_out[i,j]        (s[i]=sum_k w[i,k])
         #   w.grad[i,k] = EP*sum_j(g_out[i,j]*x[i,j])
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens()
         idx, w = self._routing()
         disp.pre_gate_token_ag(x)
@@ -544,7 +582,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         ring_forward zeroes their weights once on the local [T, K] pair
         (mask_cast_routing_w), before any gather.
         """
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens(requires_grad=False)
         idx, w = self._routing(pad_last=True)
         disp.pre_gate_token_ag(x)
@@ -564,7 +604,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         )
 
     def test_router_grad_is_zero_on_padded_lanes(self):
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         x = self._tokens(requires_grad=False)
         idx, w = self._routing(pad_last=True)
         disp.pre_gate_token_ag(x)
@@ -584,7 +626,9 @@ class TestTwoLevelRing(_TwoLevelBase):
         combine; an undrained task would let the next call read a half-written
         buffer. Calls 2-3 also run remote-first, so they must match call 1.
         """
-        disp = _dispatcher(self.ep_group, self.num_experts)
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, use_zcomm=self.use_zcomm
+        )
         idx, w = self._routing()
         first = None
         for _ in range(3):
@@ -597,6 +641,21 @@ class TestTwoLevelRing(_TwoLevelBase):
                 np.testing.assert_allclose(
                     out.numpy(), first, rtol=1e-6, atol=1e-6
                 )
+
+
+class TestTwoLevelRingZcomm(TestTwoLevelRing):
+    """The two-level ring checks again with ``use_zcomm=True``, in particular
+    the token-hop join, under which the zcomm backward leaves its last
+    token-grad ReduceScatter (and, for N >= 3, the add of the reverse hop
+    into it) on the comm streams."""
+
+    use_zcomm = True
+
+    def setUp(self):
+        reason = _zcomm_unavailable()
+        if reason is not None:
+            self.skipTest(f"zcomm unavailable: {reason}")
+        super().setUp()
 
 
 class _Fp8StraightThrough(paddle.autograd.PyLayer):
@@ -688,11 +747,16 @@ class TestTwoLevelRemoteFirst(_TwoLevelBase):
     call against the closed form, at G=2 (N=EP/2) and G=4 (N=EP/4, N=2 on
     8 GPUs)."""
 
+    use_zcomm = False
+
     def _check_repeated(self, gpus_per_node):
         if self.ep_size % gpus_per_node or self.ep_size // gpus_per_node < 2:
             self.skipTest(f"EP={self.ep_size} has no G={gpus_per_node} ring")
         disp = _dispatcher(
-            self.ep_group, self.num_experts, gpus_per_node=gpus_per_node
+            self.ep_group,
+            self.num_experts,
+            gpus_per_node=gpus_per_node,
+            use_zcomm=self.use_zcomm,
         )
         self.assertEqual(
             (disp.G, disp.N), (gpus_per_node, self.ep_size // gpus_per_node)
@@ -737,6 +801,92 @@ class TestTwoLevelRemoteFirst(_TwoLevelBase):
 
     def test_remote_first_matches_analytic_g4(self):
         self._check_repeated(4)
+
+
+class TestTwoLevelZcommFallback(_TwoLevelBase):
+    """``use_zcomm=True`` where the zcomm ops cannot run (old NCCL, ops not
+    built): the dispatcher must fall back to NCCL with a single warning and
+    give exactly the results of ``use_zcomm=False``. Runs on any build, the
+    unavailable case is forced by patching the capability check."""
+
+    def _fallback_dispatcher(self, **kwargs):
+        from paddlefleet.transformer.moe import (
+            token_dispatcher as td,
+            zcomm_comm,
+        )
+
+        with (
+            mock.patch.object(
+                zcomm_comm,
+                "zcomm_unavailable_reason",
+                return_value="forced by test",
+            ),
+            mock.patch.object(td, "_ZCOMM_FALLBACK_WARNED", False),
+            mock.patch.object(td.logger, "warning") as warn,
+        ):
+            disp = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=True, **kwargs
+            )
+            again = _dispatcher(
+                self.ep_group, self.num_experts, use_zcomm=True, **kwargs
+            )
+        return disp, again, warn
+
+    def test_falls_back_to_nccl_and_warns_once(self):
+        disp, again, warn = self._fallback_dispatcher()
+        self.assertFalse(disp.use_zcomm)
+        self.assertFalse(again.use_zcomm)
+        self.assertEqual(warn.call_count, 1)
+        self.assertIn("forced by test", str(warn.call_args))
+
+    def test_fallback_matches_nccl(self):
+        # Forward and backward over repeated calls (in-order first call, then
+        # remote-first) must equal the use_zcomm=False dispatcher exactly.
+        results = []
+        fallback, _, _ = self._fallback_dispatcher()
+        plain = _dispatcher(self.ep_group, self.num_experts, use_zcomm=False)
+        for disp in (fallback, plain):
+            calls = []
+            for _ in range(3):
+                x = self._tokens()
+                idx, w = self._routing()
+                disp.pre_gate_token_ag(x)
+                out = disp.ring_forward(
+                    x, w, idx, _weighted_expert_fn(), w.dtype
+                )
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                calls.append((out.numpy(), x.grad.numpy(), w.grad.numpy()))
+            results.append(calls)
+        for got, want in zip(*results):
+            for a, b in zip(got, want):
+                np.testing.assert_array_equal(a, b)
+
+
+class TestTwoLevelZcomm(TestTwoLevelRemoteFirst):
+    """The remote-first checks again with ``use_zcomm=True``: every ring
+    collective on the zcomm ops (CE pull AllGather, CE ReduceScatter, GIN
+    shifts / combine / AllGather) must give the same closed-form forward and
+    backward as the NCCL path, over repeated calls (window reuse)."""
+
+    use_zcomm = True
+
+    def setUp(self):
+        reason = _zcomm_unavailable()
+        if reason is not None:
+            self.skipTest(f"zcomm unavailable: {reason}")
+        super().setUp()
+
+    def test_enabled(self):
+        disp = _dispatcher(self.ep_group, self.num_experts, use_zcomm=True)
+        self.assertTrue(disp.use_zcomm)
+
+    def test_fp8_ring_keeps_nccl(self):
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, fp8_dispatch=True, use_zcomm=True
+        )
+        self.assertFalse(disp.use_zcomm)
 
 
 @_needs_sonicmoe_fp8
