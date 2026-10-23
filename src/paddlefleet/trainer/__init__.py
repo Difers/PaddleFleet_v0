@@ -85,6 +85,7 @@ import_structure = {
         "StepFlexToken",
         "FP8QuantWeightCallback",
         "MoECorrectionBiasAdjustCallback",
+        "MoEMultimodalBiasAdjustCallback",
         "MoEQuantileBalancingCallback",
         "MoeExpertsGradScaleCallback",
         "MoEGateSpGradSyncCallBack",

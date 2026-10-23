@@ -1243,6 +1243,22 @@ class TransformerConfig(ModelParallelConfig):
     """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
     tid2eid lookup buffer in hash-based MoE routing."""
 
+    moe_multimodal_router_bias: bool = False
+    """Route the HyperBody <context> placeholder tokens
+    (``hyperbody_context_token_id``) with their own aux-loss-free bias. Every
+    MoE router of the model (hash layers, learned layers and MTP) registers
+    ``multimodal_e_score_correction_bias`` and picks experts for those tokens by
+    ``topk(score + multimodal bias)`` -- on hash layers too, instead of the
+    ``tid2eid`` lookup. Text tokens keep their routing unchanged, and the text
+    ``e_score_correction_bias`` only counts text tokens. The bias is a buffer
+    updated by ``MoEMultimodalBiasAdjustCallback``. Hash layers also get the
+    router aux loss (same formula as learned layers, on their actual routing
+    map) while this is on. Learned layers require ``topk_method='noaux_tc'``
+    (checked in ``__post_init__``), and the model config must also provide
+    ``hyperbody_context_token_id`` (checked when the router is built).
+    Off by default: it changes which experts the placeholder tokens use and
+    adds a persisted buffer, so only multimodal (HyperBody) configs opt in."""
+
     moe_router_fusion: bool = False
     """Whether to fuse MoE router."""
 
@@ -3894,6 +3910,24 @@ class TransformerConfig(ModelParallelConfig):
                 "High-precision norm mode is only adapted for DSv4 to align "
                 "training and inference numerical behavior."
             )
+
+        # Multimodal router bias: learned (non-hash) routers need noaux_tc. MTP
+        # layers are never hash layers, so they count as learned.
+        if getattr(self, "moe_multimodal_router_bias", False):
+            n_hash = self.moe_n_hash_layers or 0
+            has_learned_moe = (
+                n_hash < self.num_hidden_layers
+                or (self.num_nextn_predict_layers or 0) > 0
+            )
+            if has_learned_moe and self.topk_method != "noaux_tc":
+                raise ValueError(
+                    "moe_multimodal_router_bias=True requires "
+                    "topk_method='noaux_tc' on learned (non-hash) MoE layers, "
+                    f"but got topk_method={self.topk_method!r} "
+                    f"(moe_n_hash_layers={n_hash}, "
+                    f"num_hidden_layers={self.num_hidden_layers}, "
+                    f"num_nextn_predict_layers={self.num_nextn_predict_layers})."
+                )
 
         # Hash-based MoE routing consistency checks.
         if self.moe_n_hash_layers > 0:

@@ -732,8 +732,9 @@ class PaddleMoEMonitor(PaddleProbe):
         if hasattr(gate, "_hash_routing"):
             original_hash_routing = gate._hash_routing
 
-            def cached_hash_routing(logits, flat_ids):
-                result = original_hash_routing(logits, flat_ids)
+            def cached_hash_routing(logits, flat_ids, **kwargs):
+                # kwargs: e.g. multimodal_mask (moe_multimodal_router_bias).
+                result = original_hash_routing(logits, flat_ids, **kwargs)
                 if not monitor._should_monitor():
                     gate._cached_gates = None
                     return result

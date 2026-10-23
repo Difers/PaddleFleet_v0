@@ -31,6 +31,7 @@ from paddlefleet.trainer import (
     IntervalStrategy,
     MoECorrectionBiasAdjustCallback,
     MoeExpertsGradScaleCallback,
+    MoEMultimodalBiasAdjustCallback,
     MoEGateSpGradSyncCallBack,
     get_last_checkpoint,
     set_random_seed,
@@ -471,6 +472,9 @@ def run_dpo(
     callbacks = []
     if getattr(model_config, "topk_method", None) == "noaux_tc":
         callbacks += [MoECorrectionBiasAdjustCallback(lr=0)]
+    # The multimodal bias also lives on hash layers, which need no noaux_tc.
+    if getattr(model_config, "moe_multimodal_router_bias", False):
+        callbacks += [MoEMultimodalBiasAdjustCallback(lr=0)]
 
     if training_args.use_expert_parallel:
         callbacks += [MoeExpertsGradScaleCallback(training_args)]

@@ -29,6 +29,7 @@ from paddlefleet.trainer import (
     FP8QuantWeightCallback,
     MoECorrectionBiasAdjustCallback,
     MoeExpertsGradScaleCallback,
+    MoEMultimodalBiasAdjustCallback,
     StepFlexToken,
     Trainer,
     TrainingArguments,
@@ -633,6 +634,13 @@ def run_dsv3_pretrain(model_args, data_args, generating_args, training_args):
         )
         callbacks += [
             MoECorrectionBiasAdjustCallback(moe_router_bias_update_rate)
+        ]
+    # The multimodal bias also lives on hash layers, which need no noaux_tc.
+    if getattr(config, "moe_multimodal_router_bias", False):
+        callbacks += [
+            MoEMultimodalBiasAdjustCallback(
+                getattr(config, "moe_router_bias_update_rate", 0.001)
+            )
         ]
 
     def resume_from_custom_func(model):

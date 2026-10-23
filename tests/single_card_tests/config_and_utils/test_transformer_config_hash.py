@@ -213,5 +213,56 @@ class TestHashRoutingValidationContract(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_HAVE_MODULE, _SKIP_REASON)
+class TestMultimodalRouterBiasValidation(unittest.TestCase):
+    """``moe_multimodal_router_bias`` needs noaux_tc on learned MoE layers."""
+
+    _BASE = {
+        "hidden_size": 64,
+        "num_attention_heads": 2,
+        "intermediate_size": 256,
+        "num_hidden_layers": 4,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_multimodal_router_bias": True,
+    }
+
+    def _cfg(self, **overrides):
+        kwargs = dict(self._BASE)
+        kwargs.update(overrides)
+        return TransformerConfig(**kwargs)
+
+    def test_noaux_tc_constructs(self):
+        self._cfg(topk_method="noaux_tc")
+
+    def test_learned_layers_reject_other_topk_method(self):
+        with self.assertRaisesRegex(ValueError, "moe_multimodal_router_bias"):
+            self._cfg(topk_method="greedy")
+
+    def test_all_hash_layers_without_mtp_do_not_need_noaux_tc(self):
+        self._cfg(
+            topk_method="greedy",
+            moe_n_hash_layers=4,
+            actual_vocab_size=128,
+            scoring_func="softmax",
+        )
+
+    def test_mtp_layer_counts_as_learned(self):
+        with self.assertRaisesRegex(ValueError, "moe_multimodal_router_bias"):
+            self._cfg(
+                topk_method="greedy",
+                moe_n_hash_layers=4,
+                actual_vocab_size=128,
+                scoring_func="softmax",
+                num_nextn_predict_layers=1,
+            )
+
+    def test_off_by_default(self):
+        TransformerConfig(
+            **{**self._BASE, "moe_multimodal_router_bias": False},
+            topk_method="greedy",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

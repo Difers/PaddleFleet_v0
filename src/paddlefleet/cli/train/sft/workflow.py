@@ -46,6 +46,7 @@ from paddlefleet.trainer import (
     IntervalStrategy,
     MoECorrectionBiasAdjustCallback,
     MoeExpertsGradScaleCallback,
+    MoEMultimodalBiasAdjustCallback,
     MoEGateSpGradSyncCallBack,
     MoEQuantileBalancingCallback,
     RuntimeTimer,
@@ -902,6 +903,15 @@ def run_sft(
         == "quantile_balancing"
     ):
         callbacks += [MoEQuantileBalancingCallback()]
+    # The multimodal bias also lives on hash layers, which need no noaux_tc.
+    if getattr(
+        model_config.get_text_config(), "moe_multimodal_router_bias", False
+    ):
+        callbacks += [
+            MoEMultimodalBiasAdjustCallback(
+                lr=training_args.moe_router_bias_update_rate
+            )
+        ]
 
     if training_args.use_expert_parallel:
         callbacks += [MoeExpertsGradScaleCallback(training_args)]

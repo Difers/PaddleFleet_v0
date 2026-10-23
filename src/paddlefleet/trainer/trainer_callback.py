@@ -88,6 +88,7 @@ __all__ = [
     "StepFlexToken",
     "FP8QuantWeightCallback",
     "MoECorrectionBiasAdjustCallback",
+    "MoEMultimodalBiasAdjustCallback",
     "MoEQuantileBalancingCallback",
     "MoeExpertsGradScaleCallback",
     "MoEGateSpGradSyncCallBack",
@@ -1240,6 +1241,112 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
                     usages.pop(0).zero_()
 
         model.apply(update_bias)
+
+
+class MoEMultimodalBiasAdjustCallback(TrainerCallback):
+    """Aux-loss-free balance for the multimodal routing bias.
+
+    Updates ``multimodal_e_score_correction_bias`` of every router that has it
+    (``moe_multimodal_router_bias``) from ``multimodal_expert_usage`` with the
+    same rule and reduce groups as ``MoECorrectionBiasAdjustCallback``:
+    ``bias += sign(mean(usage) - usage) * lr``, then usage is reset. It also
+    mirrors that callback's two early exits: under
+    ``use_dsv4_accuracy_compatible()`` or without ``fleet._hcg`` it only
+    all-reduces the usage and returns without touching the bias. Unlike that
+    callback it also updates routers whose gate weight is frozen, so the bias
+    keeps adapting while only the projector trains.
+
+    Register it next to ``MoECorrectionBiasAdjustCallback`` whenever
+    ``moe_multimodal_router_bias`` is on; otherwise the bias stays at zero.
+    """
+
+    def __init__(self, lr=0.001, use_mp=False):
+        super().__init__()
+        self.update_lr = lr
+        self.use_mp = use_mp
+
+    def on_optimizer_end(self, args, state, control, **kwargs):
+        if getattr(args, "freeze_training", False):
+            logger.warning(
+                "freeze_training is enabled! MoE multimodal_e_score_correction_bias will NOT be updated."
+            )
+            return
+
+        routers = []
+
+        def collect(layer):
+            if (
+                isinstance(layer, StandardMoERouter)
+                and getattr(layer, "multimodal_e_score_correction_bias", None)
+                is not None
+            ):
+                routers.append(layer)
+
+        kwargs["model"].apply(collect)
+        if not routers:
+            return
+
+        groups = {}
+        for idx, router in enumerate(routers):
+            groups.setdefault(router.num_experts, []).append(idx)
+        stacked = [
+            (
+                indices,
+                paddle.stack(
+                    [routers[i].multimodal_expert_usage for i in indices], 0
+                ),
+            )
+            for indices in groups.values()
+        ]
+        if use_dsv4_accuracy_compatible() or not hasattr(fleet, "_hcg"):
+            # Same early exit as MoECorrectionBiasAdjustCallback.
+            for _, usages in stacked:
+                dist.all_reduce(usages)
+            return
+
+        hcg = fleet.get_hybrid_communicate_group()
+        mp_group = hcg.get_model_parallel_group()
+        dp_group = hcg.get_data_parallel_group()
+        sd_group = hcg.get_sharding_parallel_group()
+        updates = [None] * len(routers)
+        log_step = (
+            state.global_step % max(int(getattr(args, "logging_steps", 1)), 1)
+            == 0
+        )
+        routed = 0
+        for indices, usages in stacked:
+            if self.use_mp and mp_group.nranks > 1:
+                dist.all_reduce(usages, group=mp_group)
+            if dp_group.nranks > 1:
+                dist.all_reduce(usages, group=dp_group)
+            if sd_group.nranks > 1:
+                dist.all_reduce(usages, group=sd_group)
+            update = (
+                paddle.sign(usages.mean(-1, keepdim=True) - usages)
+                * self.update_lr
+            )
+            update = update.astype(paddle.float32)
+            for slot, idx in enumerate(indices):
+                updates[idx] = update[slot]
+            if log_step:
+                # Host sync only on logging steps.
+                routed += int(usages.sum().item())
+
+        with paddle.no_grad():
+            for router, update in zip(routers, updates):
+                bias = router.multimodal_e_score_correction_bias
+                bias.add_(update.reshape(bias.shape))
+                router.multimodal_expert_usage.zero_()
+
+        if log_step:
+            bias_absmax = max(
+                float(r.multimodal_e_score_correction_bias.abs().max().item())
+                for r in routers
+            )
+            logger.info(
+                f"[MoEMultimodalBias] step={state.global_step} routers={len(routers)} "
+                f"multimodal_assignments={routed} bias_absmax={bias_absmax:.6f}"
+            )
 
 
 class MoEQuantileBalancingCallback(TrainerCallback):

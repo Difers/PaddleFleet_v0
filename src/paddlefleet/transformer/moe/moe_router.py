@@ -731,6 +731,9 @@ class StandardMoERouter(nn.Layer):
         # router knows its layer index.
         self.is_hash_layer = False
         self.tid2eid = None
+        # Multimodal routing bias (moe_multimodal_router_bias); also set up in
+        # set_layer_number(), after the hash-layer decision.
+        self.multimodal_bias_enabled = False
 
     def gate_score_func(
         self, logits: paddle.Tensor, logits_type_promotion: bool = True
@@ -1313,7 +1316,12 @@ class StandardMoERouter(nn.Layer):
         return topk_weight, topk_idx
 
     def _topk_noaux_tc(
-        self, scores: paddle.Tensor, k: int, n_group: int, topk_group: int
+        self,
+        scores: paddle.Tensor,
+        k: int,
+        n_group: int,
+        topk_group: int,
+        choice_bias: paddle.Tensor | None = None,
     ) -> tuple[paddle.Tensor, paddle.Tensor]:
         """_summary_
 
@@ -1322,6 +1330,9 @@ class StandardMoERouter(nn.Layer):
             k (int): select the top k experts in each group
             n_groups (int): the number of groups for all experts
             topk_group (int): the number of groups selected
+            choice_bias (paddle.Tensor, optional): per-token selection bias
+                [bsz*seq_len, n_experts] replacing ``e_score_correction_bias``
+                (see ``_multimodal_choice_bias``).
 
         Returns:
             tuple[paddle.Tensor, paddle.Tensor]: topk_weight, topk_idx
@@ -1338,7 +1349,9 @@ class StandardMoERouter(nn.Layer):
         assert self.e_score_correction_bias is not None, (
             "e_score_correction_bias is None"
         )
-        if not self.config.gpt_model_use_experimental_version:
+        if choice_bias is not None:
+            scores_for_choice = scores.reshape([bsz_seq_len, -1]) + choice_bias
+        elif not self.config.gpt_model_use_experimental_version:
             scores_for_choice = scores.reshape(
                 [bsz_seq_len, -1]
             ) + self.e_score_correction_bias.detach().unsqueeze(0)
@@ -1552,6 +1565,7 @@ class StandardMoERouter(nn.Layer):
         self,
         logits: paddle.Tensor,
         flat_ids: paddle.Tensor,
+        multimodal_mask: paddle.Tensor | None = None,
     ) -> tuple[paddle.Tensor, paddle.Tensor]:
         """Hash-based routing: expert indices come from the tid2eid lookup table.
 
@@ -1565,6 +1579,10 @@ class StandardMoERouter(nn.Layer):
             logits (paddle.Tensor): Gating logits, shape [num_tokens, num_experts].
             flat_ids (paddle.Tensor): Token IDs flattened to match the row order
                 of ``logits``. Shape [num_tokens], dtype int64.
+            multimodal_mask (paddle.Tensor, optional): [num_tokens, 1] bool. Rows
+                set here pick experts by ``topk(scores + multimodal bias)``
+                instead of ``tid2eid`` (see ``moe_multimodal_router_bias``); the
+                gate weights still come from the bias-free scores.
 
         Returns:
             top_gate (paddle.Tensor): Per-token weights for the selected experts,
@@ -1617,6 +1635,15 @@ class StandardMoERouter(nn.Layer):
             )
 
         top_idx = self.tid2eid[flat_ids].cast(paddle.int64)  # [N, topk]
+        if multimodal_mask is not None:
+            # The bias only decides which experts are picked; the weights below
+            # are gathered from the bias-free scores, like the text rows.
+            _, dynamic_idx = paddle.topk(
+                scores.cast("float32") + self._multimodal_bias_row(),
+                k=top_idx.shape[-1],
+                axis=-1,
+            )
+            top_idx = paddle.where(multimodal_mask, dynamic_idx, top_idx)
         top_gate = paddle.take_along_axis(scores, top_idx, axis=1)  # [N, topk]
         if score_function != "softmax":
             top_gate = top_gate / (top_gate.sum(axis=-1, keepdim=True) + 1e-20)
@@ -1645,7 +1672,12 @@ class StandardMoERouter(nn.Layer):
         n_group=None,
         topk_group=None,
         valid_mask=None,
+        choice_bias=None,
     ):
+        if choice_bias is not None and topk_method != "noaux_tc":
+            raise ValueError(
+                f"choice_bias is only supported by noaux_tc, got {topk_method!r}."
+            )
         if topk_method == "greedy":
             top_gate, top_idx = self._topk_greedy(gates, k=k)
         elif topk_method == "group_limited_greedy":
@@ -1661,6 +1693,7 @@ class StandardMoERouter(nn.Layer):
                 k,
                 n_group,
                 topk_group,
+                choice_bias=choice_bias,
             )
         elif topk_method == "quantile_balancing":
             top_gate, top_idx = self._topk_quantile_balancing(
@@ -1677,6 +1710,7 @@ class StandardMoERouter(nn.Layer):
     def set_layer_number(self, layer_number, is_mtp_layer: bool = False):
         self.layer_number = layer_number
         self._setup_hash_layer(layer_number, is_mtp_layer)
+        self._setup_multimodal_bias()
 
     def _setup_hash_layer(self, layer_number, is_mtp_layer: bool = False):
         """Activate hash routing for this layer if it falls in the hash range.
@@ -1769,6 +1803,126 @@ class StandardMoERouter(nn.Layer):
         if hasattr(self, "weight_1"):
             del self.weight_1
 
+    def _setup_multimodal_bias(self):
+        """Register the multimodal routing bias (``moe_multimodal_router_bias``).
+
+        Runs after ``_setup_hash_layer`` so that hash layers, learned layers and
+        MTP layers all get it. ``set_layer_number`` may run more than once; the
+        buffer is registered on the first call only.
+        """
+        self.multimodal_bias_enabled = bool(
+            getattr(self.config, "moe_multimodal_router_bias", False)
+        )
+        if not self.multimodal_bias_enabled or hasattr(
+            self, "multimodal_e_score_correction_bias"
+        ):
+            return
+        if not self.is_hash_layer and self.topk_method != "noaux_tc":
+            raise ValueError(
+                "moe_multimodal_router_bias requires topk_method='noaux_tc' on "
+                f"learned (non-hash) layers, got {self.topk_method!r}."
+            )
+        # The multimodal tokens are the HyperBody <context> placeholders.
+        token_id = getattr(self.config, "hyperbody_context_token_id", None)
+        if token_id is None:
+            raise ValueError(
+                "moe_multimodal_router_bias needs hyperbody_context_token_id."
+            )
+        self.multimodal_token_id = int(token_id)
+        # Same shape convention as e_score_correction_bias, persisted with the
+        # model; a checkpoint without it is cold-started at zeros via AOA.
+        shape = (
+            (1, self.num_experts)
+            if self.config.gpt_model_use_experimental_version
+            else (self.num_experts,)
+        )
+        self.register_buffer(
+            "multimodal_e_score_correction_bias",
+            paddle.zeros(shape, dtype=paddle.float32),
+        )
+        # Not persisted; consumed and reset by MoEMultimodalBiasAdjustCallback.
+        self.multimodal_expert_usage = paddle.zeros(
+            shape=[self.num_experts], dtype=paddle.int64
+        )
+        self.multimodal_expert_usage.stop_gradient = True
+
+    def _hash_layer_aux_loss(
+        self,
+        logits,
+        mask,
+        input_ids_none_zero_mask,
+        seq_len,
+        batch_size,
+        input_ids,
+        origin_input_ids,
+    ):
+        """Aux loss of a hash layer, computed exactly like a learned layer's:
+        P from the (padding-masked, row-normalized) gate scores, f from the
+        actual routing map -- tid2eid for text rows, the multimodal-bias top-k
+        for multimodal rows."""
+        if self.use_accuracy_compatible:
+            gates = self.gate_score_func(logits).cast(logits.dtype)
+        else:
+            gates = self.gate_score_func(logits)
+        if input_ids_none_zero_mask is not None:
+            gates = gates * input_ids_none_zero_mask.astype(gates.dtype)
+        gates_ori = gates.clone()
+        if self.scoring_func != "softmax":
+            if not getattr(
+                self.config, "gpt_model_use_experimental_version", False
+            ):
+                gates_ori = gates_ori / (
+                    gates_ori.sum(axis=-1, keepdim=True) + 1e-20
+                )
+            else:
+                gates_ori = gates_ori / paddle.clip(
+                    gates_ori.sum(-1, keepdim=True), min=1e-12
+                )
+        if self.routing_type == "seq_aux_loss":
+            return self._cal_seq_aux_loss(
+                gates_ori,
+                self.num_experts_per_tok,
+                mask,
+                seq_len,
+                batch_size,
+                input_ids=input_ids,
+                origin_input_ids=origin_input_ids,
+            )
+        return self._cal_aux_loss(gates, mask)
+
+    def _multimodal_flat_mask(self, input_ids, transpose):
+        """[num_tokens, 1] bool mask of multimodal tokens, in the row order of
+        the router logits (same flattening as ``input_ids_none_zero_mask``)."""
+        mask = input_ids == self.multimodal_token_id
+        if transpose:
+            mask = mask.transpose([1, 0])
+        return mask.reshape([-1, 1])
+
+    def _multimodal_bias_row(self):
+        return self.multimodal_e_score_correction_bias.detach().reshape(
+            [1, self.num_experts]
+        )
+
+    def _multimodal_choice_bias(self, multimodal_mask):
+        """Per-token selection bias [num_tokens, num_experts]: the multimodal
+        bias on multimodal rows, ``e_score_correction_bias`` elsewhere."""
+        text_bias = self.e_score_correction_bias.detach().reshape(
+            [1, self.num_experts]
+        )
+        return paddle.where(
+            multimodal_mask, self._multimodal_bias_row(), text_bias
+        )
+
+    @paddle.no_grad()
+    def _multimodal_expert_counts(self, mask, multimodal_mask):
+        """Per-expert count of multimodal tokens in the (padding-masked)
+        routing map."""
+        return (
+            (mask.cast(paddle.float32) * multimodal_mask.cast(paddle.float32))
+            .sum(axis=0)
+            .cast(paddle.int64)
+        )
+
 
 class TopKRouter(StandardMoERouter):
     def __init__(self, *args, **kwargs):
@@ -1780,6 +1934,7 @@ class TopKRouter(StandardMoERouter):
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
         self._setup_hash_layer(layer_number, is_mtp_layer=is_mtp_layer)
+        self._setup_multimodal_bias()
 
     def forward(self, input, input_ids=None, origin_input_ids=None):
         # The gate matmul gets this tensor, not the flattened view made below:
@@ -1826,6 +1981,7 @@ class TopKRouter(StandardMoERouter):
                     input_ids_none_zero_mask = None
             else:
                 input_ids_none_zero_mask = None
+            multimodal_transpose = self.sequence_parallel
         elif len(input.shape) == 2:
             if not self.config.gpt_model_use_experimental_version:
                 raise ValueError(
@@ -1870,6 +2026,7 @@ class TopKRouter(StandardMoERouter):
                 )
             else:
                 input_ids_none_zero_mask = None
+            multimodal_transpose = False
 
         # Hash routing requires input_ids; verify early.
         if self.is_hash_layer and input_ids is None:
@@ -1877,6 +2034,16 @@ class TopKRouter(StandardMoERouter):
                 "Hash routing (moe_n_hash_layers > 0) requires input_ids. "
                 "Make sure input_ids is passed through the model forward "
                 "to the MoE layer."
+            )
+        multimodal_mask = None
+        if getattr(self, "multimodal_bias_enabled", False):
+            if input_ids is None:
+                raise ValueError(
+                    "moe_multimodal_router_bias requires input_ids at the MoE "
+                    "router to find the multimodal tokens."
+                )
+            multimodal_mask = self._multimodal_flat_mask(
+                input_ids, multimodal_transpose
             )
 
         # Split-feature routing applies to non-hash layers only; hash-routing
@@ -1949,7 +2116,12 @@ class TopKRouter(StandardMoERouter):
             else:
                 flat_ids = input_ids.reshape([-1]).cast(paddle.int64)
 
-            top_gate, top_idx = self._hash_routing(logits, flat_ids)
+            if multimodal_mask is None:
+                top_gate, top_idx = self._hash_routing(logits, flat_ids)
+            else:
+                top_gate, top_idx = self._hash_routing(
+                    logits, flat_ids, multimodal_mask=multimodal_mask
+                )
 
             # Build full [num_tokens, num_experts] probs and routing mask.
             probs = paddle.zeros_like(logits).put_along_axis(
@@ -1972,8 +2144,30 @@ class TopKRouter(StandardMoERouter):
                 "hash_topk_indices",
                 self._layer_number,
             )
-            # No aux/z loss, no expert-bias updates on hash layers.
-            return (None, top_gate, top_idx, probs, mask, None, None, None)
+            # Only the multimodal rows feed a bias update on hash layers.
+            if (
+                multimodal_mask is not None
+                and framework._dygraph_tracer()._has_grad
+            ):
+                with paddle.no_grad():
+                    self.multimodal_expert_usage += (
+                        self._multimodal_expert_counts(mask, multimodal_mask)
+                    )
+            # Hash layers carry the aux loss only together with the multimodal
+            # bias (its tokens leave tid2eid there); no z-loss and no text
+            # expert-bias updates on hash layers.
+            l_aux = None
+            if multimodal_mask is not None and self.config.router_aux_loss_coef:
+                l_aux = self._hash_layer_aux_loss(
+                    logits,
+                    mask,
+                    input_ids_none_zero_mask,
+                    seq_len,
+                    batch_size,
+                    input_ids,
+                    origin_input_ids,
+                )
+            return (None, top_gate, top_idx, probs, mask, None, l_aux, None)
         # ---- end hash routing ----
 
         # Split-feature routing already produced `gates` (sum of the two
@@ -2023,7 +2217,11 @@ class TopKRouter(StandardMoERouter):
             # Use MoETopkFusion Triton kernel for fused topk selection.
             MoETopkFusion = _get_moe_topk_fusion()
             use_node_limit = self.n_group > 1
-            if not self.config.gpt_model_use_experimental_version:
+            if multimodal_mask is not None:
+                probs_for_choice = gates + self._multimodal_choice_bias(
+                    multimodal_mask
+                )
+            elif not self.config.gpt_model_use_experimental_version:
                 probs_for_choice = (
                     gates + self.e_score_correction_bias.detach().unsqueeze(0)
                 )
@@ -2100,6 +2298,11 @@ class TopKRouter(StandardMoERouter):
                 # already been zeroed out above and must stay out of the QB
                 # histogram.
                 valid_mask=input_ids_none_zero_mask,
+                choice_bias=(
+                    None
+                    if multimodal_mask is None
+                    else self._multimodal_choice_bias(multimodal_mask)
+                ),
             )
 
             _log_moe_md5(
@@ -2193,6 +2396,16 @@ class TopKRouter(StandardMoERouter):
             and framework._dygraph_tracer()._has_grad
         ):
             with paddle.no_grad():
+                if multimodal_mask is not None:
+                    # Text and multimodal tokens balance against separate
+                    # biases, so each bias only counts its own tokens.
+                    multimodal_counts = self._multimodal_expert_counts(
+                        mask, multimodal_mask
+                    )
+                    self.multimodal_expert_usage += multimodal_counts
+                    exp_counts = (
+                        exp_counts.cast(paddle.int64) - multimodal_counts
+                    )
                 self.expert_usage += exp_counts
 
         # aux_loss
