@@ -65,7 +65,7 @@ _ENCODER_GEOMETRY = {
     "num_experts_per_tok": 2,
     "n_shared_experts": 1,
     "first_k_dense_replace": 1,
-    "hyperencoder_query_lengths": (16, 64),
+    "hyperencoder_query_length": 16,
 }
 
 
@@ -125,67 +125,6 @@ def test_first_k_dense_replace_builds_dense_first_without_conflict():
     assert isinstance(freq, (list, tuple)), freq
     assert freq[0] == 0, freq  # layer 0 dense
     assert all(x == 1 for x in freq[1:]), freq  # rest MoE
-
-
-def test_dense_use_long_query_scalar_and_homogeneous_list():
-    """Dense path reduces scalar / homogeneous-list use_long_query correctly."""
-    from paddlefleet.transformers.hyperbody.modeling import (
-        _dense_scalar_use_long_query,
-    )
-
-    assert _dense_scalar_use_long_query(True) is True
-    assert _dense_scalar_use_long_query(False) is False
-    assert _dense_scalar_use_long_query([True, True]) is True
-    assert _dense_scalar_use_long_query([False, False]) is False
-    assert _dense_scalar_use_long_query([]) is False  # empty -> short
-
-
-def test_dense_use_long_query_rejects_mixed_list():
-    """A mixed per-segment list is not representable in the dense layout."""
-    from paddlefleet.transformers.hyperbody.modeling import (
-        _dense_scalar_use_long_query,
-    )
-
-    raised = False
-    try:
-        _dense_scalar_use_long_query([True, False])
-    except ValueError as e:
-        assert "homogeneous use_long_query" in str(e)
-        raised = True
-    assert raised, "mixed [True, False] must raise ValueError"
-
-
-def test_infer_use_long_query_counts_configured_context_token():
-    """``_infer_use_long_query`` counts the CONFIGURED context token id.
-
-    The per-segment short/long query inference must count occurrences of
-    ``config.hyperbody_context_token_id`` (not the hardcoded CONTEXT_TOKEN
-    constant), so a non-default placeholder id still drives the query table.
-    """
-    import types
-
-    import paddle
-
-    from paddlefleet.transformers.hyperbody.modeling import (
-        HyperBodyEncoderFrontEnd,
-    )
-
-    frontend = object.__new__(HyperBodyEncoderFrontEnd)
-    frontend.config = types.SimpleNamespace(
-        hyperencoder_query_lengths=(2, 3),
-        hyperbody_context_token_id=151665,
-    )
-    # Segment 1 (tokens 0-4): two 151665 -> short (2); segment 2 (tokens 4-8):
-    # three 151665 -> long (3). Plain CONTEXT_TOKEN tokens must NOT count.
-    input_ids = paddle.to_tensor(
-        [151665, 151665, 128830, 7, 151665, 151665, 151665, 9],
-        dtype="int64",
-    )
-    cu_seqlens = paddle.to_tensor([0, 4, 8], dtype="int32")
-
-    flags = frontend._infer_use_long_query(input_ids, cu_seqlens)
-
-    assert flags == [False, True], flags
 
 
 def test_encoder_pad_token_id_configurable():
@@ -271,9 +210,8 @@ def test_hyperbody_context_token_id_drives_both_views():
     """``hyperbody_context_token_id`` flows onto BOTH views.
 
     The decoder scatter id (``view.image_token_id``) and the encoder-side
-    ``hyperbody_context_token_id`` (also read by ``_infer_use_long_query``)
-    must both come from the configured value, not from the constant or from
-    ``image_token_id``.
+    ``hyperbody_context_token_id`` must both come from the configured value,
+    not from the constant or from ``image_token_id``.
     """
     cfg = _make_config(hyperbody_context_token_id=151665)
     dec = _build_decoder_view(cfg)
@@ -330,9 +268,6 @@ if __name__ == "__main__":
         test_attn_implementation_passthrough_to_view()
         test_attn_implementation_falls_back_to_default_when_absent()
         test_first_k_dense_replace_builds_dense_first_without_conflict()
-        test_dense_use_long_query_scalar_and_homogeneous_list()
-        test_dense_use_long_query_rejects_mixed_list()
-        test_infer_use_long_query_counts_configured_context_token()
         test_encoder_pad_token_id_configurable()
         test_encoder_pad_token_id_defaults_to_zero_when_absent()
         test_encoder_and_decoder_share_pad_token_id()

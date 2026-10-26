@@ -270,7 +270,7 @@ _ENCODER_GEOMETRY = {
     "num_experts_per_tok": 2,
     "n_shared_experts": 1,
     "first_k_dense_replace": 1,
-    "hyperencoder_query_lengths": (16, 64),
+    "hyperencoder_query_length": 16,
 }
 
 _fleet_ready = False

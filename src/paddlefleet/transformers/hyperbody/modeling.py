@@ -91,30 +91,6 @@ __all__ = [
 ]
 
 
-def _dense_scalar_use_long_query(use_long_query):
-    """Reduce ``use_long_query`` to the single scalar the dense encoder path
-    supports.
-
-    The dense frontend builds one rectangular ``[B, n_ctx, H]`` block with a
-    single query table shared by every segment, so it cannot represent a mixed
-    per-segment selection. ``_infer_use_long_query`` may return a per-segment
-    ``list[bool]``; a non-empty list is always truthy, so treating it as a raw
-    bool would silently pick the long-query table for every segment. Accept a
-    list only if all entries agree (reduce to that scalar); reject a mixed list
-    (such packs must use the packed decoder path, ``hyperencoder_packed_decoder``).
-    """
-    if isinstance(use_long_query, (list, tuple)):
-        if len({bool(u) for u in use_long_query}) > 1:
-            raise ValueError(
-                "dense encoder path requires a homogeneous use_long_query; got "
-                f"a mixed per-segment list {list(use_long_query)}. Use the packed "
-                "decoder path (hyperencoder_packed_decoder=True) for mixed "
-                "short/long segments."
-            )
-        return bool(use_long_query[0]) if use_long_query else False
-    return bool(use_long_query)
-
-
 _HB_DECODER_PASSTHROUGH_KEYS = (
     "mtp_startend_row_indices_all",
     "mtp_hidden_inputs_mask_all",
@@ -198,7 +174,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         # dp (dense mask) vs flashmask+packed (single call, [1,1,T,2] row
         # indices). use_packed_decoder rejects the mixed combinations.
         self.packed = use_packed_decoder(config)
-        short_q, long_q = config.hyperencoder_query_lengths
 
         self.embed_tokens = paddle.nn.Embedding(
             config.vocab_size, config.hidden_size
@@ -218,8 +193,11 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
                 "n_embed": config.hidden_size,
             }
         )
-        self.query_short = paddle.nn.Embedding(short_q, config.hidden_size)
-        self.query_long = paddle.nn.Embedding(long_q, config.hidden_size)
+        # One learnable query table shared by every context segment (each
+        # segment carries exactly ``hyperencoder_query_length`` placeholders).
+        self.query = paddle.nn.Embedding(
+            config.hyperencoder_query_length, config.hidden_size
+        )
         self.rotary_pos_emb = RotaryEmbedding(
             head_dim=config.head_dim,
             rotary_percent=config.rotary_percent,
@@ -231,8 +209,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             self.image_encoder,
             self.audio_encoder,
             self.projector,
-            self.query_short,
-            self.query_long,
+            self.query,
         ):
             m.to(dtype=config.params_dtype)
             for p in m.parameters():
@@ -323,34 +300,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             for s in range(n_seg)
         ]
 
-    def _add_unused_query_dependency(self, x, use_long_query):
-        """Keep the *unused* query table(s) in the autograd graph (zero grad).
-
-        ``use_long_query`` may be a single bool (homogeneous pack) or a
-        per-segment ``list[bool]`` (mixed pack). A table counts as "used" only if
-        at least one segment selects it; every table NOT used by any segment gets
-        a ``weight.sum()*0`` dependency so its grad is zero (not None).
-        """
-        if isinstance(use_long_query, bool):
-            used_long, used_short = use_long_query, not use_long_query
-        else:
-            flags = [bool(u) for u in use_long_query]
-            used_long = any(flags)
-            used_short = any(not f for f in flags)
-        dep = None
-        if not used_long:
-            dep = self.query_long.weight.sum() * 0.0
-        if not used_short:
-            s = self.query_short.weight.sum() * 0.0
-            dep = s if dep is None else dep + s
-        if dep is None:
-            # Both tables used (mixed pack): tie both with zero weight so neither
-            # is orphaned regardless of trunk usage.
-            dep = (
-                self.query_long.weight.sum() + self.query_short.weight.sum()
-            ) * 0.0
-        return x + dep.astype(x.dtype)
-
     def _packed_rope(self, max_seqlen: int, seg_lens):
         """Assemble RoPE freqs for the packed sequence: ``[1, ΣL_i, 1, D]``.
 
@@ -364,28 +313,40 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             return freqs[:, : seg_lens[0]]
         return paddle.concat([freqs[:, :L] for L in seg_lens], axis=1)
 
-    def _infer_use_long_query(self, input_ids, cu_seqlens):
-        short_q, long_q = self.config.hyperencoder_query_lengths
+    def _check_context_token_counts(self, input_ids, cu_seqlens):
+        """Each decoder segment must hold a whole number of query tables.
+
+        A decoder segment (``cu_seqlens``) may carry several encoder segments
+        (tiled images, multiple images, audio chunks), and their context spans can
+        sit back to back in ``input_ids``, so individual encoder segments cannot be
+        told apart here. What can be checked is that every decoder segment's
+        context-token count is a multiple of ``hyperencoder_query_length``;
+        ``GPTEmbedding`` only checks the total, which lets e.g. ``q + 1`` and
+        ``q - 1`` in two segments through and misplaces the encoder output.
+        """
+        q = int(self.config.hyperencoder_query_length)
         ctx_token = getattr(
             self.config, "hyperbody_context_token_id", CONTEXT_TOKEN
         )
         bounds = [int(x) for x in cu_seqlens.reshape([-1]).tolist()]
         tokens = input_ids.reshape([-1])
-        flags = []
-        for start, end in zip(bounds[:-1], bounds[1:]):
-            query_count = int(
-                (tokens[start:end] == ctx_token).astype("int32").sum()
+        if len(bounds) < 2 or int(tokens.shape[0]) < bounds[-1]:
+            # Not the global decoder layout cu_seqlens describes (e.g. a
+            # sequence-sharded view): nothing reliable to count against.
+            return
+        # MTP appends lookahead tokens after bounds[-1]; they are not counted.
+        is_ctx = (tokens[: bounds[-1]] == ctx_token).astype("int64")
+        csum = paddle.concat(
+            [paddle.zeros([1], dtype="int64"), paddle.cumsum(is_ctx)]
+        ).tolist()
+        counts = [csum[e] - csum[s] for s, e in zip(bounds[:-1], bounds[1:])]
+        bad = [(i, c) for i, c in enumerate(counts) if c % q != 0]
+        if bad:
+            raise ValueError(
+                "every HyperBody decoder segment must hold a multiple of "
+                f"hyperencoder_query_length={q} context tokens "
+                f"(id={ctx_token}); offending (segment, count) = {bad}"
             )
-            if query_count == long_q:
-                flags.append(True)
-            elif query_count == short_q:
-                flags.append(False)
-            else:
-                raise ValueError(
-                    f"HyperBody segment has {query_count} context tokens; "
-                    f"expected short={short_q} or long={long_q}"
-                )
-        return flags
 
     def forward(self, dict_args):
         from paddlefleet.transformer.prefix_lm_mask import (
@@ -423,11 +384,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         audio = dict_args.get("audio", None)
         cu_seqlens = dict_args.get("cu_seqlens", None)
         if cu_seqlens is not None:
-            use_long_query = self._infer_use_long_query(
-                dict_args["input_ids"], cu_seqlens
-            )
-        else:
-            use_long_query = dict_args.get("use_long_query", False)
+            self._check_context_token_counts(dict_args["input_ids"], cu_seqlens)
         cu_seqlens_context = dict_args.get("cu_seqlens_context", None)
 
         context_embeds = self._build_context_embeds(
@@ -435,11 +392,10 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         )
 
         if self.packed:
-            out = self._forward_packed(context_embeds, use_long_query)
+            out = self._forward_packed(context_embeds)
         else:
             out = self._forward_dense(
                 context_embeds,
-                use_long_query,
                 build_dense_mask,
                 prefix_lm_pad_len,
             )
@@ -463,7 +419,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         through. The bridge drops the dummy (image_embeds=None) under the
         ``_hb_text_only`` flag, so the decoder runs on pure text.
         """
-        dtype = self.query_short.weight.dtype
+        dtype = self.query.weight.dtype
         # Build the 1-token dummy through the real context builder (embed_tokens +
         # zero-weighted image/audio tower + projector keepalive) and zero it, so a
         # text-only rank touches the same parameters as a multimodal rank. Together
@@ -476,10 +432,10 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         )
         dummy_ctx = (ctx * 0.0).astype(dtype).unsqueeze(0)  # [1, 1, H]
         if self.packed:
-            out = self._forward_packed(dummy_ctx, False)
+            out = self._forward_packed(dummy_ctx)
         else:
             out = self._forward_dense(
-                dummy_ctx, False, build_dense_mask, prefix_lm_pad_len
+                dummy_ctx, build_dense_mask, prefix_lm_pad_len
             )
         out["_hb_text_only"] = True
         out["_hb_dec_input_ids"] = dict_args["input_ids"]
@@ -493,20 +449,13 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
     def _forward_dense(
         self,
         context_embeds,
-        use_long_query,
         build_dense_mask,
         prefix_lm_pad_len,
     ):
-        # Non-SP [B,S,H] dense-mask path (dp backend).
-        # The dense layout uses ONE query table for all segments (rectangular
-        # [B, n_ctx, H]); ``_infer_use_long_query`` may hand us a per-segment
-        # ``list[bool]`` whose non-empty truthiness would silently pick the
-        # long-query table for every segment. Reduce to the scalar the dense
-        # layout supports (mixed lists are rejected -> use the packed path).
-        use_long_query = _dense_scalar_use_long_query(use_long_query)
+        # Non-SP [B,S,H] dense-mask path (dp backend): every segment of the
+        # rectangular [B, n_ctx, H] block shares the single query table.
         bs, n_context, _ = context_embeds.shape
-        qw = (self.query_long if use_long_query else self.query_short).weight
-        queries = qw.unsqueeze(0).expand([bs, -1, -1])
+        queries = self.query.weight.unsqueeze(0).expand([bs, -1, -1])
         n_queries = queries.shape[1]
 
         x = paddle.concat([context_embeds, queries], axis=1)
@@ -523,7 +472,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             )
         mask = build_dense_mask([n_context], [n_queries], pad)
         rope = self.rotary_pos_emb(max_seq_len=x.shape[1])
-        x = self._add_unused_query_dependency(x, use_long_query)
 
         return {
             "hidden_states": x,
@@ -534,10 +482,9 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "n_context": n_context,
             "n_queries": n_queries,
             "seq_len": seq_len,
-            "use_long_query": use_long_query,
         }
 
-    def _forward_packed(self, context_embeds, use_long_query):
+    def _forward_packed(self, context_embeds):
         """Single packed call through the flashmask branch of
         ``DotProductAttention``.
 
@@ -551,8 +498,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
 
         ``context_embeds`` may be a rectangular ``[B, C, H]`` (synthetic /
         equal-length) or a ragged **list** of ``[C_i, H]`` (real packed dump).
-        ``use_long_query`` may be a single **bool** (homogeneous pack) or a
-        per-segment **list[bool]** (mixed short/long query pack).
+        Every segment is followed by the same single query table.
         """
         from paddlefleet.transformer.prefix_lm_mask import (
             build_flashmask_row_indices,
@@ -572,23 +518,14 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             n_contexts = [n_context] * bs0
         bs = len(seg_ctx)
 
-        # ---- Per-segment query table selection ----
-        if isinstance(use_long_query, bool):
-            uql = [use_long_query] * bs
-        else:
-            uql = [bool(u) for u in use_long_query]
-            if len(uql) != bs:
-                raise ValueError(
-                    f"use_long_query list length {len(uql)} does not match "
-                    f"segment count {bs}"
-                )
-        qws = [(self.query_long if u else self.query_short).weight for u in uql]
-        nq_list = [int(q.shape[0]) for q in qws]
+        qw = self.query.weight
+        nq = int(qw.shape[0])
+        nq_list = [nq] * bs
 
         # ---- Concatenate (context, query) segments end-to-end ----
         segments, starts, running = [], [], 0
-        for ci, nc, q, nq in zip(seg_ctx, n_contexts, qws, nq_list):
-            segments.append(paddle.concat([ci, q], axis=0))
+        for ci, nc in zip(seg_ctx, n_contexts):
+            segments.append(paddle.concat([ci, qw], axis=0))
             starts.append(running)
             running += nc + nq
         x = paddle.concat(segments, axis=0).unsqueeze(0)  # [1, ΣL, H]
@@ -621,7 +558,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         )
 
         rope = self._packed_rope(max_seqlen, seg_lens)
-        x = self._add_unused_query_dependency(x, use_long_query)
 
         return {
             "hidden_states": x,
@@ -635,7 +571,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "n_context": list(n_contexts),
             "n_queries": list(nq_list),
             "seq_len": seq_len,
-            "use_long_query": use_long_query,
         }
 
 
@@ -1161,7 +1096,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         norm_topk_prob=enc.norm_topk_prob,
         scoring_func=enc.scoring_func,
         topk_method=enc.topk_method,
-        hyperencoder_query_lengths=enc.hyperencoder_query_lengths,
+        hyperencoder_query_length=enc.hyperencoder_query_length,
         hyperencoder_seq_align=enc.hyperencoder_seq_align,
         hyperencoder_attn_backend=enc.hyperencoder_attn_backend,
         hyperencoder_packed_decoder=enc.hyperencoder_packed_decoder,
@@ -1473,7 +1408,6 @@ class HyperBodyForConditionalGeneration(HyperBodyPretrainedModel):
         context_ids: paddle.Tensor | None = None,
         image=None,
         audio=None,
-        use_long_query: bool = False,
         labels: paddle.Tensor | None = None,
         attn_mask_startend_row_indices: paddle.Tensor | None = None,
         position_ids: paddle.Tensor | None = None,
@@ -1525,7 +1459,6 @@ class HyperBodyForConditionalGeneration(HyperBodyPretrainedModel):
             "context_ids": context_ids,
             "image": image,
             "audio": audio,
-            "use_long_query": use_long_query,
             "labels": labels,
             "attn_mask_startend_row_indices": attn_mask_startend_row_indices,
             "position_ids": position_ids,

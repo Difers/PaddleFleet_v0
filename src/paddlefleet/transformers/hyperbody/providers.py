@@ -54,6 +54,7 @@ from paddlefleet.models.hyperbody import get_hyperbody_decoder_layer_specs
 from ..configuration_utils import PretrainedConfig
 from ..gpt_provider import GPTModel, GPTModelProvider
 from ..model_provider import ModelProviderMixin
+from .configuration import _positive_query_length
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ class HyperEncoderConfig(PretrainedConfig):
         topk_method="greedy",
         tie_word_embeddings=False,
         # ---- HyperEncoder-specific geometry (exposed here as config fields) ----
-        hyperencoder_query_lengths=(256, 8192),
+        hyperencoder_query_length: int = 256,
         hyperencoder_seq_align: int = 128,
         **kwargs,
     ) -> None:
@@ -148,13 +149,10 @@ class HyperEncoderConfig(PretrainedConfig):
         self.scoring_func = scoring_func
         self.topk_method = topk_method
 
-        # HyperEncoder-specific geometry. json only carries a list, so normalize to a tuple.
-        ql = tuple(int(v) for v in hyperencoder_query_lengths)
-        if len(ql) != 2:
-            raise ValueError(
-                f"hyperencoder_query_lengths must be (short, long), got {ql}"
-            )
-        self.hyperencoder_query_lengths = ql
+        # HyperEncoder-specific geometry.
+        self.hyperencoder_query_length = _positive_query_length(
+            hyperencoder_query_length, "hyperencoder_query_length"
+        )
         self.hyperencoder_seq_align = int(hyperencoder_seq_align)
 
         # `tie_word_embeddings` is popped from kwargs by the base class (default
@@ -376,7 +374,7 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
     use_accuracy_compatible: bool = False
 
     # ---- HyperEncoder-specific geometry (config fields here) ----
-    hyperencoder_query_lengths: tuple = (256, 8192)
+    hyperencoder_query_length: int = 256
     hyperencoder_seq_align: int = 128
     #: Output-projection width for encoder -> LLM.
     language_hidden_size: int = 1280
@@ -447,14 +445,13 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
         _recompute_on = rg is not None
         self.recompute_granularity = None
 
-        ql = tuple(int(v) for v in self.hyperencoder_query_lengths)
-        if len(ql) != 2 or ql[0] <= 0 or ql[1] <= 0:
-            raise ValueError(
-                f"hyperencoder_query_lengths must be two positive integers, got {ql}"
-            )
-        self.hyperencoder_query_lengths = ql
-        # seq_length = max_position_embeddings = long_q + 8192.
-        self.max_sequence_length = ql[1] + 8192
+        self.hyperencoder_query_length = _positive_query_length(
+            self.hyperencoder_query_length, "hyperencoder_query_length"
+        )
+        # seq_length = max_position_embeddings = 8192 context tokens + the
+        # query table. Rope is built per call from the actual sequence length,
+        # so this only bounds config-level consumers.
+        self.max_sequence_length = self.hyperencoder_query_length + 8192
 
         self.head_dim = self.hidden_size // self.num_attention_heads
 

@@ -100,6 +100,27 @@ def _require(value, name: str, owner: str):
     return value
 
 
+def _positive_query_length(value, name: str) -> int:
+    """Normalize ``hyperencoder_query_length`` to a positive ``int``.
+
+    A list/tuple is rejected explicitly: it is what the retired
+    ``hyperencoder_query_lengths`` ``(short, long)`` field looked like, and
+    silently picking one of its entries would hide a stale config. ``bool`` and
+    non-integral ``float`` values are rejected too, since ``int()`` would
+    silently turn them into a wrong table length.
+    """
+    if (
+        isinstance(value, (list, tuple, bool))
+        or (isinstance(value, float) and not value.is_integer())
+        or int(value) <= 0
+    ):
+        raise ValueError(
+            f"{name} must be a single positive integer (the retired "
+            f"(short, long) hyperencoder_query_lengths is not accepted), got {value!r}"
+        )
+    return int(value)
+
+
 def build_moe_layer_freq(num_hidden_layers: int) -> list[int]:
     """Per-layer dense/MoE 0-1 table: ``[0] + [1]*(L-1)`` (layer 0 dense, rest MoE).
 
@@ -265,7 +286,7 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         num_experts_per_tok: int | None = None,
         n_shared_experts: int | None = None,
         first_k_dense_replace: int | None = None,
-        hyperencoder_query_lengths: tuple[int, int] | None = None,
+        hyperencoder_query_length: int | None = None,
         # === optional geometry derivation ===
         num_key_value_heads: int | None = None,
         # === benign policy knobs (functional defaults) ===
@@ -319,17 +340,16 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         self.first_k_dense_replace = _require(
             first_k_dense_replace, "first_k_dense_replace", "encoder_config"
         )
-        ql = _require(
-            hyperencoder_query_lengths,
-            "hyperencoder_query_lengths",
-            "encoder_config",
+        # Length of the single learnable query table (``query``); every context
+        # segment carries exactly this many placeholders.
+        self.hyperencoder_query_length = _positive_query_length(
+            _require(
+                hyperencoder_query_length,
+                "hyperencoder_query_length",
+                "encoder_config",
+            ),
+            "encoder_config.hyperencoder_query_length",
         )
-        ql = tuple(int(v) for v in ql)
-        if len(ql) != 2:
-            raise ValueError(
-                f"encoder_config.hyperencoder_query_lengths must be (short, long), got {ql}"
-            )
-        self.hyperencoder_query_lengths = ql
         # ---- derived geometry ----
         self.num_key_value_heads = (
             num_key_value_heads

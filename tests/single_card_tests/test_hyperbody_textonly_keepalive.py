@@ -273,16 +273,15 @@ class TestFrontEndTextOnlyDummy(unittest.TestCase):
             # a *non-zero* context, so that zeroing is observable
             return prod(paddle.ones([1, hidden])) + 3.0
 
-        def _trunk(dummy_ctx, use_long_query, *rest):
+        def _trunk(dummy_ctx, *rest):
             seen["dummy"] = dummy_ctx
-            seen["use_long_query"] = use_long_query
             seen["rest"] = rest
             return {}
 
         frontend = _bare(
             HyperBodyEncoderFrontEnd,
             packed=packed,
-            query_short=_bare(
+            query=_bare(
                 paddle.nn.Layer, weight=paddle.zeros([1, hidden], dtype=dtype)
             ),
             _embed_one_context=_embed_one_context,
@@ -311,7 +310,6 @@ class TestFrontEndTextOnlyDummy(unittest.TestCase):
         dummy = seen["dummy"]
         self.assertEqual(list(dummy.shape), [1, 1, 4])
         self.assertEqual(float(dummy.abs().max()), 0.0)
-        self.assertIs(seen["use_long_query"], False)
 
     def test_dummy_keeps_frontend_params_in_the_graph(self):
         """``ctx * 0.0`` (not ``zeros_like``) so frontend params get grad 0."""
@@ -432,7 +430,7 @@ _ENCODER_GEOMETRY = {
     "num_experts_per_tok": 2,
     "n_shared_experts": 1,
     "first_k_dense_replace": 1,
-    "hyperencoder_query_lengths": (16, 64),
+    "hyperencoder_query_length": 16,
 }
 
 

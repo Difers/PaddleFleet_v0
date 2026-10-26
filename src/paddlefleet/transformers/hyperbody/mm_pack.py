@@ -24,8 +24,8 @@ carry python lists. HyperBody's packed multimodal input is per-segment lists::
     audio = [Tensor(M, L)    | None, ...]
 
 This module packs them into "pure Tensors + metadata" and losslessly restores the
-original lists after the loader. ``use_long_query`` is derived by the model from
-decoder input_ids/cu_seqlens and is not carried through the data path.
+original lists after the loader. Query selection needs no per-segment data:
+every context segment uses the single ``query`` table.
 
 Metadata design (ragged/jagged tensor, self-describing, modality-agnostic)
 --------------------------------------------------------------------------

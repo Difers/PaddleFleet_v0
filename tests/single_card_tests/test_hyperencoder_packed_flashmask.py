@@ -24,8 +24,9 @@ stubbed out (identity), so they need no GPU and no distributed init:
 * ``HyperEncoderModel.forward_decoder_packed`` (standalone) and
   ``HyperBodyEncoderFrontEnd._forward_packed`` (HyperBody) build row indices
   that describe the same segments they actually concatenated (incl. padding,
-  empty prefixes and mixed short/long queries), pass no dense mask / no
-  ``packed_seq_params``, and slice the query rows back at the right offsets.
+  empty prefixes and, for the standalone model, mixed short/long queries), pass
+  no dense mask / no ``packed_seq_params``, and slice the query rows back at the
+  right offsets.
 """
 
 import types
@@ -242,25 +243,28 @@ class TestForwardDecoderPacked(unittest.TestCase):
 
 
 class TestFrontEndForwardPacked(unittest.TestCase):
-    """HyperBody ``HyperBodyEncoderFrontEnd._forward_packed``."""
+    """HyperBody ``HyperBodyEncoderFrontEnd._forward_packed``.
+
+    The frontend has a single query table, appended after every segment.
+    """
 
     def _frontend(self):
         return _bare(
             HyperBodyEncoderFrontEnd,
             config=_config(),
-            query_short=_table(_SHORT_Q, 1000.0),
-            query_long=_table(_LONG_Q, 2000.0),
+            query=_table(_SHORT_Q, 1000.0),
             _packed_rope=_rope_stub,
-            _add_unused_query_dependency=lambda x, u: x,
         )
 
     def test_row_indices_describe_the_concatenated_layout(self):
-        for ctx_lens, uql_in, desc in _PACKS:
+        for ctx_lens, desc in (
+            ([4, 2], "two segments"),
+            ([3], "single segment"),
+            ([2, 0, 5], "empty prefix in the middle"),
+        ):
             with self.subTest(desc=desc):
-                out = self._frontend()._forward_packed(
-                    _contexts(ctx_lens), uql_in
-                )
-                uql, nq, seq_len, pad = _expected_geometry(ctx_lens, uql_in)
+                out = self._frontend()._forward_packed(_contexts(ctx_lens))
+                _, nq, seq_len, pad = _expected_geometry(ctx_lens, False)
                 # Only the row indices carry the mask on this path.
                 self.assertIsNone(out["attention_mask"])
                 self.assertIsNone(out["packed_seq_params"])
@@ -282,24 +286,14 @@ class TestFrontEndForwardPacked(unittest.TestCase):
                 self.assertEqual(list(layout["n_queries"]), nq)
                 h = out["hidden_states"]
                 self.assertEqual(h.shape, [1, seq_len + pad, _H])
-                for s, c, q, u in zip(
-                    layout["segment_starts"], ctx_lens, nq, uql
-                ):
-                    table = (
-                        _table(_LONG_Q, 2000.0)
-                        if u
-                        else _table(_SHORT_Q, 1000.0)
-                    ).weight
+                table = _table(_SHORT_Q, 1000.0).weight
+                for s, c, q in zip(layout["segment_starts"], ctx_lens, nq):
                     self.assertTrue(
                         bool(paddle.equal_all(h[0, s + c : s + c + q], table))
                     )
                 if pad:
                     self.assertEqual(float(h[0, seq_len:].abs().max()), 0.0)
                 self.assertEqual(out["seq_len"], seq_len)
-
-    def test_use_long_query_length_mismatch_raises(self):
-        with self.assertRaises(ValueError):
-            self._frontend()._forward_packed(_contexts([2, 2]), [False])
 
 
 if __name__ == "__main__":
