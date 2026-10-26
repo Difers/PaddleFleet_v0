@@ -329,7 +329,17 @@ __global__ void __launch_bounds__(kThreads)
 // multimem (NVLS): the mc pointer addresses a multicast object; a store is
 // replicated to the group by NVSwitch and ld_reduce reads the whole group and
 // reduces inside the switch.
+// multimem needs sm_90+. The fatbin also carries older archs (e.g. sm_80),
+// where these trap instead; the host only launches the mc kernels with a
+// multicast pointer, which NCCL hands out only when multimemSupport is set.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define ZCOMM_NO_MULTIMEM 1
+#endif
+
 __device__ __forceinline__ void mc_st(void* addr, int4 v) {
+#ifdef ZCOMM_NO_MULTIMEM
+  __trap();
+#else
   asm volatile(
       "multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(addr),
       "r"(v.x),
@@ -337,6 +347,7 @@ __device__ __forceinline__ void mc_st(void* addr, int4 v) {
       "r"(v.z),
       "r"(v.w)
       : "memory");
+#endif
 }
 
 template <typename T>
@@ -346,12 +357,17 @@ struct McReduce<__nv_bfloat16> {  // bf16 in, fp32 accumulate in the switch,
                                   // result rounded back to bf16
   __device__ static int4 run(const void* addr) {
     int4 v;
+#ifdef ZCOMM_NO_MULTIMEM
+    __trap();
+    v = make_int4(0, 0, 0, 0);
+#else
     asm volatile(
         "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
         "{%0,%1,%2,%3}, [%4];"
         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
         : "l"(addr)
         : "memory");
+#endif
     return v;
   }
 };
@@ -359,14 +375,21 @@ template <>
 struct McReduce<float> {
   __device__ static int4 run(const void* addr) {
     float4 v;
+#ifdef ZCOMM_NO_MULTIMEM
+    __trap();
+    v = make_float4(0.f, 0.f, 0.f, 0.f);
+#else
     asm volatile(
         "multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
         : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
         : "l"(addr)
         : "memory");
+#endif
     return *reinterpret_cast<int4*>(&v);
   }
 };
+
+#undef ZCOMM_NO_MULTIMEM
 
 // AG: read the local in once and multimem.st it into out[rank] of the whole
 // group (own copy included).
