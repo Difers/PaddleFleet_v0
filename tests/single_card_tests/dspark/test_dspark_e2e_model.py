@@ -43,7 +43,7 @@ from paddlefleet.transformer import parallel_multi_token_prediction as pm
 _H, _NH, _NRS, _V = 256, 8, 4, 320
 
 
-def _make_config(add_dspark_loss: bool) -> GPTConfig:
+def _make_config(add_dspark_loss: bool, **overrides) -> GPTConfig:
     config = GPTConfig(
         num_hidden_layers=3,
         hidden_size=_H,
@@ -128,6 +128,7 @@ def _make_config(add_dspark_loss: bool) -> GPTConfig:
         dspark_markov_rank=16,
         dspark_loss_scaling_factor=1.0,
         add_dspark_loss=add_dspark_loss,
+        **overrides,
     )
     config.dtype = "float32"
     return config
@@ -178,7 +179,7 @@ def _ensure_fleet_ready():
 
 
 class TestDsparkEndToEndModel(unittest.TestCase):
-    def _build_and_run(self, add_dspark_loss: bool):
+    def _build_and_run(self, add_dspark_loss: bool, **config_overrides):
         seed = 46
         random.seed(seed)
         np.random.seed(seed)
@@ -186,7 +187,7 @@ class TestDsparkEndToEndModel(unittest.TestCase):
         strategy = _ensure_fleet_ready()
         model_parallel_cuda_manual_seed(seed, tp_rank=0, ep_rank=0, etp_rank=0)
 
-        config = _make_config(add_dspark_loss)
+        config = _make_config(add_dspark_loss, **config_overrides)
         model = gpt_builder(config, num_stages=1)
 
         B, S = 1, 16
@@ -257,6 +258,41 @@ class TestDsparkEndToEndModel(unittest.TestCase):
         )
         self.assertIsNotNone(embed_param.grad)
         self.assertTrue(bool(paddle.isfinite(embed_param.grad).all()))
+
+    def test_config_selects_the_weight_type_actually_optimized(self):
+        """``dspark_loss_weight_type`` must reach the loss, not sit unused.
+
+        The knob changes the per-token weighting of the draft objective, so a
+        profile built from defaults would train a different objective than the
+        config asks for while every loss value stays finite.
+        """
+        from paddlefleet.utils.dspark import dspark_losses
+
+        seen = []
+        real = dspark_losses.compute_dspark_loss
+
+        def _spy(output, profile=None, **kwargs):
+            seen.append(profile)
+            return real(output, profile, **kwargs)
+
+        # Both values: ``dpace`` is the config default and the getattr
+        # fallback, so only the non-default ``decay`` run can catch a
+        # hard-coded "dpace" in DSparkLanguageLoss.forward or a getattr on
+        # the wrong field name. Asserting the value passed (not a literal)
+        # keeps the check honest in both directions.
+        for weight_type in ("decay", "dpace"):
+            seen.clear()
+            with mock.patch.object(dspark_losses, "compute_dspark_loss", _spy):
+                _, loss = self._build_and_run(
+                    add_dspark_loss=True,
+                    dspark_loss_weight_type=weight_type,
+                    dspark_dpace_alpha=0.25,
+                )
+            self.assertTrue(np.isfinite(float(loss)))
+            self.assertTrue(seen, "DSpark loss was never computed")
+            for profile in seen:
+                self.assertEqual(profile.weight_type, weight_type)
+                self.assertAlmostEqual(profile.dpace_alpha, 0.25)
 
 
 class TestDsparkSharedLayerAssembly(unittest.TestCase):

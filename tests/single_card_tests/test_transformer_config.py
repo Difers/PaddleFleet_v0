@@ -847,5 +847,50 @@ else:
         )
 
 
+class TestDSparkLossWeightType(unittest.TestCase):
+    """__post_init__ checks for the joint-training DSpark loss weighting."""
+
+    @staticmethod
+    def _config(**kwargs):
+        return TransformerConfig(
+            num_hidden_layers=2,
+            dspark_target_layer_ids=[0],
+            **kwargs,
+        )
+
+    def test_defaults_to_dpace(self):
+        config = self._config()
+        self.assertEqual(config.dspark_loss_weight_type, "dpace")
+        self.assertEqual(config.dspark_dpace_alpha, 0.6)
+
+    def test_accepts_dpace(self):
+        config = self._config(
+            dspark_loss_weight_type="dpace", dspark_dpace_alpha=0.25
+        )
+        self.assertEqual(config.dspark_loss_weight_type, "dpace")
+        self.assertEqual(config.dspark_dpace_alpha, 0.25)
+
+    def test_decay_remains_selectable(self):
+        config = self._config(
+            dspark_loss_weight_type="decay", dspark_dpace_alpha=0.5
+        )
+        self.assertEqual(config.dspark_loss_weight_type, "decay")
+        self.assertEqual(config.dspark_dpace_alpha, 0.5)
+
+    def test_unknown_weight_type_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, r"dspark_loss_weight_type='cosine' is invalid"
+        ):
+            self._config(dspark_loss_weight_type="cosine")
+
+    def test_dpace_alpha_out_of_range_rejected(self):
+        for alpha in (-0.5, 1.5):
+            with (
+                self.subTest(alpha=alpha),
+                self.assertRaisesRegex(ValueError, r"dspark_dpace_alpha"),
+            ):
+                self._config(dspark_dpace_alpha=alpha)
+
+
 if __name__ == "__main__":
     unittest.main()

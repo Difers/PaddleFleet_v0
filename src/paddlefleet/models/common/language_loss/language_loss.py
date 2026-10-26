@@ -1664,7 +1664,12 @@ class DSparkLanguageLoss(LanguageLoss):
             normalization_group = get_context_parallel_group()
         dspark_terms = compute_dspark_loss(
             output,
-            LossProfile(),
+            LossProfile(
+                weight_type=getattr(
+                    self.config, "dspark_loss_weight_type", "dpace"
+                ),
+                dpace_alpha=getattr(self.config, "dspark_dpace_alpha", 0.6),
+            ),
             return_terms=True,
             normalization_group=normalization_group,
         )

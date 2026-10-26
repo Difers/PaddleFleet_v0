@@ -443,6 +443,32 @@ class TransformerConfig(ModelParallelConfig):
     draft. Default 1.0 keeps the raw loss. Must be finite and non-negative.
     """
 
+    dspark_loss_weight_type: Literal["decay", "dpace"] = "dpace"
+    """Per-token weighting used by the DSpark draft loss in joint training.
+
+    One of ``{"decay", "dpace"}``. ``"dpace"`` (default) applies the
+    confidence-weighted variant implemented by ``_dpace_weights`` in
+    ``paddlefleet/utils/dspark/dspark_losses.py``; ``"decay"`` keeps the plain
+    position decay weighting. The default is ``dpace`` so a run that does not
+    touch its training config gets the DPACE objective.
+    """
+
+    dspark_dpace_alpha: float = 0.6
+    """Smoothing alpha of the ``dpace`` per-token weighting.
+
+    Only read when ``dspark_loss_weight_type == "dpace"``. ``_dpace_weights``
+    first smooths the draft's target-token probability toward 1.0 as
+    ``(1 - alpha) * p + alpha`` (invalid positions use a factor of 1), then
+    gives position ``k`` the suffix sum of the running product,
+    ``sum_{j >= k} prod_{i <= j} smooth_i``, over valid positions. ``alpha=0``
+    keeps the raw probability in that product, the most probability-sensitive
+    setting. ``alpha=1`` makes every factor exactly 1, so the weight degenerates
+    to the number of valid positions at or after ``k`` -- a linear position
+    weighting (``L - k`` for a fully valid block), *not* the ``"decay"`` mode's
+    ``exp(-k / decay_gamma)``. Default 0.6, matching
+    ``LossProfile.dpace_alpha``. Must be in ``[0, 1]``.
+    """
+
     add_dspark_loss: bool = False
     """Whether to route the DSpark distillation loss into the main loss path.
 
@@ -2595,6 +2621,16 @@ class TransformerConfig(ModelParallelConfig):
                         f"dspark_target_layer_ids entry {lid} is out of range "
                         f"[0, {n_layers})."
                     )
+            if self.dspark_loss_weight_type not in {"decay", "dpace"}:
+                raise ValueError(
+                    f"dspark_loss_weight_type={self.dspark_loss_weight_type!r} is invalid. "
+                    "Must be one of {'decay', 'dpace'}."
+                )
+            if not 0.0 <= float(self.dspark_dpace_alpha) <= 1.0:
+                raise ValueError(
+                    "dspark_dpace_alpha must be in [0, 1], got "
+                    f"{self.dspark_dpace_alpha!r}."
+                )
         # ``True`` predates the "hf" target and has always meant Megatron, so
         # canonicalize it to the explicit name; every falsy spelling collapses to
         # False. An unknown target raises rather than falling back to the default

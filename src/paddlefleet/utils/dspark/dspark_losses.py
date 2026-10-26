@@ -46,7 +46,7 @@ class LossProfile:
     confidence_alpha: float = 1.0
     weight_type: str = "decay"
     decay_gamma: float | None = 4.0
-    dpace_alpha: float = 0.5  # only used when weight_type == "dpace"
+    dpace_alpha: float = 0.6  # only used when weight_type == "dpace"
     probability_chunk_tokens: int = 1024  # memory-tiling, not a recipe choice
     subbatch_sequence_length: int = 1024  # memory-tiling, <=0 disables tiling
     # The selector_* / use_fused_distill_loss fields below are inert unless the
