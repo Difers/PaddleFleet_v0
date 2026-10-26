@@ -382,20 +382,10 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
     language_hidden_size: int = 1280
 
     # ---- Attention backend + packed-decoder path ----
-    #: ``"dp"`` (dense per-layer mask) or ``"triton"`` (packed prefix-LM core).
+    #: ``"dp"`` (eager, dense mask) or ``"flashmask"`` (packed prefix-LM row indices).
     hyperencoder_attn_backend: str = "dp"
-    #: Run the trunk as a single packed call. Requires the ``triton`` backend.
+    #: Run the trunk as a single packed call. Must match the ``flashmask`` backend.
     hyperencoder_packed_decoder: bool = False
-
-    # ---- Triton prefix-LM kernel tuning ----
-    hyperencoder_triton_block_m: int = 64
-    hyperencoder_triton_block_n: int = 64
-    hyperencoder_triton_fwd_warps: int = 4
-    hyperencoder_triton_fwd_stages: int = 2
-    hyperencoder_triton_bwd_warps: int = 4
-    hyperencoder_triton_bwd_stages: int = 2
-    #: LRU cap for the exec-plan cache (0 disables caching).
-    hyperencoder_triton_plan_cache_size: int = 64
 
     # No `transform_rules`: `HyperEncoderConfig` field names are exactly the same
     # as on the Fleet side, so none needs renaming.
@@ -468,42 +458,13 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
 
         self.head_dim = self.hidden_size // self.num_attention_heads
 
-        # Validate the attention-backend / packed-decoder / Triton-tuning fields
-        # here so a bad config fails at construction rather than deep inside a
-        # kernel launch.
+        # Validate the attention-backend / packed-decoder pairing here so a bad
+        # config fails at construction rather than at the first forward.
         from paddlefleet.models.hyperencoder.attn_backend import (
             use_packed_decoder,
         )
 
         use_packed_decoder(self)
-        for _name in (
-            "hyperencoder_triton_block_m",
-            "hyperencoder_triton_block_n",
-            "hyperencoder_triton_fwd_warps",
-            "hyperencoder_triton_fwd_stages",
-            "hyperencoder_triton_bwd_warps",
-            "hyperencoder_triton_bwd_stages",
-        ):
-            _v = int(getattr(self, _name))
-            if _v <= 0:
-                raise ValueError(
-                    f"{_name} must be a positive integer, got {_v}"
-                )
-            setattr(self, _name, _v)
-        _cache = int(self.hyperencoder_triton_plan_cache_size)
-        if _cache < 0:
-            raise ValueError(
-                f"hyperencoder_triton_plan_cache_size must be >= 0, got {_cache}"
-            )
-        self.hyperencoder_triton_plan_cache_size = _cache
-        # Only block_m == block_n is a validated configuration.
-        if self.hyperencoder_triton_block_m != self.hyperencoder_triton_block_n:
-            raise ValueError(
-                "hyperencoder_triton_block_m must equal "
-                "hyperencoder_triton_block_n (only symmetric block shapes are "
-                f"supported), got {self.hyperencoder_triton_block_m} vs "
-                f"{self.hyperencoder_triton_block_n}"
-            )
 
         # ETP == TP; SP is derived from the real tp_size.
         tp = int(self.tensor_model_parallel_size or 1)

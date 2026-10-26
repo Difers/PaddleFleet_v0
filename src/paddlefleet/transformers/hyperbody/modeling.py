@@ -195,8 +195,8 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         )
 
         self.config = config
-        # dp (dense mask) vs triton+packed (single-call, PackedSeqParams layout).
-        # use_packed_decoder validates packed=>triton (raises on packed+dp).
+        # dp (dense mask) vs flashmask+packed (single call, [1,1,T,2] row
+        # indices). use_packed_decoder rejects the mixed combinations.
         self.packed = use_packed_decoder(config)
         short_q, long_q = config.hyperencoder_query_lengths
 
@@ -538,25 +538,25 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         }
 
     def _forward_packed(self, context_embeds, use_long_query):
-        """Single packed call (triton core). Mirrors
-        ``HyperEncoderModel.forward_decoder_packed`` (non-SP branch).
+        """Single packed call through the flashmask branch of
+        ``DotProductAttention``.
 
         The ``(context, query)`` segments are concatenated end-to-end into one
-        ``[1, T, H]`` sequence; the segment layout is attached to
-        ``PackedSeqParams.prefix_lm_layout`` for ``PrefixLMTritonCore`` and also
-        carried under ``_hb_packed`` for the bridge's per-segment slice.
-        ``attention_mask`` is None: the triton core rejects a dense mask and
-        derives its semantics entirely from the layout.
+        ``[1, T, H]`` sequence. The prefix-LM mask goes to the trunk as FlashMask
+        row indices ``[1, 1, T, 2]`` under ``attn_mask_startend_row_indices``
+        (consumed with ``causal=False``); the segment layout is also carried
+        under ``_hb_packed`` for the bridge's per-segment slice.
+        ``attention_mask`` / ``packed_seq_params`` are None: the mask semantics
+        live entirely in the row indices.
 
         ``context_embeds`` may be a rectangular ``[B, C, H]`` (synthetic /
         equal-length) or a ragged **list** of ``[C_i, H]`` (real packed dump).
         ``use_long_query`` may be a single **bool** (homogeneous pack) or a
         per-segment **list[bool]** (mixed short/long query pack).
         """
-        from paddlefleet.packed_seq_params import PackedSeqParams
-        from paddlefleet.transformer.prefix_lm_mask import prefix_lm_pad_len
-        from paddlefleet.transformer.prefix_lm_triton_core import (
-            PREFIX_LM_LAYOUT_ATTR,
+        from paddlefleet.transformer.prefix_lm_mask import (
+            build_flashmask_row_indices,
+            prefix_lm_pad_len,
         )
 
         # ---- Normalize context to a per-segment list [C_i, H] ----
@@ -615,10 +615,10 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "segment_starts": tuple(starts),
             "n_contexts": tuple(n_contexts),
             "n_queries": tuple(nq_list),
-            "pad_len": pad,
         }
-        psp = PackedSeqParams()
-        setattr(psp, PREFIX_LM_LAYOUT_ATTR, layout)
+        row_indices = build_flashmask_row_indices(
+            n_contexts, nq_list, pad, place=x.place
+        )
 
         rope = self._packed_rope(max_seqlen, seg_lens)
         x = self._add_unused_query_dependency(x, use_long_query)
@@ -626,8 +626,9 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         return {
             "hidden_states": x,
             "attention_mask": None,
+            "attn_mask_startend_row_indices": row_indices,
             "rotary_pos_emb": rope,
-            "packed_seq_params": psp,
+            "packed_seq_params": None,
             "_hb_packed": layout,
             # Ragged pack: per-segment lists (bridge reads _hb_packed layout, not
             # these scalars; kept for symmetry with the dense return dict).
@@ -1115,8 +1116,14 @@ def _build_decoder_view(config: HyperBodyConfig):
 def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     """Strip the ``encoder_`` prefix into a transient HyperEncoderConfig, then
     materialize a HyperEncoderProvider view; wire the out-projector output width
-    to the decoder hidden size and force eager attention.
+    to the decoder hidden size and pick the attention implementation that
+    matches the encoder backend (``flashmask`` for the packed path, ``eager``
+    for the dense ``dp`` path; see ``models/hyperencoder/layer_specs.py``).
     """
+    from paddlefleet.models.hyperencoder.attn_backend import (
+        use_flashmask_encoder_attn,
+    )
+
     # Recompute: the encoder trunk supports a single degree of freedom --
     # ``recompute_granularity in (None, "full")`` (HyperEncoderProvider.__post_init__
     # pins method="uniform"/num_layers=1). Mirror the decoder's *intent*: if the
@@ -1215,11 +1222,13 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     )
     view = HyperEncoderProvider.from_config(enc_cfg)
     view.language_hidden_size = decoder_hidden
-    view._attn_implementation = "eager"
+    view._attn_implementation = (
+        "flashmask" if use_flashmask_encoder_attn(view) else "eager"
+    )
     # This region is replicated across CP: every CP rank holds the whole
     # sequence, so its local sequence IS the global one. Anything that scales a
-    # per-rank statistic by cp -- the aux-loss denominator, its probs gather --
-    # is then off by cp.
+    # per-rank statistic by cp -- the aux-loss denominator, its probs gather,
+    # the attention's KV gather -- is then off by cp.
     view.cp_replicated_sequence = True
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
     return view

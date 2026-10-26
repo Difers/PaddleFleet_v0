@@ -29,6 +29,7 @@ from paddlefleet.models.hyperencoder.layer_specs import (
 from paddlefleet.models.hyperencoder.norm import (
     HyperEncoderRMSNorm,
 )
+from paddlefleet.transformer.enums import AttnMaskType
 
 
 def _cfg(**over):
@@ -44,18 +45,13 @@ def _cfg(**over):
     return types.SimpleNamespace(**base)
 
 
-def _make_spec(with_core_attention=True):
+def _make_spec():
     """Fabricate a spec object shaped like get_gpt_layer_local_spec's return."""
     sub = types.SimpleNamespace(
         input_layernorm=None, post_attention_layernorm=None
     )
-    if with_core_attention:
-        attn_sub = types.SimpleNamespace(core_attention=object())
-        sub.self_attn = types.SimpleNamespace(sublayers_spec=attn_sub)
-    else:
-        sub.self_attn = types.SimpleNamespace(
-            sublayers_spec=types.SimpleNamespace()
-        )
+    attn_sub = types.SimpleNamespace(core_attention=object())
+    sub.self_attn = types.SimpleNamespace(sublayers_spec=attn_sub)
     return types.SimpleNamespace(sublayers_spec=sub)
 
 
@@ -75,11 +71,16 @@ class TestIsMoeLayer(unittest.TestCase):
             _is_moe_layer(cfg, 0)
 
 
-class TestLayerSpecsEager(unittest.TestCase):
-    def test_missing_eager_raises(self):
-        cfg = _cfg(_attn_implementation="sdpa")
-        with self.assertRaises(ValueError):
-            get_hyperencoder_layer_specs(cfg)
+class TestLayerSpecsDp(unittest.TestCase):
+    def test_dp_requires_eager(self):
+        # Any non-eager value takes the SDPA branch under bf16 (is_causal=True).
+        for impl in ("sdpa", "flashmask", None):
+            with self.subTest(impl=impl):
+                with self.assertRaises(ValueError) as cm:
+                    get_hyperencoder_layer_specs(
+                        _cfg(_attn_implementation=impl)
+                    )
+                self.assertIn("eager", str(cm.exception))
 
     def test_happy_path_replaces_norms(self):
         cfg = _cfg()
@@ -101,36 +102,49 @@ class TestLayerSpecsEager(unittest.TestCase):
         self.assertEqual(num_experts, [None, 4])
 
 
-class TestLayerSpecsTriton(unittest.TestCase):
-    def test_triton_installs_core_attention(self):
-        from paddlefleet.transformer.prefix_lm_triton_core import (
-            PrefixLMTritonCore,
-        )
+class TestLayerSpecsFlashMask(unittest.TestCase):
+    def test_flashmask_rejects_eager(self):
+        # The eager branch ignores row indices -> unmasked attention.
+        cfg = _cfg(hyperencoder_attn_backend="flashmask")
+        with self.assertRaises(ValueError) as cm:
+            get_hyperencoder_layer_specs(cfg)
+        self.assertIn("attn_mask_startend_row_indices", str(cm.exception))
 
-        cfg = _cfg(hyperencoder_attn_backend="triton")
+    def test_flashmask_keeps_stock_core_attention(self):
+        # FlashMask goes through the stock DotProductAttention: the spec's
+        # core_attention must be left exactly as the GPT builder produced it.
+        cfg = _cfg(
+            hyperencoder_attn_backend="flashmask",
+            _attn_implementation="flashmask",
+        )
+        built = []
+
+        def _build(**kw):
+            spec = _make_spec()
+            # Remember the core the GPT builder produced, before any rewrite.
+            built.append(
+                (
+                    spec,
+                    spec.sublayers_spec.self_attn.sublayers_spec.core_attention,
+                )
+            )
+            return spec
+
         with mock.patch.object(
-            layer_specs,
-            "get_gpt_layer_local_spec",
-            side_effect=lambda **kw: _make_spec(),
-        ):
+            layer_specs, "get_gpt_layer_local_spec", side_effect=_build
+        ) as build:
             specs = get_hyperencoder_layer_specs(cfg)
-        for s in specs:
+        self.assertEqual(len(specs), 2)
+        for s, (orig, orig_core) in zip(specs, built):
+            self.assertIs(s, orig)
             self.assertIs(
                 s.sublayers_spec.self_attn.sublayers_spec.core_attention,
-                PrefixLMTritonCore,
+                orig_core,
             )
-
-    def test_triton_missing_core_attention_raises(self):
-        cfg = _cfg(hyperencoder_attn_backend="triton")
-        with (
-            mock.patch.object(
-                layer_specs,
-                "get_gpt_layer_local_spec",
-                side_effect=lambda **kw: _make_spec(with_core_attention=False),
-            ),
-            self.assertRaises(RuntimeError),
-        ):
-            get_hyperencoder_layer_specs(cfg)
+            self.assertIs(s.sublayers_spec.input_layernorm, HyperEncoderRMSNorm)
+        # Same mask type as dp: semantics come only from the fed mask.
+        for c in build.call_args_list:
+            self.assertIs(c.kwargs["attn_mask_type"], AttnMaskType.no_mask)
 
 
 class TestBlockSpec(unittest.TestCase):

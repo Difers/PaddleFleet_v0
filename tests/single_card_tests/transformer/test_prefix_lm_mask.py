@@ -12,8 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the prefix-LM three-region mask representations."""
+"""Unit tests for the prefix-LM three-region mask representations.
 
+The FlashMask row indices are what the packed encoder actually feeds to
+``flashmask_attention(causal=False)``; the dense mask is the reference. Every
+row-index test is checked either against a hand-derived table or against the
+dense mask through an expander that only knows the FlashMask semantics.
+"""
+
+import random
 import unittest
 
 import paddle
@@ -21,12 +28,12 @@ import paddle
 from paddlefleet.transformer.prefix_lm_mask import (
     build_dense_mask,
     build_flashmask_row_indices,
-    build_prefix_lm_layout,
-    expand_layout_to_dense,
     expand_row_indices_to_dense,
     prefix_lm_pad_len,
     prefix_lm_segment_starts,
 )
+
+_GPU = paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
 
 
 class TestCheckLens(unittest.TestCase):
@@ -95,88 +102,110 @@ class TestBuildDenseMask(unittest.TestCase):
 
 
 class TestFlashMaskRowIndices(unittest.TestCase):
-    def test_shape_no_pad(self):
-        ri = build_flashmask_row_indices([2], [2])
-        self.assertEqual(ri.shape, [1, 1, 4, 4])
+    def test_shape_and_dtype(self):
+        for pad in (0, 2):
+            with self.subTest(pad=pad):
+                ri = build_flashmask_row_indices([2], [2], pad_len=pad)
+                self.assertEqual(ri.shape, [1, 1, 4 + pad, 2])
+                self.assertEqual(ri.dtype, paddle.int32)
 
-    def test_shape_with_pad(self):
-        ri = build_flashmask_row_indices([2], [2], pad_len=2)
-        self.assertEqual(ri.shape, [1, 1, 6, 4])
+    def test_values_match_hand_derived_table(self):
+        # seg0: s=0, C=2, L=4 -> prefix cols 0,1: [LTS=4, UTE=s=0];
+        #                        suffix cols 2,3: [4, j]
+        # seg1: s=4, C=0, L=3 -> suffix cols 4,5,6: [7, j]
+        # pad cols 7,8: [j+1, j] (self only)
+        ri = build_flashmask_row_indices([2, 0], [2, 3], pad_len=2)
+        expected = [
+            [4, 0],
+            [4, 0],
+            [4, 2],
+            [4, 3],
+            [7, 4],
+            [7, 5],
+            [7, 6],
+            [8, 7],
+            [9, 8],
+        ]
+        self.assertEqual(ri.reshape([-1, 2]).numpy().tolist(), expected)
 
-
-class TestLayout(unittest.TestCase):
-    def test_fields(self):
-        layout = build_prefix_lm_layout([2, 1], [2, 1], pad_len=2)
-        self.assertEqual(layout["segment_starts"], (0, 4))
-        self.assertEqual(layout["n_contexts"], (2, 1))
-        self.assertEqual(layout["n_queries"], (2, 1))
-        self.assertEqual(layout["pad_len"], 2)
+    def test_validates_lengths(self):
+        with self.assertRaises(ValueError):
+            build_flashmask_row_indices([2], [0])
+        with self.assertRaises(ValueError):
+            build_flashmask_row_indices([2], [2], pad_len=-1)
 
 
 class TestExpandRowIndices(unittest.TestCase):
-    def test_bad_shape_raises(self):
+    def test_rejects_legacy_four_column_layout(self):
+        # The causal 4-column [LTS, LTE, UTS, UTE] form must not be mistaken for
+        # the non-causal 2-column form.
+        for cols in (1, 3, 4):
+            with self.subTest(cols=cols), self.assertRaises(ValueError):
+                expand_row_indices_to_dense(
+                    paddle.zeros([1, 1, 4, cols], dtype="int32")
+                )
+
+    def test_rejects_non_4d(self):
         with self.assertRaises(ValueError):
-            expand_row_indices_to_dense(
-                paddle.zeros([1, 1, 4, 3], dtype="int32")
-            )
-
-    def test_expand_shape(self):
-        ri = build_flashmask_row_indices([2], [2])
-        dense = expand_row_indices_to_dense(ri)
-        self.assertEqual(dense.shape, [1, 1, 4, 4])
+            expand_row_indices_to_dense(paddle.zeros([4, 2], dtype="int32"))
 
 
-class TestExpandLayout(unittest.TestCase):
-    def test_no_pad(self):
-        layout = build_prefix_lm_layout([2], [2])
-        dense = expand_layout_to_dense(layout)
-        self.assertEqual(dense.shape, [1, 1, 4, 4])
-
-    def test_with_pad(self):
-        layout = build_prefix_lm_layout([2], [2], pad_len=2)
-        dense = expand_layout_to_dense(layout)
-        self.assertEqual(dense.shape, [1, 1, 6, 6])
-
-
-class TestThreeRepresentationsAgree(unittest.TestCase):
-    """The three representations must expand to a bit-identical dense mask."""
+class TestRepresentationsAgree(unittest.TestCase):
+    """Dense mask and FlashMask row indices expand to the same forbidden set."""
 
     def _check(self, prefix_lens, suffix_lens, pad_len):
         dense = build_dense_mask(prefix_lens, suffix_lens, pad_len)
         via_ri = expand_row_indices_to_dense(
             build_flashmask_row_indices(prefix_lens, suffix_lens, pad_len)
         )
-        via_layout = expand_layout_to_dense(
-            build_prefix_lm_layout(prefix_lens, suffix_lens, pad_len)
+        self.assertEqual(dense.shape, via_ri.shape)
+        mismatch = int((dense != via_ri).astype("int32").sum())
+        self.assertEqual(
+            mismatch, 0, f"{prefix_lens=} {suffix_lens=} {pad_len=}"
         )
-        self.assertTrue(bool((dense == via_ri).all()))
-        self.assertTrue(bool((dense == via_layout).all()))
 
-    def test_single_segment_no_pad(self):
-        self._check([3], [2], 0)
+    def test_edge_cases(self):
+        cases = [
+            ([3], [2], 0),  # single segment
+            ([2, 3], [2, 1], 4),  # multi segment + pad
+            ([0, 2], [3, 2], 2),  # empty prefix in the first segment
+            ([2, 0], [1, 1], 0),  # empty prefix in the last segment, Q=1
+            ([0], [1], 0),  # smallest legal pack
+            ([5, 1, 0, 7], [1, 3, 2, 1], 1),  # 1-token suffixes + 1-token pad
+        ]
+        for prefix, suffix, pad in cases:
+            with self.subTest(prefix=prefix, suffix=suffix, pad=pad):
+                self._check(prefix, suffix, pad)
 
-    def test_multi_segment_with_pad(self):
-        self._check([2, 3], [2, 1], 4)
-
-    def test_zero_prefix(self):
-        self._check([0, 2], [3, 2], 2)
+    def test_random_packs(self):
+        rng = random.Random(20261022)
+        for _ in range(40):
+            n = rng.randint(1, 6)
+            prefix = [rng.randint(0, 9) for _ in range(n)]
+            suffix = [rng.randint(1, 9) for _ in range(n)]
+            pad = rng.choice([0, 0, 1, rng.randint(2, 7)])
+            with self.subTest(prefix=prefix, suffix=suffix, pad=pad):
+                self._check(prefix, suffix, pad)
 
 
 class TestExplicitPlace(unittest.TestCase):
-    """Exercise the optional ``place`` argument on the tensor builders."""
+    """The optional ``place`` puts the result on that device, value-unchanged."""
 
-    def setUp(self):
-        # Use whatever place the default tensor lives on, so the test is
-        # agnostic to CPU/GPU execution.
-        self.place = paddle.zeros([1]).place
+    def test_cpu_place(self):
+        ri = build_flashmask_row_indices(
+            [2], [2], pad_len=2, place=paddle.CPUPlace()
+        )
+        self.assertTrue(ri.place.is_cpu_place())
+        m = build_dense_mask([2], [2], pad_len=2, place=paddle.CPUPlace())
+        self.assertTrue(m.place.is_cpu_place())
 
-    def test_dense_mask_with_place(self):
-        m = build_dense_mask([2], [2], pad_len=2, place=self.place)
-        self.assertEqual(m.shape, [1, 1, 6, 6])
-
-    def test_row_indices_with_place(self):
-        ri = build_flashmask_row_indices([2], [2], pad_len=2, place=self.place)
-        self.assertEqual(ri.shape, [1, 1, 6, 4])
+    @unittest.skipUnless(_GPU, "requires a GPU")
+    def test_gpu_place_matches_cpu_values(self):
+        args = ([3, 0, 2], [2, 4, 1], 3)
+        cpu = build_flashmask_row_indices(*args, place=paddle.CPUPlace())
+        gpu = build_flashmask_row_indices(*args, place=paddle.CUDAPlace(0))
+        self.assertTrue(gpu.place.is_gpu_place())
+        self.assertEqual(gpu.numpy().tolist(), cpu.numpy().tolist())
 
 
 if __name__ == "__main__":

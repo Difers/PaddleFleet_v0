@@ -27,8 +27,8 @@ Config assembly and the top-level unified model live under
 
 from paddlefleet.models.hyperencoder.attn_backend import (
     encoder_attn_backend,
+    use_flashmask_encoder_attn,
     use_packed_decoder,
-    use_triton_encoder_attn,
 )
 from paddlefleet.models.hyperencoder.layer_specs import (
     get_hyperencoder_block_spec as get_hyperbody_encoder_block_spec,
@@ -51,8 +51,8 @@ from .decoder_layer_specs import (
 
 __all__ = [
     "encoder_attn_backend",
+    "use_flashmask_encoder_attn",
     "use_packed_decoder",
-    "use_triton_encoder_attn",
     "get_hyperbody_decoder_block_spec",
     "get_hyperbody_decoder_layer_specs",
     "get_hyperbody_encoder_block_spec",

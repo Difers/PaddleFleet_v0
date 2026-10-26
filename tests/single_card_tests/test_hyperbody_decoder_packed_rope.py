@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit coverage for the decoder ``packed_decoder_rope`` gate on HyperBody.
+"""Unit coverage for the HyperBody packed-path config gates.
 
 Under the nested (``sub_configs``) config, ``packed_decoder_rope`` on the decoder
 view tracks ``encoder_config.hyperencoder_packed_decoder`` directly (the two move
 together; there is no separate top-level override knob). This module asserts:
   * ``modeling._build_decoder_view`` sets ``packed_decoder_rope`` == the encoder
     flag for both True/False;
-  * the ``triton`` frontend without a packed decoder is rejected at config
-    construction (case-insensitive).
+  * ``hyperencoder_attn_backend='flashmask'`` and ``hyperencoder_packed_decoder``
+    must be set together (both mixed pairs are rejected at config construction,
+    case-insensitive);
+  * ``modeling._build_encoder_view`` picks the attention implementation that
+    matches the backend and marks the encoder as CP-replicated.
 
 These are pure config-view assertions (no GPU / no distributed init). Geometry is
 REQUIRED by the sensitive-info policy, so configs are built with explicit
@@ -30,7 +33,10 @@ REQUIRED by the sensitive-info policy, so configs are built with explicit
 import sys
 
 from paddlefleet.transformers.hyperbody.configuration import HyperBodyConfig
-from paddlefleet.transformers.hyperbody.modeling import _build_decoder_view
+from paddlefleet.transformers.hyperbody.modeling import (
+    _build_decoder_view,
+    _build_encoder_view,
+)
 
 # Minimal-but-complete geometry satisfying the REQUIRED sensitive-info fields.
 _DECODER_GEOMETRY = {
@@ -59,7 +65,11 @@ _ENCODER_GEOMETRY = {
 }
 
 
-def _make_config(hyperencoder_packed_decoder, hyperencoder_attn_backend="dp"):
+def _make_config(hyperencoder_packed_decoder, hyperencoder_attn_backend=None):
+    if hyperencoder_attn_backend is None:
+        hyperencoder_attn_backend = (
+            "flashmask" if hyperencoder_packed_decoder else "dp"
+        )
     encoder_config = {
         **_ENCODER_GEOMETRY,
         "hyperencoder_attn_backend": hyperencoder_attn_backend,
@@ -82,31 +92,68 @@ def test_packed_decoder_rope_tracks_hyperencoder_packed_decoder():
         )
 
 
-def test_triton_backend_requires_packed_decoder():
-    """The 'triton' frontend without packed decoding is rejected at construction."""
-    for backend in ("triton", "TRITON"):
+def test_flashmask_backend_and_packed_decoder_move_together():
+    """Both mixed pairs are rejected at construction; matching pairs pass."""
+    for backend, packed in (
+        ("flashmask", False),
+        ("FlashMask", False),
+        ("dp", True),
+    ):
         raised = False
         try:
             _make_config(
-                hyperencoder_packed_decoder=False,
+                hyperencoder_packed_decoder=packed,
                 hyperencoder_attn_backend=backend,
             )
         except ValueError as e:
-            assert "requires hyperencoder_packed_decoder" in str(e)
+            assert "must be set together" in str(e), str(e)
             raised = True
-        assert raised, f"{backend} + non-packed should raise ValueError"
+        assert raised, f"{backend=} {packed=} should raise ValueError"
 
-    # triton + packed is accepted.
-    cfg = _make_config(
-        hyperencoder_packed_decoder=True, hyperencoder_attn_backend="triton"
+    for backend, packed in (
+        ("flashmask", True),
+        ("FLASHMASK", True),
+        ("dp", False),
+    ):
+        cfg = _make_config(
+            hyperencoder_packed_decoder=packed,
+            hyperencoder_attn_backend=backend,
+        )
+        assert cfg.encoder_config.hyperencoder_packed_decoder is packed
+
+
+def test_encoder_view_attn_implementation_follows_backend():
+    """flashmask -> non-eager 'flashmask'; dp -> 'eager'; always CP-replicated."""
+    for packed, impl in ((True, "flashmask"), (False, "eager")):
+        view = _build_encoder_view(
+            _make_config(hyperencoder_packed_decoder=packed), decoder_hidden=64
+        )
+        assert view._attn_implementation == impl, (
+            packed,
+            view._attn_implementation,
+        )
+        assert view.cp_replicated_sequence is True
+
+
+def test_encoder_view_builds_flashmask_layer_specs():
+    """The flashmask view passes the layer-spec backend/impl assertion."""
+    from paddlefleet.models.hyperencoder.layer_specs import (
+        get_hyperencoder_layer_specs,
     )
-    assert cfg.encoder_config.hyperencoder_attn_backend == "triton"
+
+    view = _build_encoder_view(
+        _make_config(hyperencoder_packed_decoder=True), decoder_hidden=64
+    )
+    specs = get_hyperencoder_layer_specs(view)
+    assert len(specs) == view.num_hidden_layers
 
 
 if __name__ == "__main__":
     try:
         test_packed_decoder_rope_tracks_hyperencoder_packed_decoder()
-        test_triton_backend_requires_packed_decoder()
+        test_flashmask_backend_and_packed_decoder_move_together()
+        test_encoder_view_attn_implementation_follows_backend()
+        test_encoder_view_builds_flashmask_layer_specs()
     except AssertionError:
         import traceback
 

@@ -42,21 +42,20 @@ Adding a parameter to the shared class is a small change but:
 
 A thin subclass avoids those risks and is the better trade-off.
 
-## What each of the three attention paths needs
+## What each of the two attention paths needs
 
 | Path | Carrier | How this class passes it |
 |---|---|---|
-| (1) eager | dense `attention_mask` `[1,1,L,L]` | uses the parent's existing `attention_mask` parameter; this class does nothing extra |
-| (2) FlashMask | `attn_mask_startend_row_indices` `[1,1,T',4]` | this class injects it into `dict_args` |
-| (3) Triton | `packed_seq_params.prefix_lm_layout` dict | attached to `packed_seq_params` (a plain dataclass, adding a field has no side effect), already forwarded by the parent |
+| (1) eager (``dp``, dense) | dense `attention_mask` `[1,1,L,L]` | uses the parent's existing `attention_mask` parameter; this class does nothing extra |
+| (2) FlashMask (``flashmask``, packed) | `attn_mask_startend_row_indices` `[1,1,T',2]` | this class injects it into `dict_args` |
 
-Paths (1) and (2) cannot be passed together. Under bf16, if only the dense mask
-is passed without row indices, `DotProductAttention` takes its SDPA branch and
-forces `is_causal=True`, silently breaking the bidirectional semantics -- this
-is guarded by the `_attn_implementation='eager'` assertion in the layer specs.
-Conversely, if both are passed, the flashmask branch takes priority and the
-dense mask is silently ignored. So this class raises directly when both are
-non-None, rather than guessing a priority.
+Exactly one of them must be passed. Under bf16, if only the dense mask is passed
+with a non-eager implementation, `DotProductAttention` takes its SDPA branch
+and forces `is_causal=True`; if row indices are passed with the eager
+implementation they are ignored. Both are guarded by the
+`_attn_implementation` assertion in the layer specs. If both masks are passed,
+the flashmask branch takes priority and the dense mask is silently ignored, so
+this class raises directly rather than guessing a priority.
 """
 
 from __future__ import annotations
@@ -99,50 +98,16 @@ class HyperEncoderBlock(TransformerBlock):
         """
         Args:
             attention_mask: path (1), dense mask `[1,1,L,L]` bool, `True` = masked out.
-            attn_mask_startend_row_indices: path (2), FlashMask 4-column indices `[1,1,T',4]` int32.
-            packed_seq_params: path (3) attaches `prefix_lm_layout` to it.
+            attn_mask_startend_row_indices: path (2), FlashMask non-causal row indices `[1,1,T',2]` int32.
+            packed_seq_params: forwarded unchanged (unused by both paths).
         """
-        from paddlefleet.transformer.prefix_lm_triton_core import (
-            PREFIX_LM_LAYOUT_ATTR,
-        )
-
-        if (
-            attention_mask is not None
-            and attn_mask_startend_row_indices is not None
-        ):
+        if (attention_mask is None) == (attn_mask_startend_row_indices is None):
             raise ValueError(
-                "attention_mask (dense) and attn_mask_startend_row_indices (FlashMask "
-                "column-sparse) cannot be passed together: the flashmask branch of "
-                "dot_product_attention takes priority and the dense mask would be "
-                "silently ignored. Choose exactly one path."
-            )
-        # Path (3) (packed + triton) passes neither mask parameter; the geometry
-        # is entirely in `packed_seq_params.prefix_lm_layout`. So "pass nothing"
-        # is only valid when a layout is attached -- otherwise it truly degrades
-        # to no mask at all.
-        _has_layout = (
-            getattr(packed_seq_params, PREFIX_LM_LAYOUT_ATTR, None) is not None
-        )
-        if (
-            attention_mask is None
-            and attn_mask_startend_row_indices is None
-            and not _has_layout
-        ):
-            raise ValueError(
-                "exactly one of attention_mask / attn_mask_startend_row_indices / "
-                f"packed_seq_params.{PREFIX_LM_LAYOUT_ATTR} must be provided -- "
-                "providing none silently degrades to no mask, losing the prefix-LM "
-                "three-region semantics without raising."
-            )
-        if _has_layout and (
-            attention_mask is not None
-            or attn_mask_startend_row_indices is not None
-        ):
-            raise ValueError(
-                f"packed_seq_params.{PREFIX_LM_LAYOUT_ATTR} cannot be passed together "
-                "with a dense mask / FlashMask row indices: the three paths are "
-                "mutually exclusive, and passing more than one means the caller has "
-                "not decided which path to take."
+                "exactly one of attention_mask (dense) / "
+                "attn_mask_startend_row_indices (FlashMask) must be provided: "
+                "passing none silently degrades to no mask, and passing both "
+                "silently drops the dense mask (the flashmask branch of "
+                "dot_product_attention takes priority)."
             )
 
         # The parent's forward does not know about attn_mask_startend_row_indices,
@@ -480,8 +445,8 @@ class HyperEncoderModel(FleetLayer):
         The only difference from :meth:`forward_decoder` is the geometry: the B
         `(context, query)` segments in the batch are concatenated end-to-end into
         one long sequence, and the mask is no longer a dense `[1,1,T,T]` but the
-        integer plan `packed_seq_params.prefix_lm_layout`, consumed directly by
-        the `PrefixLMTritonCore` Triton kernel.
+        FlashMask row indices `[1,1,T',2]`, consumed by the flashmask branch of
+        `DotProductAttention` with `causal=False`.
 
         The return shape matches :meth:`forward_decoder` (`[B, Q, H]`) so that
         the output-projection loop in :meth:`forward` is identical on both paths;
@@ -493,9 +458,9 @@ class HyperEncoderModel(FleetLayer):
         per-segment list list[[Q_i,H]]). Real production may pack Q=256 segments
         and Q=8192 segments into the same sequence.
         """
-        from paddlefleet.transformer.prefix_lm_mask import prefix_lm_pad_len
-        from paddlefleet.transformer.prefix_lm_triton_core import (
-            PREFIX_LM_LAYOUT_ATTR,
+        from paddlefleet.transformer.prefix_lm_mask import (
+            build_flashmask_row_indices,
+            prefix_lm_pad_len,
         )
 
         # ``use_long_query`` may be a single **bool** (homogeneous pack, returns
@@ -503,8 +468,7 @@ class HyperEncoderModel(FleetLayer):
         # pack). Mixed packs have different ``Q_i`` per segment, so a per-segment
         # list ``list[[Q_i,H]]`` is returned (the list form lets the
         # output-projection loop in :meth:`forward` treat both paths uniformly).
-        # The kernel side already consumes the layout as a per-segment
-        # ``n_queries`` tuple.
+        # The mask side consumes the per-segment ``n_queries`` directly.
         # ``context_embeds`` may be an **equal-length rectangle**
         # ``[bs, n_context, H]`` (synthetic use case), or a **variable-length
         # segment list** ``list[[C_i, H]]`` (real production ragged pack). The
@@ -559,48 +523,24 @@ class HyperEncoderModel(FleetLayer):
             )
 
         # ---- Per-segment sequence lengths: the last segment absorbs the pad ----
-        # The pad is not a segment of its own: it is folded into the last
-        # segment's [start, end), and its positions are handled by the kernel's
-        # pad diagonal term (`tok_seg_start == -1`). If it were a separate
-        # segment, the rope segmentation and the layout segmentation would no
-        # longer line up.
+        # The pad is not a segment of its own for rope: it is folded into the
+        # last segment's [start, end) so the rope segmentation and the segment
+        # starts line up. The mask still treats pad columns as self-only.
         seg_lens = [nc + nq for nc, nq in zip(n_contexts, nq_list)]
         seg_lens[-1] += pad
         max_seqlen = max(seg_lens)
 
-        # `PackedSeqParams` on this path is only the carrier for
-        # `prefix_lm_layout`; its numeric fields are left empty -- in particular
-        # `cu_seqlens` is NOT set.
-        #
-        # Why: as soon as `attention.py` sees `cu_seqlens`, it switches rope to
-        # the thd branch (`rope_utils._apply_rotary_pos_emb_thd`), whose sharding
-        # is hard-coded batch-major (`split(..., axis=1 if ndim==4 else 0)`,
-        # `freqs[:, ...]`); with SP enabled the backbone is time-major
-        # `[S,B,N,D]`, so it would shard the wrong axis and the `split` sizes
-        # would not match. That is a shared file used by models unrelated to
-        # HyperEncoder, so it should not be changed for us.
-        #
-        # So freqs are assembled on the host side instead (`_packed_rope` below):
-        # the result is bit-equivalent to the thd branch (at offset=0, cp=1 the
-        # thd helper reduces to `freqs[:, :L_i]` then `cat`), while rope takes the
-        # bshd branch, which already handles `time_major` correctly. The op
-        # sequence is unchanged and the shared file is untouched.
-        #
-        # Cost: `cu_seqlens` is unused by `PrefixLMTritonCore` anyway (it only
-        # reads `prefix_lm_layout`). If the core is later swapped for an
-        # implementation that needs `cu_seqlens`, this must change too.
-        psp = PackedSeqParams()
-        setattr(
-            psp,
-            PREFIX_LM_LAYOUT_ATTR,
-            {
-                "segment_starts": tuple(starts),
-                "n_contexts": tuple(n_contexts),
-                "n_queries": tuple(nq_list),
-                "pad_len": pad,
-            },
+        # No `PackedSeqParams` / `cu_seqlens` on this path: as soon as
+        # `attention.py` sees `cu_seqlens`, it switches rope to the thd branch
+        # (`rope_utils._apply_rotary_pos_emb_thd`), whose sharding is hard-coded
+        # batch-major; with SP enabled the backbone is time-major `[S,B,N,D]`, so
+        # it would shard the wrong axis. Freqs are assembled on the host side
+        # instead (`_packed_rope` below), bit-equivalent to the thd branch at
+        # offset=0, cp=1, while rope takes the bshd branch which handles
+        # `time_major` correctly. The segment isolation lives in the mask.
+        row_indices = build_flashmask_row_indices(
+            n_contexts, nq_list, pad, place=x.place
         )
-
         rope = self._packed_rope(max_seqlen, seg_lens)
         if self.config.sequence_parallel:
             # Same handling as the non-packed path (see the long comment in
@@ -610,7 +550,9 @@ class HyperEncoderModel(FleetLayer):
             rope = rope.transpose([1, 0, 2, 3])
             h = self._sp_scatter(x)
             h = self.block(
-                hidden_states=h, rotary_pos_emb=rope, packed_seq_params=psp
+                hidden_states=h,
+                rotary_pos_emb=rope,
+                attn_mask_startend_row_indices=row_indices,
             )
             h = self._sp_gather(h)
             # The packed path keeps the pad (slices to x's length, not to
@@ -619,7 +561,9 @@ class HyperEncoderModel(FleetLayer):
             h = h[: x.shape[1]].transpose([1, 0, 2])
         else:
             h = self.block(
-                hidden_states=x, rotary_pos_emb=rope, packed_seq_params=psp
+                hidden_states=x,
+                rotary_pos_emb=rope,
+                attn_mask_startend_row_indices=row_indices,
             )
 
         # ---- Extract the query suffix per segment ----
@@ -786,26 +730,12 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
     language_hidden_size: int = 1280
 
     # ---- Attention backend + packed-decoder path ----
-    #: ``"dp"`` (dense per-layer mask) or ``"triton"`` (packed prefix-LM core).
-    #: Validated in ``__post_init__`` (``"flex"`` and unknown values raise).
+    #: ``"dp"`` (eager, dense per-layer mask) or ``"flashmask"`` (packed
+    #: prefix-LM row indices). Validated in ``__post_init__``.
     hyperencoder_attn_backend: str = "dp"
-    #: Run the trunk as a single packed call. Requires the ``triton`` backend
-    #: (the packed segment layout is only read by the triton core).
+    #: Run the trunk as a single packed call. Must match the ``flashmask``
+    #: backend (only the row indices express the packed segment isolation).
     hyperencoder_packed_decoder: bool = False
-
-    # ---- Triton prefix-LM kernel tuning ----
-    #: Kernel block shape. ``block_m`` (and via it the softmax reduction tree)
-    #: affects the numerical result, so it is a declared field rather than a
-    #: free-floating env var.
-    hyperencoder_triton_block_m: int = 64
-    hyperencoder_triton_block_n: int = 64
-    #: Launch configuration for the forward / backward kernels.
-    hyperencoder_triton_fwd_warps: int = 4
-    hyperencoder_triton_fwd_stages: int = 2
-    hyperencoder_triton_bwd_warps: int = 4
-    hyperencoder_triton_bwd_stages: int = 2
-    #: LRU cap for the exec-plan cache (0 disables caching).
-    hyperencoder_triton_plan_cache_size: int = 64
 
     # No `transform_rules`: `HyperEncoderConfig` field names are exactly the same
     # as on the Fleet side (`num_hidden_layers` / `hidden_size` /
@@ -907,48 +837,18 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
 
         self.head_dim = self.hidden_size // self.num_attention_heads
 
-        # Validate the attention-backend / packed-decoder / Triton-tuning fields
-        # here so a bad config.json fails at construction rather than deep inside
-        # a kernel launch. `use_packed_decoder` also validates the backend
-        # (rejects "flex" / unknown, and packed-without-triton), reusing the same
+        # Validate the attention-backend / packed-decoder pairing here so a bad
+        # config.json fails at construction rather than at the first forward.
+        # `use_packed_decoder` also validates the backend name, reusing the same
         # logic the runtime path reads.
         from paddlefleet.models.hyperencoder.attn_backend import (
             use_packed_decoder,
         )
 
         use_packed_decoder(self)
-        for _name in (
-            "hyperencoder_triton_block_m",
-            "hyperencoder_triton_block_n",
-            "hyperencoder_triton_fwd_warps",
-            "hyperencoder_triton_fwd_stages",
-            "hyperencoder_triton_bwd_warps",
-            "hyperencoder_triton_bwd_stages",
-        ):
-            _v = int(getattr(self, _name))
-            if _v <= 0:
-                raise ValueError(
-                    f"{_name} must be a positive integer, got {_v}"
-                )
-            setattr(self, _name, _v)
-        _cache = int(self.hyperencoder_triton_plan_cache_size)
-        if _cache < 0:
-            raise ValueError(
-                f"hyperencoder_triton_plan_cache_size must be >= 0, got {_cache}"
-            )
-        self.hyperencoder_triton_plan_cache_size = _cache
-        # block_m and block_n are independent knobs, but only block_m == block_n
-        # is a validated configuration (block_m drives the softmax reduction tree
-        # and the two must partition the same sequence consistently). The
-        # production default is 64/64. Reject asymmetric block shapes rather than
-        # silently producing incorrect gradients.
-        if self.hyperencoder_triton_block_m != self.hyperencoder_triton_block_n:
-            raise ValueError(
-                "hyperencoder_triton_block_m must equal "
-                "hyperencoder_triton_block_n (only symmetric block shapes are "
-                f"supported), got {self.hyperencoder_triton_block_m} vs "
-                f"{self.hyperencoder_triton_block_n}"
-            )
+        # HyperEncoderModel never splits the sequence over CP: every CP rank
+        # holds the whole sequence, exactly like the HyperBody encoder view.
+        self.cp_replicated_sequence = True
 
         # moe_layer_freq (= [0] + [1]*11) does NOT need to be computed by hand --
         # the parent's post_init derives the same list from `first_k_dense_replace`

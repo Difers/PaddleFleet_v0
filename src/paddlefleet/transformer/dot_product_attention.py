@@ -298,7 +298,14 @@ class DotProductAttention(FleetLayer):
 
         self.config: TransformerConfig = config
 
-        self.context_parallel_size = get_context_parallel_world_size()
+        # A CP-replicated region (e.g. the HyperBody encoder) already holds the
+        # full sequence on every CP rank: gathering KV over CP would duplicate it
+        # cp times, so attention there must run as if CP were off.
+        self.context_parallel_size = (
+            1
+            if getattr(config, "cp_replicated_sequence", False)
+            else get_context_parallel_world_size()
+        )
 
         # following is None by default. We allow MLA to set its own comm mode
         self.hybrid_mla_cp_mode = getattr(config, "hybrid_mla_cp_mode", None)

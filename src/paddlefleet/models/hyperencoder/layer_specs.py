@@ -34,20 +34,20 @@ pre-MLP norm is called ``post_attention_layernorm`` here.
 
 ## How ``attn_mask_type`` is handled
 
-We pass **``AttnMaskType.no_mask``**, because:
+We pass **``AttnMaskType.no_mask``**: the prefix-LM semantics come entirely
+from the mask we feed (``prefix_lm_mask``), so the framework must not add a
+causal triangle on top. Under ``no_mask`` the flashmask branch of
+``DotProductAttention`` runs with ``causal=False``, which is exactly what the
+2-column row indices encode.
 
-* We feed a complete dense mask ourselves
-  (``prefix_lm_mask.build_dense_mask``); the framework must not add another
-  causal layer on top.
-* Passing ``causal`` would make ``FusedScaleMaskSoftmax`` apply an extra causal
-  triangle, which conflicts with the prefix-LM semantics.
-* ``no_mask`` states the intent explicitly.
+The other switch that must agree with the backend is ``_attn_implementation``
+(set on the config, asserted in :func:`get_hyperencoder_layer_specs`):
 
-The other switch that must be set explicitly is ``_attn_implementation="eager"``.
-Otherwise, under bf16, ``DotProductAttention`` takes the SDPA branch and forces
-``is_causal=True``, which would silently break the bidirectional encoder
-semantics. That switch lives at the config level rather than in the spec; see
-the assertion in :func:`get_hyperencoder_layer_specs`.
+* ``dp`` needs ``"eager"``: the dense mask is only honored by the eager branch;
+  under bf16 any other value takes the SDPA branch, which forces
+  ``is_causal=True`` and silently breaks the bidirectional semantics.
+* ``flashmask`` needs a non-eager value: the eager branch ignores row indices,
+  which would silently degrade to an unmasked (fully visible) attention.
 """
 
 from __future__ import annotations
@@ -55,10 +55,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from paddlefleet.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from paddlefleet.models.hyperencoder.attn_backend import use_triton_encoder_attn
+from paddlefleet.models.hyperencoder.attn_backend import (
+    use_flashmask_encoder_attn,
+)
 from paddlefleet.models.hyperencoder.norm import HyperEncoderRMSNorm
 from paddlefleet.transformer.enums import AttnMaskType
-from paddlefleet.transformer.prefix_lm_triton_core import PrefixLMTritonCore
 from paddlefleet.transformer.transformer_block import (
     TransformerBlockSublayersSpec,
 )
@@ -91,16 +92,22 @@ def _is_moe_layer(config: TransformerConfig, layer_idx: int) -> bool:
 
 def get_hyperencoder_layer_specs(config: TransformerConfig) -> list[LayerSpec]:
     """Build the list of per-layer ``LayerSpec`` objects."""
-    triton_attn = use_triton_encoder_attn(config)
-    if (
-        not triton_attn
-        and getattr(config, "_attn_implementation", None) != "eager"
-    ):
+    eager = getattr(config, "_attn_implementation", None) == "eager"
+    if use_flashmask_encoder_attn(config):
+        if eager:
+            raise ValueError(
+                "hyperencoder_attn_backend='flashmask' requires a non-eager "
+                "config._attn_implementation: the eager branch of "
+                "DotProductAttention ignores attn_mask_startend_row_indices and "
+                "would run an unmasked attention."
+            )
+    elif not eager:
         raise ValueError(
-            "HyperEncoder requires config._attn_implementation='eager' to be set "
-            "explicitly. Otherwise, under bf16, DotProductAttention takes the SDPA "
-            "branch and forces is_causal=True, which silently breaks the "
-            "bidirectional encoder semantics."
+            "hyperencoder_attn_backend='dp' requires "
+            "config._attn_implementation='eager'. Otherwise, under bf16, "
+            "DotProductAttention takes the SDPA branch and forces "
+            "is_causal=True, which silently breaks the bidirectional encoder "
+            "semantics."
         )
 
     specs: list[LayerSpec] = []
@@ -121,18 +128,6 @@ def get_hyperencoder_layer_specs(config: TransformerConfig) -> list[LayerSpec]:
         # named post_attention_layernorm in PaddleFleet.
         spec.sublayers_spec.input_layernorm = HyperEncoderRMSNorm
         spec.sublayers_spec.post_attention_layernorm = HyperEncoderRMSNorm
-        if triton_attn:
-            # Swap only core_attention; the outer SelfAttention still handles
-            # QKV projection / RoPE / output projection. Fail loudly if the
-            # swap point is missing rather than silently staying on dp.
-            attn = getattr(spec.sublayers_spec, "self_attn", None)
-            sub = getattr(attn, "sublayers_spec", None)
-            if sub is None or not hasattr(sub, "core_attention"):
-                raise RuntimeError(
-                    "Cannot install PrefixLMTritonCore: the layer spec has no "
-                    "self_attn.sublayers_spec.core_attention"
-                )
-            sub.core_attention = PrefixLMTritonCore
         specs.append(spec)
     return specs
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Three equivalent representations of the prefix-LM three-region mask, plus
+"""Two equivalent representations of the prefix-LM three-region mask, plus
 their dense expanders (used for cross-checking in unit tests).
 
 ## Geometry
@@ -41,19 +41,18 @@ the default "forbidden":
     is ``j >= s_i+C_i``);
   * real tokens cannot see pad columns (a pad column only opens the diagonal).
 
-## The three representations
+## The two representations
 
 | function | output | consumer |
 |---|---|---|
 | :func:`build_dense_mask`             | ``[1,1,T',T']`` bool | eager path (explicit score + mask_func) |
-| :func:`build_flashmask_row_indices`  | ``[1,1,T',4]`` int32 | ``flashmask_attention`` column-sparse path |
-| :func:`build_prefix_lm_layout`       | dict (4 fields)      | Triton kernel (geometry passed directly) |
+| :func:`build_flashmask_row_indices`  | ``[1,1,T',2]`` int32 | ``flashmask_attention(causal=False)`` column-sparse path |
 
-:func:`expand_row_indices_to_dense` and :func:`expand_layout_to_dense` are for
-unit tests only. They make it possible to *assert* that all three paths share
-the same mask source of truth, rather than assume it.
+:func:`expand_row_indices_to_dense` is for unit tests only. It makes it
+possible to *assert* that both paths share the same mask source of truth,
+rather than assume it.
 
-## FlashMask 4-column encoding
+## FlashMask encoding
 
 Each key column ``j`` is given ``[LTS, LTE, UTS, UTE]``:
 
@@ -61,8 +60,8 @@ Each key column ``j`` is given ``[LTS, LTE, UTS, UTE]``:
   * upper-triangle side (rows **<** j): row range ``[UTS, UTE)`` is **masked**
 
 The diagonal (row == j) is **never masked by this encoding**, so the pad
-self-loop is free. Substituting the table above (with ``UTS ≡ 0`` and
-``LTE ≡ T'`` constant, only two values vary):
+self-loop is free. Substituting the table above, ``UTS ≡ 0`` and ``LTE ≡ T'``
+are constant, so only the non-causal 2-column form ``[LTS, UTE]`` is emitted:
 
     UTE(j) = s_i        if j ∈ prefix_i        else j
     LTS(j) = s_i + L_i  if j ∈ seg i           else j + 1   (j ∈ pad)
@@ -83,13 +82,11 @@ __all__ = [
     "prefix_lm_pad_len",
     "build_dense_mask",
     "build_flashmask_row_indices",
-    "build_prefix_lm_layout",
     "expand_row_indices_to_dense",
-    "expand_layout_to_dense",
 ]
 
-# Column order of the 4 fields, matching paddle's flashmask_attention.
-_LTS, _LTE, _UTS, _UTE = 0, 1, 2, 3
+# Column order of the 2 fields, matching flashmask_attention(causal=False).
+_LTS, _UTE = 0, 1
 
 
 def _check_lens(
@@ -195,12 +192,15 @@ def build_flashmask_row_indices(
     pad_len: int = 0,
     place=None,
 ) -> paddle.Tensor:
-    """Representation 2: FlashMask column-sparse indices ``[1, 1, T', 4]`` int32.
+    """Representation 2: FlashMask column-sparse indices ``[1, 1, T', 2]`` int32.
 
-    The 4 columns are ``[LTS, LTE, UTS, UTE]`` (see the encoding notes in the
-    module docstring). There is no per-column Python loop: ``repeat_interleave``
-    broadcasts the per-segment ``(s_i, s_i+L_i)`` onto the column axis, then two
-    ``where`` calls against ``arange`` compute the fields.
+    The 2 columns are ``[LTS, UTE]`` for ``flashmask_attention(causal=False)``
+    (see the encoding notes in the module docstring). One H2D copy of the
+    ``[3, N]`` per-segment table (segment start / end / prefix end); every
+    per-column value is computed on device. Each column finds its segment with
+    ``searchsorted`` instead of ``repeat_interleave`` (whose tensor ``repeats``
+    forces a D2H read of the output size): all shapes are known on the host, so
+    nothing is read back. The single small H2D is the only transfer.
     """
     _check_lens(prefix_lens, suffix_lens, pad_len)
     starts = prefix_lm_segment_starts(prefix_lens, suffix_lens)
@@ -208,128 +208,60 @@ def build_flashmask_row_indices(
     total = starts[-1] + seg_lens[-1]
     tp = total + int(pad_len)
 
-    seg_len_t = paddle.to_tensor(seg_lens, dtype="int32")
-    start_t = paddle.to_tensor(starts, dtype="int32")
-    prefix_t = paddle.to_tensor([int(c) for c in prefix_lens], dtype="int32")
+    table = paddle.to_tensor(
+        [
+            starts,
+            [s + n for s, n in zip(starts, seg_lens)],
+            [s + int(c) for s, c in zip(starts, prefix_lens)],
+        ],
+        dtype="int32",
+    )
+    seg_start, seg_end, seg_prefix_end = table[0], table[1], table[2]
 
-    # Broadcast segment-level values onto the column axis:
-    # col_start[j] = s_i, col_end[j] = s_i + L_i, col_prefix_end[j] = s_i + C_i
-    col_start = paddle.repeat_interleave(start_t, seg_len_t)
-    col_end = paddle.repeat_interleave(start_t + seg_len_t, seg_len_t)
-    col_prefix_end = paddle.repeat_interleave(start_t + prefix_t, seg_len_t)
-
-    j_real = paddle.arange(total, dtype="int32")
-    is_prefix_col = j_real < col_prefix_end
-
-    tp_t = paddle.full([total], tp, dtype="int32")
-    lts_real = col_end  # rows >= s_i+L_i forbidden
-    lte_real = tp_t
-    uts_real = paddle.zeros([total], dtype="int32")
-    ute_real = paddle.where(
-        is_prefix_col, col_start, j_real
+    j = paddle.arange(tp, dtype="int32")
+    j_real = j[:total]
+    # Segment of column j: the first segment whose end exceeds j.
+    seg = paddle.searchsorted(seg_end, j_real, out_int32=True, right=True)
+    lts = paddle.gather(seg_end, seg)  # rows >= s_i+L_i forbidden
+    ute = paddle.where(
+        j_real < paddle.gather(seg_prefix_end, seg),
+        paddle.gather(seg_start, seg),
+        j_real,
     )  # prefix col opens to s_i; suffix col opens to j
 
     if int(pad_len) > 0:
-        j_pad = paddle.arange(total, tp, dtype="int32")
-        lts = paddle.concat(
-            [lts_real, j_pad + 1]
-        )  # pad col: rows > j forbidden
-        lte = paddle.concat(
-            [lte_real, paddle.full([int(pad_len)], tp, dtype="int32")]
-        )
-        uts = paddle.concat(
-            [uts_real, paddle.zeros([int(pad_len)], dtype="int32")]
-        )
-        ute = paddle.concat([ute_real, j_pad])  # pad col: rows < j forbidden
-    else:
-        lts, lte, uts, ute = lts_real, lte_real, uts_real, ute_real
+        j_pad = j[total:]
+        lts = paddle.concat([lts, j_pad + 1])  # pad col: rows > j forbidden
+        ute = paddle.concat([ute, j_pad])  # pad col: rows < j forbidden
 
-    out = paddle.stack([lts, lte, uts, ute], axis=-1).reshape([1, 1, tp, 4])
+    out = paddle.stack([lts, ute], axis=-1).reshape([1, 1, tp, 2])
     if place is not None:
         out = out.to(place)
     return out
-
-
-def build_prefix_lm_layout(
-    prefix_lens: Sequence[int],
-    suffix_lens: Sequence[int],
-    pad_len: int = 0,
-) -> dict[str, object]:
-    """Representation 3: geometry layout for the Triton kernel (plain Python
-    scalars, no tensors)."""
-    _check_lens(prefix_lens, suffix_lens, pad_len)
-    return {
-        "segment_starts": tuple(
-            prefix_lm_segment_starts(prefix_lens, suffix_lens)
-        ),
-        "n_contexts": tuple(int(c) for c in prefix_lens),
-        "n_queries": tuple(int(q) for q in suffix_lens),
-        "pad_len": int(pad_len),
-    }
 
 
 def expand_row_indices_to_dense(row_indices: paddle.Tensor) -> paddle.Tensor:
     """Expand representation 2 into a dense ``[1,1,T',T']`` bool (``True`` =
     forbidden). **Unit tests only.**
 
-    Derived strictly from the FlashMask semantics, without referencing the other
-    two representations, so that it can serve as an independent cross-check.
+    Derived strictly from the FlashMask semantics, without referencing the dense
+    representation, so that it can serve as an independent cross-check.
     """
-    if row_indices.ndim != 4 or row_indices.shape[-1] != 4:
+    if row_indices.ndim != 4 or row_indices.shape[-1] != 2:
         raise ValueError(
-            f"row_indices shape should be [1,1,T',4], got {row_indices.shape}"
+            f"row_indices shape should be [1,1,T',2], got {row_indices.shape}"
         )
     tp = int(row_indices.shape[2])
-    ri = row_indices.reshape([tp, 4]).astype("int64")
-    lts, lte, uts, ute = ri[:, _LTS], ri[:, _LTE], ri[:, _UTS], ri[:, _UTE]
+    ri = row_indices.reshape([tp, 2]).astype("int64")
+    lts, ute = ri[:, _LTS], ri[:, _UTE]
 
     rows = paddle.arange(tp, dtype="int64").reshape([tp, 1])  # row r
     cols = paddle.arange(tp, dtype="int64").reshape([1, tp])  # column j
 
     lower = rows > cols  # lower-triangle side
     upper = rows < cols  # upper-triangle side
-    in_lower_band = (rows >= lts.reshape([1, tp])) & (
-        rows < lte.reshape([1, tp])
-    )
-    in_upper_band = (rows >= uts.reshape([1, tp])) & (
-        rows < ute.reshape([1, tp])
-    )
+    in_lower_band = rows >= lts.reshape([1, tp])
+    in_upper_band = rows < ute.reshape([1, tp])
 
     forbidden = (lower & in_lower_band) | (upper & in_upper_band)
     return forbidden.reshape([1, 1, tp, tp])
-
-
-def expand_layout_to_dense(layout: dict[str, object]) -> paddle.Tensor:
-    """Expand representation 3 into a dense ``[1,1,T',T']`` bool (``True`` =
-    forbidden). **Unit tests only.**
-
-    Written directly from the "allowed relations" table in the module docstring,
-    region by region, without reusing :func:`build_dense_mask`.
-    """
-    starts = list(layout["segment_starts"])  # type: ignore[arg-type]
-    n_ctx = list(layout["n_contexts"])  # type: ignore[arg-type]
-    n_q = list(layout["n_queries"])  # type: ignore[arg-type]
-    pad_len = int(layout["pad_len"])  # type: ignore[arg-type]
-
-    total = starts[-1] + n_ctx[-1] + n_q[-1]
-    tp = total + pad_len
-
-    rows = paddle.arange(tp, dtype="int64").reshape([tp, 1])
-    cols = paddle.arange(tp, dtype="int64").reshape([1, tp])
-    allowed = paddle.zeros([tp, tp], dtype="bool")
-
-    for s, c, q in zip(starts, n_ctx, n_q):
-        seg_end = s + c + q
-        col_in_prefix = (cols >= s) & (cols < s + c)
-        col_in_suffix = (cols >= s + c) & (cols < seg_end)
-        row_in_seg = (rows >= s) & (rows < seg_end)
-        # prefix column: allow all rows of the segment
-        allowed = allowed | (col_in_prefix & row_in_seg)
-        # suffix column j: allow rows [j, seg_end)
-        allowed = allowed | (col_in_suffix & row_in_seg & (rows >= cols))
-
-    if pad_len > 0:
-        col_in_pad = cols >= total
-        allowed = allowed | (col_in_pad & (rows == cols))
-
-    return paddle.logical_not(allowed).reshape([1, 1, tp, tp])

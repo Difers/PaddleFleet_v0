@@ -21,64 +21,56 @@ serialized with the rest of the config:
 
 | field | values | effect |
 |---|---|---|
-| ``hyperencoder_attn_backend`` | ``dp`` (default) / ``triton`` | selects the ``core_attention`` implementation |
+| ``hyperencoder_attn_backend`` | ``dp`` (default) / ``flashmask`` | ``dp``: eager attention with a dense ``[1,1,T,T]`` mask; ``flashmask``: the standard ``DotProductAttention`` flashmask branch with ``[1,1,T,2]`` row indices |
 | ``hyperencoder_packed_decoder`` | ``False`` (default) / ``True`` | run the trunk with a single packed call |
 
-**The ``flex`` backend is not implemented here**: it is a compiled artifact of
-``torch.nn.attention.flex_attention`` and has no Paddle equivalent. The ``flex``
-and ``triton`` backends are equivalent under the packed layout, so this module
-supports ``dp`` and ``triton`` only and **raises on ``flex``** instead of
-silently falling back to ``dp`` (a silent downgrade would produce misleading
-results).
-
-The readers use ``getattr`` with defaults so any ``TransformerConfig`` works;
-the fields are authoritatively declared and validated on the HyperEncoder
-config.
+The two switches move together: ``flashmask`` is the packed path and ``dp`` is
+the dense one (:func:`use_packed_decoder` rejects the mixed combinations). Both
+keep the stock ``DotProductAttention`` as ``core_attention`` and differ only in
+which mask is fed and in ``_attn_implementation`` (``eager`` for ``dp``,
+non-eager for ``flashmask``). The encoder is never sharded over CP: every CP
+rank holds the whole sequence (``cp_replicated_sequence``), so
+``DotProductAttention`` runs it with a CP size of 1.
 """
 
 from __future__ import annotations
 
 __all__ = [
     "encoder_attn_backend",
-    "use_triton_encoder_attn",
+    "use_flashmask_encoder_attn",
     "use_packed_decoder",
 ]
 
+_BACKENDS = ("dp", "flashmask")
+
 
 def encoder_attn_backend(config) -> str:
-    """Return ``dp`` or ``triton``. ``flex`` raises (see module docstring)."""
+    """Return ``dp`` or ``flashmask``."""
     v = str(getattr(config, "hyperencoder_attn_backend", "dp")).lower()
-    if v == "flex":
+    if v not in _BACKENDS:
         raise ValueError(
-            "hyperencoder_attn_backend='flex' is not implemented here: "
-            "flex is a compiled artifact of torch.nn.attention.flex_attention "
-            "and has no Paddle equivalent. Use triton for packed semantics "
-            "(it is equivalent to flex)."
-        )
-    if v not in ("dp", "triton"):
-        raise ValueError(
-            f"Unknown hyperencoder_attn_backend={v!r}; expected 'dp' or 'triton'"
+            f"Unknown hyperencoder_attn_backend={v!r}; expected one of {_BACKENDS}"
         )
     return v
 
 
-def use_triton_encoder_attn(config) -> bool:
-    """Whether to replace ``core_attention`` with ``PrefixLMTritonCore``."""
-    return encoder_attn_backend(config) == "triton"
+def use_flashmask_encoder_attn(config) -> bool:
+    """Whether the encoder trunk is fed FlashMask row indices."""
+    return encoder_attn_backend(config) == "flashmask"
 
 
 def use_packed_decoder(config) -> bool:
     """Whether the trunk runs as a single packed call."""
     on = bool(getattr(config, "hyperencoder_packed_decoder", False))
-    # The packed path attaches the segment layout to packed_seq_params, which
-    # only the triton backend reads. Enabling packed while staying on the dp
-    # backend would silently ignore the layout and degrade the mask, so this is
-    # a hard error.
-    if on and not use_triton_encoder_attn(config):
+    # Packed means several mutually invisible segments in one [1, T] sequence:
+    # only the O(T) FlashMask row indices express that at real lengths. Dense
+    # means one rectangular segment fed as a [T, T] mask, which only the eager
+    # branch honors. Mixing them would silently run the wrong mask.
+    if on != use_flashmask_encoder_attn(config):
         raise RuntimeError(
             "hyperencoder_packed_decoder=True requires "
-            "hyperencoder_attn_backend='triton': the packed segment layout is "
-            "only read by the triton core and would be silently ignored on the "
-            "dp backend."
+            "hyperencoder_attn_backend='flashmask', and 'flashmask' requires "
+            f"hyperencoder_packed_decoder=True; got packed={on}, "
+            f"backend={encoder_attn_backend(config)!r}."
         )
     return on
