@@ -41,6 +41,7 @@ from . import reshard as reshard_util
 from .reshard import (
     SHARDING_STRATEGY_V1,
     SHARDING_STRATEGY_V2,
+    get_opt_state_suffixes,
     get_param_sharding_group,
     merge_model_state,
     merge_opt_state,
@@ -210,7 +211,7 @@ class ParameterNameRemapper:
                 model_state[k] = self._map_tensor(v)[1]
         return model_state
 
-    def remap_optimizer_state(self, opt_state):
+    def remap_optimizer_state(self, opt_state, opt_state_suffixes=None):
         lr_scheduler_key = "LR_Scheduler"
         master_weight_key = "master_weights"
 
@@ -232,7 +233,7 @@ class ParameterNameRemapper:
                 opt_names.append(v.name)
 
         opt_to_pname = reshard_util.convert_opt_name_to_tname(
-            self.old_p_names, opt_names
+            self.old_p_names, opt_names, opt_state_suffixes
         )
         for opt_name in opt_names:
             v = opt_state[opt_name]
@@ -245,7 +246,10 @@ class ParameterNameRemapper:
 
 
 class GroupGetter:
-    def __init__(self, model, hcg=None):
+    def __init__(self, model, hcg=None, optimizer=None):
+        # State-name suffixes come from ``optimizer.optimizer_state_layout()``
+        # (plus the built-in AdamW names), so custom optimizers resolve too.
+        self.opt_state_suffixes = get_opt_state_suffixes(optimizer)
         self.structure_name_mapping = {}
         self.structure_name_to_group = {}
         self.tensor_name_to_group = {}
@@ -264,24 +268,18 @@ class GroupGetter:
         if name in self.tensor_name_to_group:
             return name
 
-        suffix = [
-            "_fp32_master_0_beta1_pow_acc_0",
-            "_fp32_master_0_beta2_pow_acc_0",
-            "_fp32_master_0_moment1_0",
-            "_fp32_master_0_moment2_0",
-            "_beta1_pow_acc_0",
-            "_beta2_pow_acc_0",
-            "_moment1_0",
-            "_moment2_0",
-        ]
+        for s in self.opt_state_suffixes:
+            if (
+                name.endswith(s)
+                and name[: -len(s)] in self.tensor_name_to_group
+            ):
+                return name[: -len(s)]
 
-        for s in suffix:
-            if name.endswith(s):
-                tmp = name[: -len(s)]
-                assert tmp in self.tensor_name_to_group, f"cannot find {name}"
-                return tmp
-
-        raise ValueError(f"cannot find {name}")
+        raise ValueError(
+            f"cannot find the parameter of optimizer state {name}; known state "
+            f"suffixes: {list(self.opt_state_suffixes)}. A custom optimizer "
+            "must list its state names in optimizer_state_layout()."
+        )
 
     def get_group(self, name):
         if name in self.structure_name_to_group:
@@ -352,7 +350,9 @@ class ShardingIO:
         if remapper is None:
             return state_dict
         if is_opt:
-            return remapper.remap_optimizer_state(state_dict)
+            return remapper.remap_optimizer_state(
+                state_dict, get_opt_state_suffixes(self.optimizer)
+            )
         else:
             return remapper.remap_model_state(state_dict)
 
@@ -368,7 +368,7 @@ class ShardingIO:
             base_weight_name (str): The name of the checkpoint file.
             model_wrapped (nn.Layer): The wrapped model.
         """
-        group_getter = GroupGetter(self.model)
+        group_getter = GroupGetter(self.model, optimizer=self.optimizer)
         gids = group_getter.get_group_ids()
         parallel_config = self._load_distributed_strategy(checkpoint)
         pp_degree = parallel_config["pp_degree"]
@@ -626,7 +626,7 @@ class ShardingIO:
             self.optimizer
         )
 
-        group_getter = GroupGetter(self.model)
+        group_getter = GroupGetter(self.model, optimizer=self.optimizer)
 
         if not self._need_reshard(checkpoint):
             one_shard_opt_state_dict = self._load_optimizer_state_of_one_shard(
@@ -708,7 +708,8 @@ class ShardingIO:
                         )
                         node_model_state_tmp.add_opts(sub_tmp)
                         node_model_state_tmp.pack_keys(
-                            structure_name_map.get(gid, {})
+                            structure_name_map.get(gid, {}),
+                            opt_state_suffixes=group_getter.opt_state_suffixes,
                         )
                         model_state[gid].merge_from(node_model_state_tmp, i)
             return model_state
@@ -764,7 +765,7 @@ class ShardingIO:
         self, model_to_save, merge_tensor_parallel=False, state_dict=None
     ):
         weight_name_suffix = self.args.sharded_name_suffix()
-        group_getter = GroupGetter(model_to_save)
+        group_getter = GroupGetter(model_to_save, optimizer=self.optimizer)
         gids = group_getter.get_group_ids()
         if state_dict is None:
             state_dict = model_to_save.state_dict()

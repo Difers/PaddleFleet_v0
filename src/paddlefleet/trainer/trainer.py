@@ -2135,7 +2135,9 @@ class Trainer:
                 paddle.no_grad(),
             ):
                 if paddle.distributed.is_initialized():
-                    group_getter = GroupGetter(self.model)
+                    group_getter = GroupGetter(
+                        self.model, optimizer=self.optimizer
+                    )
                     with _sprof_span("split_opt_state"):
                         opt_state_dict = split_opt_state(
                             opt_state_dict, group_getter

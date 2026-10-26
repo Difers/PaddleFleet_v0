@@ -112,23 +112,64 @@ def get_sharding_strategy(optimizer):
     return SHARDING_STRATEGY_V1
 
 
-def convert_opt_name_to_tname(tensor_names, opt_names):
+# State suffixes of the built-in AdamW optimizer. They are always accepted, so
+# optimizers that do not declare ``optimizer_state_layout()`` keep working.
+_BUILTIN_OPT_STATE_NAMES = (
+    "beta1_pow_acc_0",
+    "beta2_pow_acc_0",
+    "moment1_0",
+    "moment2_0",
+)
+_DEFAULT_MASTER_WEIGHT_NAME = "fp32_master_0"
+
+
+def get_optimizer_state_layout(optimizer):
+    """Return ``optimizer_state_layout()`` of ``optimizer``, or None.
+
+    Walks the ``_inner_opt`` chain (HybridParallelOptimizer -> sharding shell ->
+    inner optimizer) and returns the first layout found.
+    """
+    seen = set()
+    opt = optimizer
+    while opt is not None and id(opt) not in seen:
+        seen.add(id(opt))
+        layout_fn = getattr(opt, "optimizer_state_layout", None)
+        if callable(layout_fn):
+            return layout_fn()
+        opt = getattr(opt, "_inner_opt", None)
+    return None
+
+
+def get_opt_state_suffixes(optimizer=None):
+    """Suffixes that turn a parameter name into an optimizer state name.
+
+    The state names come from the optimizer's ``optimizer_state_layout()``
+    (``vector`` + ``scalar``) plus the built-in AdamW names. Each name is
+    accepted both under the master weight (``_fp32_master_0_moment1_0``, the
+    AdamW convention) and directly under the parameter (``_square_avg_0``).
+    Returned longest first, so a short suffix never shadows a longer one.
+    """
+    names = []
+    master = _DEFAULT_MASTER_WEIGHT_NAME
+    layout = get_optimizer_state_layout(optimizer)
+    if layout:
+        master = layout.get("master") or master
+        names.extend(layout.get("vector", []))
+        names.extend(layout.get("scalar", []))
+    names.extend(_BUILTIN_OPT_STATE_NAMES)
+    names = list(dict.fromkeys(names))
+    suffixes = [f"_{master}_{n}" for n in names] + [f"_{n}" for n in names]
+    return tuple(sorted(dict.fromkeys(suffixes), key=len, reverse=True))
+
+
+def convert_opt_name_to_tname(tensor_names, opt_names, suffixes=None):
     tensor_names = set(tensor_names)
     all_names = []
     all_names.extend(list(tensor_names))
     all_names.extend(opt_names)
     all_names.sort()
     pre_t_name = ""
-    suffix = [
-        "_fp32_master_0_beta1_pow_acc_0",
-        "_fp32_master_0_beta2_pow_acc_0",
-        "_fp32_master_0_moment1_0",
-        "_fp32_master_0_moment2_0",
-        "_beta1_pow_acc_0",
-        "_beta2_pow_acc_0",
-        "_moment1_0",
-        "_moment2_0",
-    ]
+    suffix = suffixes if suffixes is not None else get_opt_state_suffixes()
     opt_to_t = {}
     for n in all_names:
         if n in tensor_names:
@@ -140,6 +181,7 @@ def convert_opt_name_to_tname(tensor_names, opt_names):
 
     for t in opt_names:
         _find = False
+        first_match = None
         for s in suffix:
             if get_env_device() == "xpu" and t.endswith(s + ".SCALE_VALUE"):
                 # NOTE: for xpu adamw, all optimizer state will have an extra attribute end with SCALE_VALUE.
@@ -147,12 +189,21 @@ def convert_opt_name_to_tname(tensor_names, opt_names):
                 _find = True
                 break
             if t.endswith(s):
-                logger.info(
-                    f"{t}-{t[: -len(s)]}--{t[: -len(s)] in tensor_names}"
-                )
-                opt_to_t[t] = t[: -len(s)]
-                _find = True
-                break
+                t_name = t[: -len(s)]
+                logger.info(f"{t}-{t_name}--{t_name in tensor_names}")
+                if t_name in tensor_names:
+                    # Same rule as GroupGetter._get_parameter_name: a suffix
+                    # only counts if what it leaves is a known tensor, so
+                    # e.g. "p_fp32_master_0_square_avg_0" -> "p_fp32_master_0".
+                    opt_to_t[t] = t_name
+                    _find = True
+                    break
+                if first_match is None:
+                    first_match = t_name
+        if not _find and first_match is not None:
+            # No suffix yields a known tensor: keep the longest match.
+            opt_to_t[t] = first_match
+            _find = True
         assert _find, t
     return opt_to_t
 
@@ -352,7 +403,9 @@ class NodeModelState:
         self._master_weights = flatten(self._master_weights, 3)
         return self
 
-    def pack_keys(self, structure_name_mapping=None, place="cpu"):
+    def pack_keys(
+        self, structure_name_mapping=None, place="cpu", opt_state_suffixes=None
+    ):
         """
         change the key of model_weights dict from param_name to (structure_name, param_name);
         change the key of opt dict from opt_name to (structure_name, param_name, opt_name);
@@ -363,6 +416,9 @@ class NodeModelState:
         offloads them to host memory to reduce GPU memory pressure. Using `"gpu"` keeps
         the state on the GPU instead, trading higher GPU memory usage for avoiding the
         D2H/H2D round-trip overhead on small states and improving performance.
+
+        `opt_state_suffixes` maps optimizer state names back to parameter names,
+        see `get_opt_state_suffixes`; None means the built-in AdamW names.
         """
         # pack key for pp convert
         if structure_name_mapping is not None:
@@ -379,7 +435,9 @@ class NodeModelState:
 
         tensor_names = list(tname_to_structure_name.keys())
         opt_names = list(self._opt_state.keys())
-        opt_name_to_tname = convert_opt_name_to_tname(tensor_names, opt_names)
+        opt_name_to_tname = convert_opt_name_to_tname(
+            tensor_names, opt_names, opt_state_suffixes
+        )
 
         # model state
         model_weights_tmp = OrderedDict()

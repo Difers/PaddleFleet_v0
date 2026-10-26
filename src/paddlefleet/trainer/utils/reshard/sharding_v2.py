@@ -26,7 +26,7 @@ from paddle.distributed.fleet.model import PipelineParallel
 
 from ....transformers.model_utils import unwrap_optimizer
 from ....utils.log import logger
-from .common import get_moe_sharding_group
+from .common import get_moe_sharding_group, get_optimizer_state_layout
 
 
 def shard(node_model_state, model, optimizer):
@@ -34,6 +34,7 @@ def shard(node_model_state, model, optimizer):
     split_infos = collect_split_info(optimizer, model)
     group = node_model_state.group
     cur_rank = max(group.rank, 0)
+    is_scalar = scalar_state_checker(optimizer)
 
     def split_func(k, v):
         param_name = k[1]
@@ -41,7 +42,7 @@ def shard(node_model_state, model, optimizer):
         assert param_name in split_infos, (
             f"param_name {param_name}, split_infos{split_infos}"
         )
-        is_beta = is_bata(opt_name)
+        is_beta = is_scalar(opt_name)
         index, padded_size, buffer_size, has_slice_grad = split_infos[
             param_name
         ]
@@ -103,14 +104,15 @@ def restore(node_model_state, model, optimizer):
     # evenly distribute param
     node_model_state.even_distribute()
     param_shapes = {k: v.shape for (k, v) in model.state_dict().items()}
+    is_scalar = scalar_state_checker(optimizer)
 
     def merge_func(k, v):
         structure_name = k[0]
         opt_name = k[-1]
         assert structure_name in param_shapes, structure_name
         tensor_list = [e[1] for e in v]
-        # do not merge beta acc
-        if is_bata(opt_name):
+        # do not merge beta acc / scalar states
+        if is_scalar(opt_name):
             return tensor_list[0]
         shape = param_shapes[structure_name]
         return merge_tensors(k, tensor_list, shape)
@@ -269,3 +271,17 @@ def is_bata(name):
     if "_beta2_pow_acc_" in name:
         return True
     return False
+
+
+def scalar_state_checker(optimizer):
+    """Predicate for optimizer states that V2 reshard keeps whole (no pad,
+    slice or merge): the built-in beta accumulators plus the ``scalar`` names
+    declared by ``optimizer_state_layout()``.
+    """
+    layout = get_optimizer_state_layout(optimizer) or {}
+    suffixes = tuple(f"_{n}" for n in layout.get("scalar") or ())
+
+    def is_scalar(name):
+        return is_bata(name) or name.endswith(suffixes)
+
+    return is_scalar

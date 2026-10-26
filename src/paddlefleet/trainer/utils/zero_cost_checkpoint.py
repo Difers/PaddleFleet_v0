@@ -3262,7 +3262,7 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
     def _manipulate_state_dict_and_config(self, model_to_save, optimizer):
         # return model_to_save.sharded_state_dict()
 
-        group_getter = GroupGetter(model_to_save)
+        group_getter = GroupGetter(model_to_save, optimizer=optimizer)
         gids = group_getter.get_group_ids()
         from paddlefleet.trainer.utils.sharding_io import (
             exclude_parameters_in_state_dict,
