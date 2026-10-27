@@ -1496,7 +1496,7 @@ jobs:
       can-skip: ${{ steps.check-approval.outputs.can-skip }}
 
     steps:
-      - name: Check swgu98 coverage approval
+      - name: Check swgu98/sneaxiy coverage approval
         id: check-approval
         run: |
           set -euo pipefail
@@ -1505,21 +1505,19 @@ jobs:
 
           can_skip=$(echo "${reviews}" | jq -r --arg head "${HEAD_SHA}" '
             [ .[]
-              | select(.user.login == "swgu98")
+              | select(.user.login == "swgu98" or .user.login == "sneaxiy")
               | select(.commit_id == $head)
               | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
             ]
-            | sort_by(.submitted_at)
-            | last
-            | if .state == "APPROVED" then
-                ((.body // "") | ascii_downcase) as $body
-                | if ($body | contains("lgtm")) and ($body | contains("coverage")) then "true" else "false" end
-              else
-                "false"
-              end
+            | group_by(.user.login)
+            | map(sort_by(.submitted_at) | last)
+            | if any(.[];
+                .state == "APPROVED" and
+                ((.body // "") | ascii_downcase | contains("lgtm") and contains("coverage"))
+              ) then "true" else "false" end
           ')
 
-          echo "swgu98 coverage approval: ${can_skip}"
+          echo "swgu98/sneaxiy coverage approval: ${can_skip}"
           echo "can-skip=${can_skip}" >> "${GITHUB_OUTPUT}"
 
   coverage_check:
