@@ -56,6 +56,7 @@ from .layer_discovery import (
     get_dsa_core,
     is_dsa_layer,
     iter_monitor_layers,
+    parse_sample_layers,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ class PaddleDSAHealthMonitor(PaddleProbe):
         self.row_samples = int(row_samples)
         self.head_samples = int(head_samples)
         self.local_window = int(local_window)
-        self.sample_layers = set(sample_layers) if sample_layers else None
+        self.sample_layers = parse_sample_layers(sample_layers)
         self.cp_size = 1
         self._match_enabled = True
         self._stash: dict[int, tuple] = {}

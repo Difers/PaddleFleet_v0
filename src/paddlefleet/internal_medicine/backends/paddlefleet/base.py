@@ -24,6 +24,7 @@ import paddle
 
 from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
+from .layer_discovery import LayerId
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +201,27 @@ class PaddleProbe(Probe):
         assert not self._buffers_allocated, (
             "mark_mtp_layers after allocate_buffers"
         )
-        self._mtp_layer_ids.update(int(layer_idx) for layer_idx in layer_ids)
+        # ``int(...)`` would drop a ``LayerId`` region and merge, say, an encoder
+        # layer into the decoder layer of the same number.
+        self._mtp_layer_ids.update(
+            layer_idx if isinstance(layer_idx, LayerId) else int(layer_idx)
+            for layer_idx in layer_ids
+        )
+
+    def _key_prefix(self, layer_idx=None) -> str:
+        """Monitor prefix, with the layer's region appended when it has one.
+
+        ``LayerId`` regions (HyperBody's ``enc``) become ``<prefix>_<region>``,
+        so the region shows up as its own monitor in the viewer -- per-layer
+        keys *and* the derived global aggregates -- and never shares a key or a
+        cross-layer aggregate with the untagged layers of the same number.
+        This holds for the ``record_layer_metric`` path; the legacy
+        ``Probe._record_metrics`` path splits per-layer keys only.
+        """
+        region = getattr(layer_idx, "region", None)
+        return (
+            f"{self.METRIC_PREFIX}_{region}" if region else self.METRIC_PREFIX
+        )
 
     def _layer_key(
         self, layer_idx: int, metric_name: str, attn_type: str | None = None
@@ -208,25 +229,30 @@ class PaddleProbe(Probe):
         # Attention type stays on the metric name so window/full charts split
         # naturally. MTP identity stays on the layer token and follows the
         # existing metric gather/JSONL path without separate metadata.
-        layer_token = f"layer_{layer_idx}"
+        prefix = self._key_prefix(layer_idx)
+        layer_token = f"layer_{int(layer_idx)}"
         if layer_idx in self._mtp_layer_ids:
             layer_token += "_mtp"
         if attn_type is not None:
-            return (
-                f"{self.METRIC_PREFIX}/{layer_token}/{attn_type}_{metric_name}"
-            )
-        return f"{self.METRIC_PREFIX}/{layer_token}/{metric_name}"
+            return f"{prefix}/{layer_token}/{attn_type}_{metric_name}"
+        return f"{prefix}/{layer_token}/{metric_name}"
 
     def _global_key(
-        self, metric_name: str, attn_type: str | None = None
+        self, metric_name: str, attn_type: str | None = None, layer_idx=None
     ) -> str:
+        prefix = self._key_prefix(layer_idx)
         if attn_type is not None:
-            return f"{self.METRIC_PREFIX}/global_{attn_type}_{metric_name}"
-        return f"{self.METRIC_PREFIX}/global_{metric_name}"
+            return f"{prefix}/global_{attn_type}_{metric_name}"
+        return f"{prefix}/global_{metric_name}"
 
     def _should_disable_explicit_key(self, key: str) -> bool:
+        _monitor, _, sub = key.partition("/")
         if (
-            key.startswith(f"{self.METRIC_PREFIX}/global_")
+            sub.startswith("global_")
+            and (
+                _monitor == self.METRIC_PREFIX
+                or _monitor.startswith(f"{self.METRIC_PREFIX}_")
+            )
             and not self.log_global
         ):
             return True
@@ -250,7 +276,9 @@ class PaddleProbe(Probe):
         if not (self.log_per_layer or self.log_global):
             return
         layer_key = self._layer_key(layer_idx, metric_name, attn_type=attn_type)
-        global_key = self._global_key(metric_name, attn_type=attn_type)
+        global_key = self._global_key(
+            metric_name, attn_type=attn_type, layer_idx=layer_idx
+        )
         if not self.family_allows(layer_key):
             # Registered as disabled rather than merely skipped: record_* looks the
             # key up here to stay a cheap no-op instead of a KeyError.

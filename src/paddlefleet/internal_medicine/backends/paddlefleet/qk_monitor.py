@@ -636,25 +636,37 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size} CP={self.cp_size}"
             )
 
+        # The CP layout is resolved per layer, from that layer's own config: a
+        # model may mix CP-sharded and CP-replicated regions (HyperBody's
+        # encoder runs the whole sequence on every CP rank and marks its config
+        # ``cp_replicated_sequence``), and the replicated region's config keeps
+        # the TransformerConfig default ``cp_balance_mode``. Reading one
+        # model-wide mode off ``attention_layers[0]`` therefore picked up the
+        # encoder's default ``dualchunk_allgather`` for a contiguous-CP decoder,
+        # and the hook all-gathered a Q it must not touch.
+        #
+        # Indexed by position, not by ``layer_idx``: the encoder and decoder
+        # regions number their layers independently, so ``layer_idx`` repeats.
+        layer_cp = [
+            self._resolve_layer_cp(attn_module, item)
+            for _layer_idx, attn_module, item in attention_layers
+        ]
         if self.cp_size > 1:
-            config = getattr(attention_layers[0][1], "config", None)
-            if config is None:
-                config = getattr(
-                    getattr(attention_layers[0][1], "core_attention", None),
-                    "config",
-                    None,
-                )
-            if config is None:
-                config = getattr(attention_layers[0][2].layer, "config", None)
-            self.cp_balance_mode = getattr(
-                config, "cp_balance_mode", "dualchunk_allgather"
+            sharded_modes = sorted(
+                {mode for sharded, mode in layer_cp if sharded}
             )
+            n_replicated = sum(1 for sharded, _ in layer_cp if not sharded)
+            if len(sharded_modes) == 1:
+                self.cp_balance_mode = sharded_modes[0]
             logger.warning(
-                "[PaddleQKMonitor] CP=%d detected with mode=%s. Contiguous CP "
-                "keeps local Q and gathers K; dual-chunk reconstructs both Q "
-                "and K to global token order before QK stats.",
+                "[PaddleQKMonitor] CP=%d detected. CP-sharded layers use mode=%s "
+                "(%d layers); %d layers are CP-replicated and are treated as CP=1. "
+                "Contiguous CP keeps local Q and gathers K; dual-chunk "
+                "reconstructs both Q and K to global token order before QK stats.",
                 self.cp_size,
-                self.cp_balance_mode,
+                ",".join(sharded_modes) or "-",
+                len(layer_cp) - n_replicated,
+                n_replicated,
             )
 
         for layer_idx, attn_module, item in attention_layers:
@@ -693,19 +705,22 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         self.allocate_buffers()
 
-        for layer_idx, attn_module, item in attention_layers:
+        for pos, (layer_idx, attn_module, item) in enumerate(attention_layers):
             is_sparse = self._is_sparse_layer(item)
             if is_sparse:
                 patch = self._patch_sparse_attn(layer_idx, attn_module, item)
                 if patch is not None:
                     self.hooks.append(patch)
-                    continue
+                continue
             if hasattr(attn_module, "core_attention"):
+                cp_sharded, cp_mode = layer_cp[pos]
                 hook = attn_module.core_attention.register_forward_pre_hook(
                     self._make_compute_hook(
                         layer_idx,
                         item.attn_type,
                         record_qkv_norms=not is_sparse,
+                        cp_sharded=cp_sharded,
+                        cp_mode=cp_mode,
                     )
                 )
                 self.hooks.append(hook)
@@ -728,6 +743,34 @@ class PaddleQKStatsMonitor(PaddleProbe):
         )
         core = getattr(core, "core_attention", None)
         return hasattr(core, "compressed_sparse_attn")
+
+    @staticmethod
+    def _layer_config(attn_module, item):
+        """The config this attention layer was built with, or ``None``."""
+        for owner in (
+            attn_module,
+            getattr(attn_module, "core_attention", None),
+            getattr(item, "layer", None),
+        ):
+            config = getattr(owner, "config", None)
+            if config is not None:
+                return config
+        return None
+
+    def _resolve_layer_cp(self, attn_module, item) -> tuple[bool, str]:
+        """``(sequence is CP-sharded in this layer, cp_balance_mode)``.
+
+        A layer whose config sets ``cp_replicated_sequence`` holds the full
+        sequence on every CP rank, so its Q and K are already global and must
+        not be gathered: it is reported as not sharded and the hook treats it
+        as CP=1. Every other layer uses its own ``cp_balance_mode``.
+        """
+        if self.cp_size <= 1:
+            return False, self.cp_balance_mode
+        config = self._layer_config(attn_module, item)
+        if getattr(config, "cp_replicated_sequence", False):
+            return False, self.cp_balance_mode
+        return True, getattr(config, "cp_balance_mode", self.cp_balance_mode)
 
     @staticmethod
     def _learnable_sink(attn_module):
@@ -922,10 +965,12 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 attention_layers.append((item.idx, attn, item))
         return attention_layers
 
-    def _uses_contiguous_cp(self) -> bool:
-        return self.cp_balance_mode.startswith("contiguous")
+    def _uses_contiguous_cp(self, mode: str | None = None) -> bool:
+        return (mode or self.cp_balance_mode).startswith("contiguous")
 
-    def _cp_gather_seq(self, tensor: paddle.Tensor) -> paddle.Tensor | None:
+    def _cp_gather_seq(
+        self, tensor: paddle.Tensor, mode: str | None = None
+    ) -> paddle.Tensor | None:
         """Restore ``tensor`` to global sequence order across the CP group.
 
         Contiguous CP concatenates rank shards in rank order. Dual-chunk CP
@@ -944,7 +989,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
             gather = (
                 all_gather_contiguous
-                if self._uses_contiguous_cp()
+                if self._uses_contiguous_cp(mode)
                 else all_gather_balance
             )
             return gather(tensor, group=self.cp_group, axis=1)
@@ -965,7 +1010,16 @@ class PaddleQKStatsMonitor(PaddleProbe):
         attn_type: str | None = None,
         *,
         record_qkv_norms: bool = True,
+        cp_sharded: bool | None = None,
+        cp_mode: str | None = None,
     ):
+        # ``cp_sharded`` / ``cp_mode`` come from ``_resolve_layer_cp`` (this
+        # layer's own config). ``None`` keeps the model-wide fallback.
+        if cp_sharded is None:
+            cp_sharded = self.cp_size > 1
+        cp_mode = cp_mode or self.cp_balance_mode
+        contiguous_cp = self._uses_contiguous_cp(cp_mode)
+
         def hook_fn(layer, inputs):
             if not layer.training:
                 return
@@ -999,11 +1053,11 @@ class PaddleQKStatsMonitor(PaddleProbe):
                                 attn_type=attn_type,
                             )
                     q_row_offset = 0
-                    if self.cp_size > 1:
-                        key = self._cp_gather_seq(key.detach())
+                    if cp_sharded:
+                        key = self._cp_gather_seq(key.detach(), cp_mode)
                         if key is None:
                             return
-                        if self._uses_contiguous_cp():
+                        if contiguous_cp:
                             # Local Q is one contiguous interval, so K-only
                             # gather plus q_row_offset is enough. Avoid gathering
                             # Q: that would make every rank recompute full-seq
@@ -1014,7 +1068,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                             # Dual-chunk Q is two non-contiguous intervals, so
                             # a single offset cannot describe it. Reconstruct
                             # both Q and K to global order and run at offset 0.
-                            query = self._cp_gather_seq(query.detach())
+                            query = self._cp_gather_seq(query.detach(), cp_mode)
                             if query is None:
                                 return
 
@@ -1054,9 +1108,9 @@ class PaddleQKStatsMonitor(PaddleProbe):
                         softmax_scale=getattr(layer, "softmax_scale", None),
                     )
                     if (
-                        self.cp_size > 1
+                        cp_sharded
                         and self.cp_group is not None
-                        and self._uses_contiguous_cp()
+                        and contiguous_cp
                     ):
                         import paddle.distributed as dist
 

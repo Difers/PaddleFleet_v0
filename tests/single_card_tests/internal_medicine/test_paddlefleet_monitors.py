@@ -2051,6 +2051,361 @@ class PaddleQKMonitorTest(unittest.TestCase):
         monitor.remove_hooks()
 
 
+class RegionLayerIdTest(unittest.TestCase):
+    """HyperBody encoder layer ``LayerId(3, "enc")`` next to decoder layer 3."""
+
+    def setUp(self):
+        training_logs.reset()
+
+    def _record_enc_and_dec(self, log_global):
+        enc = layer_discovery.LayerId(3, "enc")
+        monitor = PaddleQKStatsMonitor(
+            log_per_layer=True, log_global=log_global
+        )
+        for idx in (enc, 3):
+            monitor.declare_layer_metric(idx, "q_norm_mean")
+            monitor.declare_layer_metric(idx, "q_norm_max")
+        monitor.allocate_buffers()
+        for idx, mean, peak in ((enc, 1.0, 10.0), (3, 2.0, 20.0)):
+            monitor.record_layer_metric(
+                idx, "q_norm_mean", paddle.to_tensor(mean, dtype="float32")
+            )
+            monitor.record_layer_metric(
+                idx, "q_norm_max", paddle.to_tensor(peak, dtype="float32")
+            )
+        monitor.step()
+        return monitor, training_logs.get_latest(prefix="qk_stats")
+
+    def test_region_id_never_equals_bare_int(self):
+        LayerId = layer_discovery.LayerId
+        self.assertNotEqual(LayerId(3, "enc"), 3)
+        self.assertNotIn(LayerId(3, "enc"), {3})
+        self.assertIn(LayerId(3, "enc"), {LayerId(3, "enc")})
+        self.assertEqual(LayerId(3), 3)
+        self.assertEqual(hash(LayerId(3)), hash(3))
+
+    def test_region_layers_get_own_layer_and_global_keys(self):
+        _monitor, metrics = self._record_enc_and_dec(log_global=True)
+        self.assertEqual(metrics["qk_stats_enc/layer_3/q_norm_mean"], 1.0)
+        self.assertEqual(metrics["qk_stats/layer_3/q_norm_mean"], 2.0)
+        self.assertEqual(metrics["qk_stats_enc/global_q_norm_mean"], 1.0)
+        self.assertEqual(metrics["qk_stats/global_q_norm_mean"], 2.0)
+        self.assertEqual(metrics["qk_stats_enc/global_q_norm_max"], 10.0)
+        self.assertEqual(metrics["qk_stats/global_q_norm_max"], 20.0)
+
+    def test_log_global_false_disables_both_regions(self):
+        monitor, metrics = self._record_enc_and_dec(log_global=False)
+        self.assertIn("qk_stats_enc/layer_3/q_norm_mean", metrics)
+        self.assertIn("qk_stats/layer_3/q_norm_mean", metrics)
+        self.assertFalse([k for k in metrics if "/global_" in k])
+        for prefix in ("qk_stats", "qk_stats_enc"):
+            self.assertTrue(
+                monitor._should_disable_explicit_key(f"{prefix}/global_max")
+            )
+
+    def test_family_classification_strips_region_prefix(self):
+        monitor = PaddleQKStatsMonitor()
+        self.assertEqual(
+            monitor._metric_sub("qk_stats_enc/layer_3/q_norm_max"), "q_norm_max"
+        )
+        self.assertEqual(
+            monitor._metric_sub("qk_stats_enc/global_q_norm_max"),
+            "global_q_norm_max",
+        )
+        # A key of another monitor is left whole.
+        self.assertEqual(monitor._metric_sub("moe_health/x"), "moe_health/x")
+
+    def test_region_id_orders_formats_and_pickles(self):
+        import pickle
+
+        LayerId = layer_discovery.LayerId
+        enc3, enc5 = LayerId(3, "enc"), LayerId(5, "enc")
+        # Untagged layers sort before every region, then by number.
+        self.assertEqual(sorted([enc5, 4, enc3, 1]), [1, 4, enc3, enc5])
+        self.assertTrue(enc3 < enc5 and enc3 <= enc3 and enc5 > enc3)
+        self.assertTrue(enc5 >= enc5 and LayerId(2) < 3 and LayerId(2) <= 2)
+        self.assertTrue(LayerId(4) > 3 and LayerId(4) >= 4)
+        for op in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"):
+            self.assertIs(getattr(enc3, op)("enc:3"), NotImplemented)
+        self.assertEqual(repr(enc3), "enc:3")
+        self.assertEqual(repr(LayerId(3)), "3")
+        restored = pickle.loads(pickle.dumps(enc3))
+        self.assertEqual(restored, enc3)
+        self.assertEqual(restored.region, "enc")
+
+    def test_layer_config_and_default_hook_cp(self):
+        self.assertIsNone(
+            PaddleQKStatsMonitor._layer_config(
+                SimpleNamespace(), SimpleNamespace()
+            )
+        )
+        # Without per-layer CP info the hook falls back to the model-wide one.
+        monitor = PaddleQKStatsMonitor()
+        self.assertTrue(callable(monitor._make_compute_hook(3, None)))
+
+    def test_legacy_per_layer_log_routes_region(self):
+        monitor = PaddleQKStatsMonitor()
+        monitor._log_per_layer_metrics(
+            layer_discovery.LayerId(3, "enc"), {"x": 1.0}
+        )
+        self.assertEqual(
+            training_logs.get_latest(prefix="qk_stats"),
+            {"qk_stats_enc/layer_3/x": 1.0},
+        )
+
+    def test_legacy_global_is_not_split_by_region(self):
+        # Documented limit of the legacy ``_record_metrics`` path: per-layer
+        # keys follow the region, the global aggregate does not.
+        monitor = PaddleQKStatsMonitor()
+        monitor._record_metrics(layer_discovery.LayerId(3, "enc"), {"x": 1.0})
+        monitor._record_metrics(3, {"x": 3.0})
+        monitor.step()
+        self.assertEqual(
+            training_logs.get_latest(prefix="qk_stats"),
+            {
+                "qk_stats_enc/layer_3/x": 1.0,
+                "qk_stats/layer_3/x": 3.0,
+                "qk_stats/global_x": 2.0,
+            },
+        )
+
+    def test_sample_layers_selects_region_layers(self):
+        LayerId = layer_discovery.LayerId
+        parsed = layer_discovery.parse_sample_layers([3, "enc:3", " 5 "])
+        self.assertEqual(parsed, {3, LayerId(3, "enc"), 5})
+        self.assertIn(LayerId(3, "enc"), parsed)
+        self.assertNotIn(LayerId(5, "enc"), parsed)
+        self.assertIsNone(layer_discovery.parse_sample_layers(None))
+        self.assertIsNone(layer_discovery.parse_sample_layers([]))
+
+
+class PerLayerCPResolutionTest(unittest.TestCase):
+    """CP-replicated encoder + contiguous-CP decoder in one model.
+
+    The encoder comes first and keeps the TransformerConfig default
+    ``dualchunk_allgather``, so a model-wide mode read off the first attention
+    layer would send the decoder down the dual-chunk path.
+    """
+
+    CP_SIZE = 2
+    CP_RANK = 1
+    ENC_MODE = "dualchunk_allgather"
+    DEC_MODE = "contiguous_allgather"
+
+    def _build_model(self, dec_mode=None):
+        class CoreAttention(nn.Layer):
+            def forward(self, query, key, value):
+                return value
+
+        class Attention(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.core_attention = CoreAttention()
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self, config):
+                super().__init__()
+                self.layer_idx = 0
+                self.config = config
+                self.self_attn = Attention()
+
+        enc_config = SimpleNamespace(
+            metric_layer_region="enc",
+            cp_replicated_sequence=True,
+            cp_balance_mode=self.ENC_MODE,
+        )
+        dec_config = SimpleNamespace(cp_balance_mode=dec_mode or self.DEC_MODE)
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList(
+                    [TransformerLayer(enc_config), TransformerLayer(dec_config)]
+                )
+
+        return Model()
+
+    def _register_under_cp(self, monitor, model):
+        cp_group = object()
+        pgc = importlib.import_module(
+            "paddlefleet.process_groups_config"
+        ).ProcessGroupCollection
+        utils = importlib.import_module("paddlefleet.utils")
+        with (
+            mock.patch.object(
+                pgc,
+                "use_mpu_process_groups",
+                return_value=SimpleNamespace(tp=None, cp=cp_group),
+            ),
+            mock.patch.object(
+                utils,
+                "get_pg_size",
+                side_effect=lambda g=None: self.CP_SIZE if g is cp_group else 1,
+            ),
+            mock.patch.object(
+                paddle.distributed, "get_rank", return_value=self.CP_RANK
+            ),
+        ):
+            monitor.register_hooks(model)
+        self.assertEqual(monitor.cp_size, self.CP_SIZE)
+        self.assertEqual(monitor.cp_rank, self.CP_RANK)
+
+    def test_resolve_layer_cp_reads_each_layers_config(self):
+        monitor = PaddleQKStatsMonitor()
+        monitor.cp_size = self.CP_SIZE
+        layers = monitor._find_attention_layers(self._build_model())
+        self.assertEqual(
+            [idx for idx, _attn, _item in layers],
+            [layer_discovery.LayerId(0, "enc"), 0],
+        )
+        self.assertEqual(
+            [
+                monitor._resolve_layer_cp(attn, item)
+                for _i, attn, item in layers
+            ],
+            [(False, monitor.cp_balance_mode), (True, self.DEC_MODE)],
+        )
+
+    def test_hooks_receive_per_layer_cp_layout(self):
+        monitor = PaddleQKStatsMonitor()
+        original = monitor._make_compute_hook
+        seen = []
+
+        def spy(layer_idx, attn_type=None, **kwargs):
+            seen.append((layer_idx, kwargs["cp_sharded"], kwargs["cp_mode"]))
+            return original(layer_idx, attn_type, **kwargs)
+
+        with mock.patch.object(monitor, "_make_compute_hook", side_effect=spy):
+            self._register_under_cp(monitor, self._build_model())
+        self.assertEqual(
+            seen,
+            [
+                (layer_discovery.LayerId(0, "enc"), False, self.ENC_MODE),
+                (0, True, self.DEC_MODE),
+            ],
+        )
+        # The only CP-sharded mode becomes the model-wide one.
+        self.assertEqual(monitor.cp_balance_mode, self.DEC_MODE)
+        monitor.remove_hooks()
+
+    def test_sparse_layer_without_patch_gets_no_dense_hook(self):
+        # Sparse (CSA/HCA) layers are skipped under CP>1: `_patch_sparse_attn`
+        # returns None, and the dense causal hook must not stand in for it.
+        monitor = PaddleQKStatsMonitor()
+        with (
+            mock.patch.object(monitor, "_is_sparse_layer", return_value=True),
+            mock.patch.object(
+                monitor, "_patch_sparse_attn", return_value=None
+            ) as patch_sparse,
+            mock.patch.object(monitor, "_make_compute_hook") as make_hook,
+        ):
+            self._register_under_cp(monitor, self._build_model())
+        self.assertEqual(patch_sparse.call_count, 2)
+        make_hook.assert_not_called()
+        self.assertEqual(monitor.hooks, [])
+
+    def _run_layer(self, monitor, model, layer_pos):
+        zero = paddle.zeros([1, 1], dtype="float32")
+        fake_stats = {
+            "max_global": zero.sum(),
+            "mean_global": zero.sum(),
+            "entropy_global": zero.sum(),
+            "sink_global": zero.sum(),
+            "entropy_per_head": zero,
+            "sink_per_head": zero,
+        }
+        qkv = paddle.ones([1, 4, 1, 2], dtype="float32")
+        with (
+            mock.patch.object(
+                monitor,
+                "_cp_gather_seq",
+                side_effect=lambda t, mode=None: paddle.concat([t, t], 1),
+            ) as gather,
+            mock.patch.object(
+                qk_monitor_module,
+                "compute_qk_stats_paddle",
+                return_value=dict(fake_stats),
+            ) as compute,
+            mock.patch.object(paddle.distributed, "all_reduce") as reduce,
+        ):
+            core = model.layers[layer_pos].self_attn.core_attention
+            core(qkv, qkv, qkv)
+        self.assertEqual(compute.call_count, 1)
+        (query, key), kwargs = compute.call_args
+        return gather, reduce, query, key, kwargs["q_row_offset"]
+
+    def test_dualchunk_layer_gathers_q_and_k(self):
+        training_logs.reset()
+        monitor = PaddleQKStatsMonitor()
+        model = self._build_model(dec_mode="dualchunk_allgather")
+        self._register_under_cp(monitor, model)
+        gather, reduce, query, key, offset = self._run_layer(monitor, model, 1)
+        # K first, then Q, both with the decoder's own mode.
+        self.assertEqual(
+            [c.args[1] for c in gather.call_args_list],
+            ["dualchunk_allgather", "dualchunk_allgather"],
+        )
+        reduce.assert_not_called()
+        self.assertEqual(
+            (query.shape[1], key.shape[1], offset), (4 * 2, 4 * 2, 0)
+        )
+        monitor.remove_hooks()
+
+    def test_replicated_layer_skips_gather_and_contiguous_gathers_k_only(self):
+        training_logs.reset()
+        monitor = PaddleQKStatsMonitor()
+        model = self._build_model()
+        self._register_under_cp(monitor, model)
+
+        zero = paddle.zeros([1, 1], dtype="float32")
+        fake_stats = {
+            "max_global": zero.sum(),
+            "mean_global": zero.sum(),
+            "entropy_global": zero.sum(),
+            "sink_global": zero.sum(),
+            "entropy_per_head": zero,
+            "sink_per_head": zero,
+        }
+        seq = 4
+        qkv = paddle.ones([1, seq, 1, 2], dtype="float32")
+
+        def run(layer_pos):
+            with (
+                mock.patch.object(
+                    monitor,
+                    "_cp_gather_seq",
+                    side_effect=lambda t, mode=None: paddle.concat([t, t], 1),
+                ) as gather,
+                mock.patch.object(
+                    qk_monitor_module,
+                    "compute_qk_stats_paddle",
+                    return_value=dict(fake_stats),
+                ) as compute,
+                mock.patch.object(paddle.distributed, "all_reduce") as reduce,
+            ):
+                core = model.layers[layer_pos].self_attn.core_attention
+                core(qkv, qkv, qkv)
+            self.assertEqual(compute.call_count, 1)
+            (query, key), kwargs = compute.call_args
+            return gather, reduce, query, key, kwargs["q_row_offset"]
+
+        gather, reduce, query, key, offset = run(0)
+        gather.assert_not_called()
+        reduce.assert_not_called()
+        self.assertEqual((query.shape[1], key.shape[1], offset), (seq, seq, 0))
+
+        gather, reduce, query, key, offset = run(1)
+        self.assertEqual(
+            [c.args[1] for c in gather.call_args_list], [self.DEC_MODE]
+        )
+        self.assertEqual(reduce.call_count, 2)
+        self.assertEqual(
+            (query.shape[1], key.shape[1], offset),
+            (seq, seq * self.CP_SIZE, seq * self.CP_RANK),
+        )
+        monitor.remove_hooks()
+
+
 class PaddleQKKernelComputeTest(unittest.TestCase):
     """GPU numerical tests for the shared triton qk_stats kernel via paddle."""
 

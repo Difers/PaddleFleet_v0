@@ -26,6 +26,93 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class LayerId(int):
+    """Metric layer id that also names the model region it belongs to.
+
+    Some models stack independently numbered regions in one module list --
+    HyperBody runs an encoder (layers 0..11) and a decoder (layers 0..42) in a
+    single PipelineLayer -- so the bare layer number repeats. A region-tagged id
+    behaves like the int it wraps for arithmetic and formatting, but compares and
+    hashes together with its region, so per-layer caches and metric schemas keep
+    the regions apart. The region reaches the metric key through the monitor
+    prefix (``qk_stats_enc/layer_3/...``, see ``PaddleProbe._key_prefix``), which
+    leaves every untagged key exactly as it was.
+    """
+
+    def __new__(cls, value: int, region: str | None = None):
+        obj = super().__new__(cls, value)
+        obj.region = region
+        return obj
+
+    def _sort_key(self):
+        return (self.region or "", int(self))
+
+    @staticmethod
+    def _other_key(other):
+        if isinstance(other, LayerId):
+            return other._sort_key()
+        if isinstance(other, int):
+            return ("", int(other))
+        return None
+
+    def __eq__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() == key
+
+    def __ne__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() != key
+
+    def __lt__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() < key
+
+    def __le__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() <= key
+
+    def __gt__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() > key
+
+    def __ge__(self, other):
+        key = self._other_key(other)
+        return NotImplemented if key is None else self._sort_key() >= key
+
+    def __hash__(self):
+        return hash(int(self)) if not self.region else hash(self._sort_key())
+
+    def __repr__(self):
+        return f"{self.region}:{int(self)}" if self.region else str(int(self))
+
+    def __reduce__(self):
+        return (LayerId, (int(self), self.region))
+
+
+def parse_sample_layers(sample_layers) -> set | None:
+    """``sample_layers`` as a set that region-tagged layer ids can match.
+
+    A ``LayerId`` with a region never equals the bare int of the same number,
+    so ``3`` selects only the untagged layer 3. Write ``"enc:3"`` (the
+    ``repr`` of ``LayerId(3, "enc")``) to select a region's layer.
+    """
+    if not sample_layers:
+        return None
+    parsed = set()
+    for entry in sample_layers:
+        if isinstance(entry, str):
+            region, sep, number = entry.strip().rpartition(":")
+            entry = LayerId(int(number), region) if sep else int(number)
+        parsed.add(entry)
+    return parsed
+
+
+def layer_region(layer) -> str | None:
+    """Region tag of a layer, from its config's ``metric_layer_region``."""
+    region = getattr(_layer_config(layer), "metric_layer_region", None)
+    return region if isinstance(region, str) and region else None
+
+
 @dataclass(frozen=True)
 class MonitorLayer:
     """A transformer layer together with its metric layer id and attention type."""
@@ -409,8 +496,9 @@ def iter_monitor_layers(
 
     def _make(idx: int, layer: object, is_mtp: bool) -> MonitorLayer:
         kind, ratio, window_size, has_indexer = attn_meta(layer)
+        region = layer_region(layer)
         return MonitorLayer(
-            idx=idx,
+            idx=LayerId(idx, region) if region else idx,
             layer=layer,
             is_mtp=is_mtp,
             attn_type=kind,

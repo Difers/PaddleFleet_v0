@@ -68,7 +68,11 @@ from .grad_reduce import (
     describe,
     plan_total_groups,
 )
-from .layer_discovery import get_decoder_layers, iter_monitor_layers
+from .layer_discovery import (
+    get_decoder_layers,
+    iter_monitor_layers,
+    parse_sample_layers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +324,7 @@ class PaddleGradHealthMonitor(PaddleProbe):
             verbose=verbose,
             exclude_families=exclude_families,
         )
-        self.sample_layers = set(sample_layers) if sample_layers else None
+        self.sample_layers = parse_sample_layers(sample_layers)
         self._failed: set[tuple[int, str]] = set()
         # AMP: latched so the scale is divided out exactly once per step, and so a
         # step whose backward recorded nothing is left alone.

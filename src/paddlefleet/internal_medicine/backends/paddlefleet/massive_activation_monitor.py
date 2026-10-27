@@ -49,7 +49,11 @@ import paddle
 from paddle import nn
 
 from .base import PaddleProbe
-from .layer_discovery import get_decoder_layers, iter_monitor_layers
+from .layer_discovery import (
+    get_decoder_layers,
+    iter_monitor_layers,
+    parse_sample_layers,
+)
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
@@ -134,7 +138,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         self.topk_channels = topk_channels
         self.sparsity_epsilon = sparsity_epsilon
         self.cosine_sample_pairs = cosine_sample_pairs
-        self.sample_layers = set(sample_layers) if sample_layers else None
+        self.sample_layers = parse_sample_layers(sample_layers)
         self.absolute_thresholds = tuple(absolute_thresholds)
         self.MAX_AGGREGATED = self.MAX_AGGREGATED | {
             f"channel_count_gt_{_threshold_key(t)}"

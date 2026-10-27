@@ -72,6 +72,7 @@ from .layer_discovery import (
     get_attention_module,
     get_decoder_layers,
     iter_monitor_layers,
+    parse_sample_layers,
 )
 from .vha_metrics import (
     head_output_stats,
@@ -169,7 +170,7 @@ class PaddleVHAHealthMonitor(PaddleProbe):
             monitor_interval=monitor_interval,
             verbose=verbose,
         )
-        self.sample_layers = set(sample_layers) if sample_layers else None
+        self.sample_layers = parse_sample_layers(sample_layers)
         # Branch-prefixed names, because record_layer_metric classifies on the
         # name it is handed.
         self.MAX_AGGREGATED = {

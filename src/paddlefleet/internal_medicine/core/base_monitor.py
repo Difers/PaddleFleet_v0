@@ -94,8 +94,17 @@ class Probe(ABC):
         ``global_`` is left in place; ``metric_families.classify`` strips it, so
         a cross-layer aggregate stays in the same family as the per-layer curves.
         """
-        prefix = f"{self.METRIC_PREFIX}/"
-        sub = key.removeprefix(prefix)
+        # Region-tagged keys carry ``<prefix>_<region>/`` (see
+        # ``PaddleProbe._key_prefix``); strip that too so they classify into the
+        # same families as the untagged ones.
+        monitor, sep, rest = key.partition("/")
+        if sep and (
+            monitor == self.METRIC_PREFIX
+            or monitor.startswith(f"{self.METRIC_PREFIX}_")
+        ):
+            sub = rest
+        else:
+            sub = key
         if sub.startswith("layer_"):
             _layer, _, rest = sub.partition("/")
             if rest:
@@ -170,6 +179,13 @@ class Probe(ABC):
 
         Increments _global_count once (one layer observation).
         Skips entirely when metrics is empty.
+
+        Region-tagged ``LayerId`` layers are routed only for the per-layer
+        keys (``<prefix>_<region>/layer_<n>``). The global accumulator is not
+        split by region: every layer recorded here, tagged or not, lands in
+        the same ``<prefix>/global_*``. Only the Megatron backend calls this
+        path and it has no regions; region-aware globals come from
+        ``PaddleProbe`` (see ``PaddleProbe._key_prefix``).
         """
         if not metrics:
             return
@@ -181,9 +197,18 @@ class Probe(ABC):
     def _log_per_layer_metrics(self, layer_idx: int, metrics: dict[str, float]):
         """Write per-layer metric keys without touching global aggregation."""
         if self.log_per_layer and metrics:
+            # Same layout as ``PaddleProbe._layer_key``: a region-tagged
+            # ``LayerId`` goes to ``<prefix>_<region>/layer_<n>``, never to
+            # ``layer_<region>:<n>``.
+            region = getattr(layer_idx, "region", None)
+            prefix = (
+                f"{self.METRIC_PREFIX}_{region}"
+                if region
+                else self.METRIC_PREFIX
+            )
             training_logs.update(
                 **{
-                    f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v
+                    f"{prefix}/layer_{int(layer_idx)}/{k}": v
                     for k, v in metrics.items()
                 }
             )
