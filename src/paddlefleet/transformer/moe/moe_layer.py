@@ -79,6 +79,7 @@ from .fusion_layer_utils import (
     FusionMoePyLayer,
     HybridEPMoePyLayer,
 )
+from .grouped_down_proj.ring import enable_grouped_down_proj
 from .moe_expert import GroupedMLPExpert, SonicMoEExpert, StandardMLPExpert
 from .moe_router import TopKRouter
 from .moe_shared_expert import StandardMLPSharedExpert
@@ -807,6 +808,14 @@ class MoELayer(nn.Layer):
                     use_ue8m0=self.use_ue8m0,
                     **ring_kwargs,
                 )
+                if self.use_ring_moe:
+                    enable_grouped_down_proj(
+                        self.token_dispatcher,
+                        self.config.moe_ring_grouped_down_proj_list,
+                        self.moe_intermediate_size
+                        // self.expert_model_parallel_size,
+                        self.fp8_dispatch,
+                    )
                 if self.use_ring_moe and hasattr(
                     getattr(self, "grouped_gemm_experts", None),
                     "set_calls_per_micro_batch",

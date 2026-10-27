@@ -27,6 +27,7 @@ Run with:
       tests/multi_card_tests/moe/test_ring_dispatcher_two_level.py
 """
 
+import contextlib
 import unittest
 from unittest import mock
 
@@ -1106,6 +1107,155 @@ class TestTwoLevelFp8Ring(_TwoLevelBase):
                         rtol=2e-2,
                         atol=2e-2,
                     )
+
+
+class _RecordingGroupedDownProj:
+    """Stands in for ``grouped_down_proj.ring.RingGroupedDownProj``: records
+    the ring's hook calls and leaves the expert call untouched."""
+
+    def __init__(self, extra=0, runs=True):
+        self.starts, self.events = [], []
+        self.pairs, self.ids = {}, {}
+        # columns appended by `extend_pair` (as the GPU planner's plan parts):
+        # [sum of the row's ids, 7.0, ...]
+        self.extra = extra
+        self.runs = runs  # what `start_forward` answers
+
+    def start_forward(self, T, K, E, intra_group):
+        self.starts.append((T, K, E, intra_group.nranks))
+        self.pairs, self.ids = {}, {}
+        return self.runs
+
+    def extend_pair(self, local_idx, pair):
+        self.events.append(("extend", None))
+        if not self.extra:
+            return pair
+        tag = local_idx.astype("float32").sum(axis=1, keepdim=True)
+        cols = [tag] + [paddle.full_like(tag, 7.0)] * (self.extra - 1)
+        return paddle.concat([pair, *cols], axis=1)
+
+    def submit(self, rnd, pair, src_stream=None, row0=0):
+        self.events.append(("submit", rnd))
+        if rnd not in self.pairs:  # later submits of a round are ignored
+            self.pairs[rnd] = (pair, row0)
+
+    @contextlib.contextmanager
+    def round(self, rnd, ids):
+        self.events.append(("round", rnd))
+        self.ids[rnd] = ids.clone()
+        yield
+
+
+class TestTwoLevelGroupedDownProjHooks(_TwoLevelBase):
+    """`ring_forward` drives an enabled grouped down projection: one start per
+    forward, every round's routing submitted before its expert call, and the
+    submitted rows (including the pre-gathered blocks' `row0`) are exactly
+    the ids that round runs with.  The output is unchanged."""
+
+    def _check(self, gpus_per_node, extra=0):
+        disp = _dispatcher(
+            self.ep_group, self.num_experts, gpus_per_node=gpus_per_node
+        )
+        rec = _RecordingGroupedDownProj(extra)
+        disp._gdp = rec
+        N = self.ep_size // gpus_per_node
+        T = self.T_local * gpus_per_node
+        idx, w = self._routing()
+        for it in range(3):  # call 2+ runs remote-first
+            x = self._tokens()
+            disp.pre_gate_token_ag(x)
+            rec.events = []
+            out = disp.ring_forward(x, w, idx, _scale_expert_fn(2.0), w.dtype)
+            paddle.device.synchronize()
+            np.testing.assert_allclose(
+                out.numpy(),
+                (x.detach() * 2.0 * self.ep_size).numpy(),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            self.assertEqual(
+                rec.starts[-1], (T, self.K, self.num_experts, gpus_per_node)
+            )
+            rounds = [r for kind, r in rec.events if kind == "round"]
+            self.assertEqual(sorted(rounds), list(range(N)), (it, rec.events))
+            for rnd in range(N):
+                first_submit = rec.events.index(("submit", rnd))
+                self.assertLess(
+                    first_submit, rec.events.index(("round", rnd)), it
+                )
+                pair, row0 = rec.pairs[rnd]
+                np.testing.assert_array_equal(
+                    pair[row0 : row0 + T, : self.K].astype("int32").numpy(),
+                    rec.ids[rnd].numpy(),
+                )
+                self.assertEqual(pair.shape[1], 2 * self.K + rec.extra)
+                if rec.extra:  # appended columns travel with their rows
+                    rows = pair[row0 : row0 + T].numpy()
+                    np.testing.assert_array_equal(
+                        rows[:, 2 * self.K], rows[:, : self.K].sum(axis=1)
+                    )
+
+    def test_hooks_g2(self):
+        self._check(2)
+
+    def test_hooks_g2_wide_pair(self):
+        self._check(2, extra=3)
+
+    def test_wide_pair_keeps_grads(self):
+        """Columns appended to the routing pair change neither the output nor
+        the token / router-weight grads (weights are read from [K, 2K))."""
+        res = {}
+        for extra in (None, 3):
+            paddle.seed(11)
+            disp = _dispatcher(self.ep_group, self.num_experts)
+            if extra is not None:
+                disp._gdp = _RecordingGroupedDownProj(extra)
+            for step in range(2):  # step 1 runs remote-first
+                idx, w0 = self._routing()
+                x = self._tokens()
+                w = w0 * x.mean(axis=-1, keepdim=True)
+                disp.pre_gate_token_ag(x)
+                out = disp.ring_forward(
+                    x, w, idx, _weighted_expert_fn(), w.dtype
+                )
+                paddle.autograd.backward(
+                    [out], [self._distinct_upstream(out.shape)]
+                )
+                res[extra, step] = (
+                    out.numpy(),
+                    x.grad.numpy(),
+                    w0.grad.numpy(),
+                )
+        for step in range(2):
+            for a, b in zip(res[None, step], res[3, step]):
+                np.testing.assert_array_equal(a, b)
+
+    def test_declined_forward_runs_without_hooks(self):
+        """A forward the runtime declines (`start_forward` -> False, e.g. a
+        round over the token limit) calls no other hook."""
+        disp = _dispatcher(self.ep_group, self.num_experts)
+        rec = _RecordingGroupedDownProj(extra=3, runs=False)
+        disp._gdp = rec
+        idx, w = self._routing()
+        for _ in range(2):  # call 2 runs remote-first
+            x = self._tokens()
+            disp.pre_gate_token_ag(x)
+            rec.events = []
+            out = disp.ring_forward(x, w, idx, _scale_expert_fn(2.0), w.dtype)
+            paddle.device.synchronize()
+            np.testing.assert_allclose(
+                out.numpy(),
+                (x.detach() * 2.0 * self.ep_size).numpy(),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            self.assertEqual(rec.events, [])
+        self.assertEqual(len(rec.starts), 2)
+
+    def test_hooks_g4(self):
+        if self.ep_size % 4 or self.ep_size // 4 < 2:
+            self.skipTest("needs EP >= 8")
+        self._check(4)
 
 
 if __name__ == "__main__":

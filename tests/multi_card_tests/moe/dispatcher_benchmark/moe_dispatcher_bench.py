@@ -74,6 +74,10 @@ if _HERE not in sys.path:
 _GIB = 1024.0**3
 _ORDER = ["sharding", "moe_sharding", "pp", "sep", "cp", "dp", "ep", "mp"]
 ALL_DISPATCHERS = ("allgather", "ringmoe", "deepep")
+# RingMoE with the grouped down projection (``moe_ring_grouped_down_proj_list``);
+# run only when asked for, since it needs a group list.
+RING_GDP = "ringmoe-gdp"
+KNOWN_DISPATCHERS = (*ALL_DISPATCHERS, RING_GDP)
 
 
 @dataclass
@@ -106,6 +110,11 @@ class BenchConfig:
     # Which MaxVio the targets refer to: "per_expert" or "per_rank" (the
     # load of each rank's expert block, i.e. the per-card imbalance).
     maxvio_metric: str = "per_expert"
+    # Recorded routing (npz with indices / weights) to replay instead of the
+    # real router or a MaxVio sweep; keeps the router's expert co-occurrence.
+    routing_npz: str | None = None
+    # Group list for the ringmoe-gdp dispatcher (row_group_planner.save_list).
+    grouped_down_proj_list: str | None = None
     # TransformerConfig.ringmoe_use_zcomm for the ringmoe dispatcher.
     ringmoe_use_zcomm: bool = True
 
@@ -125,6 +134,7 @@ class BenchResult:
     realized_maxvio: float | None = None  # per-expert, EP-wide histogram
     per_rank_maxvio: float | None = None  # under the E // EP block mapping
     sigma: float | None = None
+    routing_file: str | None = None  # replayed routing (--routing-npz)
     fwd_ms: list = field(default_factory=list)
     bwd_ms: list = field(default_factory=list)
     peak_gib: list = field(default_factory=list)
@@ -172,6 +182,7 @@ def build_transformer_config(dispatcher: str, cfg: BenchConfig):
     """TransformerConfig for one MoELayer driven by ``dispatcher``."""
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
+    gdp = dispatcher == RING_GDP
     return TransformerConfig(
         hidden_size=cfg.hidden_size,
         num_attention_heads=4,
@@ -197,7 +208,10 @@ def build_transformer_config(dispatcher: str, cfg: BenchConfig):
         n_group=1,
         topk_group=1,
         moe_shared_expert_overlap=cfg.n_shared_experts > 0,
-        moe_token_dispatcher_type=dispatcher,
+        moe_token_dispatcher_type="ringmoe" if gdp else dispatcher,
+        moe_ring_grouped_down_proj_list=cfg.grouped_down_proj_list
+        if gdp
+        else None,
         ringmoe_use_zcomm=cfg.ringmoe_use_zcomm,
         moe_expert_fusion=True,
         moe_use_fusion_node=True,
@@ -231,13 +245,15 @@ def unavailable_reason(dispatcher: str, cfg: BenchConfig) -> str | None:
 
     from paddlefleet.transformer.moe import fused_a2a
 
-    if dispatcher not in ALL_DISPATCHERS:
+    if dispatcher not in KNOWN_DISPATCHERS:
         return f"unknown dispatcher {dispatcher!r}"
+    if dispatcher == RING_GDP and not cfg.grouped_down_proj_list:
+        return "ringmoe-gdp needs --grouped-down-proj-list"
     if not paddlefleet_ops.is_sonic_moe_available():
         return "Sonic-MoE not available"
     if dispatcher == "deepep" and not fused_a2a.HAVE_DEEP_EP:
         return "DeepEP not available"
-    if dispatcher == "ringmoe":
+    if dispatcher in ("ringmoe", RING_GDP):
         gpus_per_node = ring_gpus_per_node(cfg)
         if gpus_per_node < 2 or dist.get_world_size() // gpus_per_node < 2:
             return "ringmoe needs G > 1 and N > 1"
@@ -398,8 +414,39 @@ def run_dispatcher(dispatcher: str, cfg: BenchConfig, pg_collection):
     paddle.device.cuda.empty_cache()
     layer = build_moe_layer(dispatcher, cfg, pg_collection)
     layer_topology = _topology(layer)
+    if (
+        dispatcher == RING_GDP
+        and getattr(layer.token_dispatcher, "_gdp", None) is None
+    ):
+        del layer
+        return [
+            BenchResult(
+                dispatcher,
+                status="skipped: grouped down projection not enabled for this "
+                "shape / build (see the MoELayer warning)",
+            )
+        ]
     results = []
-    if not cfg.maxvio_targets:
+    if cfg.routing_npz:
+        import routing_inject as ri
+
+        gate_signature = ri.capture_gate_signature(layer, _make_input(cfg))
+        routing = ri.load_routing_npz(
+            gate_signature,
+            cfg.routing_npz,
+            pg_collection.ep,
+            pg_collection.ep.rank,
+        )
+        base = BenchResult(
+            dispatcher,
+            topology=layer_topology,
+            realized_maxvio=routing["per_expert_maxvio"],
+            per_rank_maxvio=routing["per_rank_maxvio"],
+            routing_file=os.path.basename(cfg.routing_npz),
+        )
+        with ri.injected_gate(layer, gate_signature, routing):
+            results.append(_measure_cell(layer, cfg, base))
+    elif not cfg.maxvio_targets:
         results.append(
             _measure_cell(
                 layer, cfg, BenchResult(dispatcher, topology=layer_topology)
@@ -469,6 +516,12 @@ def run_all(dispatchers, cfg: BenchConfig):
 
 def _cell_name(result: BenchResult) -> str:
     name = f"{result.dispatcher} [{result.topology}]"
+    if result.routing_file is not None:
+        return name + (
+            f" routing={result.routing_file}"
+            f" maxvio={result.realized_maxvio:.2f}"
+            f" rank_maxvio={result.per_rank_maxvio:.2f}"
+        )
     if result.target_maxvio is not None:
         name += (
             f" maxvio={result.realized_maxvio:.2f}"
@@ -527,7 +580,7 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--dispatchers",
         default="",
-        help=f"comma-separated subset of {','.join(ALL_DISPATCHERS)} "
+        help=f"comma-separated subset of {','.join(KNOWN_DISPATCHERS)} "
         "(default: allgather,ringmoe on real routing, all with --maxvio)",
     )
     parser.add_argument("--tokens", type=int, default=default_cfg.tokens)
@@ -593,7 +646,22 @@ def _parse_args(argv=None):
         "(TransformerConfig.ringmoe_use_zcomm, on by default; "
         "--no-ringmoe-use-zcomm = NCCL; other dispatchers ignore it)",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--routing-npz",
+        default="",
+        help="replay a recorded routing (npz with indices / weights, "
+        "[T_total, K] or [layers, T_total, K]) instead of the router",
+    )
+    parser.add_argument(
+        "--grouped-down-proj-list",
+        default="",
+        help="group list for the ringmoe-gdp dispatcher (see "
+        "scripts/make_group_list.py)",
+    )
+    args = parser.parse_args(argv)
+    if args.routing_npz and args.maxvio:
+        parser.error("--routing-npz and --maxvio are exclusive")
+    return args
 
 
 def main(argv=None):
@@ -616,6 +684,8 @@ def main(argv=None):
         ],
         hot_placement=args.hot_placement,
         maxvio_metric=args.maxvio_metric,
+        routing_npz=args.routing_npz or None,
+        grouped_down_proj_list=args.grouped_down_proj_list or None,
         ringmoe_use_zcomm=args.ringmoe_use_zcomm,
     )
     paddle.set_default_dtype("bfloat16")

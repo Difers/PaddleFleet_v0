@@ -411,6 +411,12 @@ class LlmMetaConfig:
             "alltoall",
             'Communication type used by MoE module "deepep" or "alltoall". ',
         ),
+        (
+            "moe_ring_grouped_down_proj_list",
+            Optional[str],
+            None,
+            "RingMoE only: expert group list enabling the grouped BF16 down projection; None = off.",
+        ),
         ("use_unified_moe", bool, False, "Whether to use unified moe."),
         (
             "moe_deepep_num_sms",

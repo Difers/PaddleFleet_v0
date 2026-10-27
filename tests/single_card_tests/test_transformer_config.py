@@ -847,6 +847,30 @@ else:
         )
 
 
+class TestRingGroupedDownProjConfig(unittest.TestCase):
+    def test_default_off(self):
+        self.assertIsNone(TransformerConfig().moe_ring_grouped_down_proj_list)
+
+    def test_enabled_on_ringmoe(self):
+        TransformerConfig(
+            moe_token_dispatcher_type="ringmoe",
+            moe_ring_grouped_down_proj_list="groups.npz",
+        )
+
+    def test_rejects_non_ringmoe_or_fp8(self):
+        for kw in (
+            {"moe_token_dispatcher_type": "alltoall"},
+            {"moe_token_dispatcher_type": "ringmoe", "fp8": "e4m3"},
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "needs moe_token_dispatcher_type='ringmoe' and no fp8",
+            ):
+                TransformerConfig(
+                    moe_ring_grouped_down_proj_list="groups.npz", **kw
+                )
+
+
 class TestDSparkLossWeightType(unittest.TestCase):
     """__post_init__ checks for the joint-training DSpark loss weighting."""
 

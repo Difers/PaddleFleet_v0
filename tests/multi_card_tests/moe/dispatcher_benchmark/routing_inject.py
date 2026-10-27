@@ -44,6 +44,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from unittest import mock
 
+import numpy as np
 import paddle
 
 HOT_PLACEMENTS = ("clustered", "spread", "random")
@@ -241,6 +242,43 @@ def build_routing(sig, sigma, ep_group, rank, seed, hot_placement):
         "sigma": float(sigma),
         "per_expert_maxvio": maxvio(global_tokens_per_expert),
         "per_rank_maxvio": maxvio(per_rank_load(global_tokens_per_expert, R)),
+    }
+
+
+def load_routing_npz(sig, path, ep_group, rank):
+    """This rank's routing from a recorded export (``indices`` / ``weights``
+    arrays of shape ``[T_total, K]`` or ``[layers, T_total, K]``; the first
+    layer is used).  Rank ``r`` replays tokens ``[r*T, (r+1)*T)`` modulo
+    ``T_total``, so an export of one node's gathered batch is reused by every
+    node.  Real routing keeps the router's expert co-occurrence, which the
+    synthetic MaxVio routings do not."""
+    T, K, E = sig["num_tokens"], sig["topk"], sig["num_experts"]
+    z = np.load(path, allow_pickle=True)
+    idx, w = np.asarray(z["indices"]), np.asarray(z["weights"], np.float32)
+    if idx.ndim == 3:
+        idx, w = idx[0], w[0]
+    if idx.shape[1] != K or idx.max() >= E or idx.shape[0] < T:
+        raise ValueError(
+            f"routing {path}: indices {idx.shape} (max {idx.max()}) do not "
+            f"fit T={T} K={K} E={E}"
+        )
+    rows = (np.arange(T) + rank * T) % idx.shape[0]
+    top_idx = paddle.to_tensor(idx[rows].astype(np.int64)).astype(
+        sig["indices_dtype"]
+    )
+    top_gate = paddle.to_tensor(w[rows]).astype(sig["weights_dtype"])
+    top_gate.stop_gradient = False
+    counts = paddle.to_tensor(
+        np.bincount(idx[rows][idx[rows] >= 0], minlength=E).astype(np.int64)
+    )
+    if ep_group.nranks > 1:
+        paddle.distributed.all_reduce(counts, group=ep_group)
+    return {
+        "top_gate": top_gate,
+        "top_idx": top_idx,
+        "sigma": float("nan"),
+        "per_expert_maxvio": maxvio(counts),
+        "per_rank_maxvio": maxvio(per_rank_load(counts, ep_group.nranks)),
     }
 
 

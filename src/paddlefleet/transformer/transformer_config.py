@@ -1141,6 +1141,18 @@ class TransformerConfig(ModelParallelConfig):
     Call ``paddlefleet.transformer.moe.finalize_moonep`` before destroying
     the process group when using MoonEP."""
 
+    moe_ring_grouped_down_proj_list: str | None = None
+    """RingMoE only: path of an expert group list (written by
+    ``paddlefleet_ops.sonicmoe.row_group_planner.save_list``).  When set, each
+    ring round's BF16 down projection runs as sonic's grouped down projection
+    (plan built on the GPU; same result up to bf16 rounding).  Off by default;
+    needs ``moe_token_dispatcher_type='ringmoe'``, no ``fp8``, and a SonicMoE
+    build with the grouped down projection.  The per-rank intermediate size
+    ``moe_intermediate_size // expert_model_parallel_size`` must also be a
+    segment length the installed sonic / quack support (``supports_expert_k``;
+    at least a multiple of 16, a multiple of 64 with older builds); otherwise
+    the layer logs a warning and keeps the default down projection."""
+
     ringmoe_use_zcomm: bool = True
     """Whether the 'ringmoe' dispatcher runs its collectives on the low-SM
     paddlefleet_ops zcomm ops instead of NCCL: intra-node token and
@@ -2535,6 +2547,14 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.moe_ring_grouped_down_proj_list and (
+            self.moe_token_dispatcher_type != "ringmoe" or self.fp8
+        ):
+            raise ValueError(
+                "moe_ring_grouped_down_proj_list needs "
+                "moe_token_dispatcher_type='ringmoe' and no fp8, got "
+                f"{self.moe_token_dispatcher_type!r} / fp8={self.fp8!r}"
+            )
         # calculate_per_token_loss: reject layouts whose token count is not
         # handled yet, instead of silently mis-scaling the loss.
         if self.calculate_per_token_loss:

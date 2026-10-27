@@ -15,6 +15,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -3080,9 +3081,10 @@ def _routing_pair(idx, w):
 
 
 def _routing_unpair(pair, k, w_dtype):
-    """Split a ``[rows, 2K]`` float32 routing pair back into ``(idx, w)``."""
+    """Split a ``[rows, >= 2K]`` float32 routing pair back into ``(idx, w)``."""
     idx = pair[:, :k].astype("int32")
-    w = pair[:, k:]
+    # columns past 2K, if any, carry the grouped down projection's plan parts
+    w = pair[:, k : 2 * k]
     if w.dtype != w_dtype:
         w = w.astype(w_dtype)
     return idx, w
@@ -3306,6 +3308,8 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
         self._gate_pack = None
         # Slot from join_token_hop, consumed by ring_forward.
         self._tok_hop_slot = None
+        # Grouped BF16 down projection (enable_grouped_down_proj).
+        self._gdp = None
         # A real EP group is required; the multi-node (N > 1) and intra-node
         # (G > 1) checks follow once the sub-groups are built. All three are
         # raised rather than asserted so they survive ``python -O``.
@@ -3604,6 +3608,15 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             paddle.distributed.all_reduce(counts, group=self.moe_group)
         return counts
 
+    def enable_grouped_down_proj(self, config):
+        """Run the BF16 down projection of every round as sonic's grouped
+        down projection (`paddlefleet.transformer.moe.grouped_down_proj`;
+        `config` is its `GroupedDownProjConfig`); fp8 dispatch keeps the
+        default path."""
+        from .grouped_down_proj.ring import RingGroupedDownProj
+
+        self._gdp = RingGroupedDownProj(config)
+
     def ring_forward(
         self,
         x_l,
@@ -3756,6 +3769,33 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             rs_group = self.intra_rs_group
             zc = self.use_zcomm
 
+            # Grouped down projection: every round's routing goes to the
+            # planner as soon as its gather is enqueued; the round's down
+            # projection waits for the plan on the GPU (see
+            # `grouped_down_proj.ring`).
+            gdp = self._gdp if not fp8_ring else None
+            if gdp is not None:
+                rt_rows = rt_group.nranks if rt_group is not None else 1
+                if not gdp.start_forward(
+                    local_idx.shape[0] * rt_rows,
+                    k_topk,
+                    self.num_experts,
+                    intra,
+                ):
+                    gdp = None
+
+            def _gdp_submit(rnd, handle, group):
+                # Round `rnd`'s routing, produced by `handle`'s gather on
+                # `group`'s comm stream.
+                if gdp is not None and handle is not None:
+                    gdp.submit(
+                        rnd,
+                        handle["output"],
+                        group.process_group.get_stream(
+                            _framework._current_expected_place()
+                        ),
+                    )
+
             # partials[slot] is this node's output for the tokens of
             # inter rank ``slot``.
             partials = [None] * num_nodes
@@ -3844,6 +3884,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             # inter gather). Pair gathers run on the routing comm stream
             # (`_prefetch_routing_ag`), so they overlap compute.
             home_pair = _routing_pair(local_idx, home_w)
+            if gdp is not None:
+                # This rank's part of the grouped plan rides with its routing
+                # to every round (GPU planner; unchanged otherwise).
+                home_pair = gdp.extend_pair(local_idx, home_pair)
             home_pair.stop_gradient = False
             pair_ag_handle = _prefetch_routing_ag(home_pair, rt_group)
             # Inputs of the first round: the home round unless remote-first.
@@ -3851,6 +3895,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
             cur_pair = home_pair
             tok_ag_handle = home_tok_ag_handle
             home_pair_ag_handle = pair_ag_handle
+            _gdp_submit(0, home_pair_ag_handle, rt_group)
             remote_pair_hop_handle = {}
             pregather_blk, pregather_pf = None, {}
             if remote_first:
@@ -3868,6 +3913,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                 if not _order_after(rt_group, pair_hop_group):
                     self._drain([remote_pair_hop_handle])
                 pair_ag_handle = _prefetch_routing_ag(cur_pair, rt_group)
+                _gdp_submit(1, pair_ag_handle, rt_group)
                 cur_pair.stop_gradient = False
                 # Pop rather than read: `remote` lives until the end of the
                 # forward, and with zcomm its hop output is a window view
@@ -3938,6 +3984,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     seg_scale=gathered_scale,
                     seg_pair_ag_handle=pair_ag_handle,
                     seg_pregathered=pair_pregather and step > 0,
+                    seg_next=None if is_last else steps[pos + 1],
                 ):
                     # One round as a manual-backward segment: routing gather,
                     # histogram, next round's transfers, previous round's
@@ -3963,6 +4010,10 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                         gathered_pair = _RouterAllGather.apply(
                             seg_pair, rt_group
                         )
+                    if gdp is not None:
+                        # No-op if the round's gather was submitted ahead;
+                        # otherwise its routing was gathered on this stream.
+                        gdp.submit(seg_step, gathered_pair)
                     g_idx, g_w = _routing_unpair(gathered_pair, k_topk, w_dtype)
                     hist = (
                         tokens_per_expert_histogram_triton(
@@ -3983,17 +4034,22 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                                 # Every peer ReduceScatter is issued: start
                                 # the combine so it overlaps the home GEMM.
                                 _early_combine_issue()
-                        return expert_fn(
-                            seg_tok,
-                            g_idx,
-                            g_w,
-                            self.fp8_dispatch,
-                            tokens_per_expert=hist,
-                            fp8_scale=seg_scale,
-                            recompute_moe_gate_up=recompute_moe_gate_up,
-                            fp8_combine_grad_handle=None,
-                            sync_free_sizing=True,
-                        )
+                        with (
+                            gdp.round(seg_step, g_idx)
+                            if gdp is not None
+                            else contextlib.nullcontext()
+                        ):
+                            return expert_fn(
+                                seg_tok,
+                                g_idx,
+                                g_w,
+                                self.fp8_dispatch,
+                                tokens_per_expert=hist,
+                                fp8_scale=seg_scale,
+                                recompute_moe_gate_up=recompute_moe_gate_up,
+                                fp8_combine_grad_handle=None,
+                                sync_free_sizing=True,
+                            )
 
                     # Issue the next round's transfers before the GEMM is
                     # enqueued, so they overlap it. The home round after the
@@ -4009,6 +4065,22 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                                         gathered_pair, pair_inter_group
                                     )
                                 )
+                                if gdp is not None:
+                                    # Rounds 1..N-1: their blocks of the
+                                    # gather, sliced after it on the copy
+                                    # stream.
+                                    rows = all_pairs.shape[0] // num_nodes
+                                    ag_stream = pair_inter_group.process_group.get_stream(
+                                        _framework._current_expected_place()
+                                    )
+                                    for k in range(1, num_nodes):
+                                        gdp.submit(
+                                            k,
+                                            all_pairs,
+                                            ag_stream,
+                                            row0=((inter_rank - k) % num_nodes)
+                                            * rows,
+                                        )
                         else:
                             # Routing hop first, then its gather, ordered
                             # after this hop only on the comm side. If
@@ -4024,6 +4096,9 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                             if _order_after(rt_group, pair_hop_group):
                                 next_pair_ag_handle = _prefetch_routing_ag(
                                     next_pair, rt_group
+                                )
+                                _gdp_submit(
+                                    seg_next, next_pair_ag_handle, rt_group
                                 )
                         # Token hop, then its gather on `tok_group`,
                         # ordered after the `inter` hops on the comm side.
@@ -4197,7 +4272,7 @@ class RingMoETokenDispatcher(AllGatherTokenDispatcher):
                     # Router-weight half of a routing-pair grad.
                     if g_pair is None:
                         return None
-                    g_w_half = g_pair[:, k_topk:]
+                    g_w_half = g_pair[:, k_topk : 2 * k_topk]
                     return (
                         g_w_half.astype(w_dtype)
                         if g_w_half.dtype != w_dtype
