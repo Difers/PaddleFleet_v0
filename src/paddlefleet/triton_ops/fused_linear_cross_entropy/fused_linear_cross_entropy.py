@@ -28,10 +28,14 @@ import triton
 from .cross_entropy import (
     liger_cross_entropy_kernel,
     liger_cross_entropy_multimax_kernel,
+    multimax_grad_reduce_kernel,
 )
 from .utils import element_mul_kernel
 
 MAX_FUSED_SIZE = 65536 // 2
+
+# Row tile of `multimax_grad_reduce_kernel` ([BLOCK_ROWS, 8] fp32 in registers).
+MULTIMAX_REDUCE_BLOCK_ROWS = 1024
 
 # --- CE kernel launch tuning -------------------------------------------------
 # The CE kernels stream the whole vocab row [n_cols] in a BLOCK_SIZE-wide loop,
@@ -97,7 +101,9 @@ def fused_linear_cross_entropy_forward(
         multimax_ranges, multimax_ts: 可选 [4]-shape 张量。若两者均提供，
             则使用 `liger_cross_entropy_multimax_kernel` 在 Triton 内核中
             将 SegLU 段式调制 + CE + SegLU 反向 全部融合在两次扫描内完成；
-            grad_multimax_{ranges,ts} 通过 atomic_add 写入返回缓冲。
+            grad_multimax_{ranges,ts} 通过 atomic_add 写入返回缓冲；
+            FLAGS_cudnn_deterministic 开启时（deterministic_mode 会设置）
+            改为每行写 [n_rows, 8] 分片、再按固定顺序求和，梯度逐位可复现。
             相比在 Python 中逐 chunk 计算 SegLU 前向 / 反向，可避免在 HBM
             上物化 4 个 ReLU 中间张量与 SegLU 输出，将每个 chunk 的 vocab
             轴显存峰值从 ~10× 降回 ~1×。
@@ -161,6 +167,21 @@ def fused_linear_cross_entropy_forward(
         multimax_requires_grad = (
             not multimax_ranges.stop_gradient or not multimax_ts.stop_gradient
         )
+        # The atomic_add order follows program scheduling, so the grads
+        # differ in the last bits run to run. Deterministic mode stores each
+        # row's 8 partials into a [chunk_size, 8] buffer (reused across
+        # chunks; every row writes its slots) and sums them in a fixed order.
+        multimax_deterministic = multimax_requires_grad and bool(
+            paddle.get_flags(["FLAGS_cudnn_deterministic"])[
+                "FLAGS_cudnn_deterministic"
+            ]
+        )
+        multimax_partials = (
+            paddle.empty([chunk_size, 8], dtype=paddle.float32)
+            if multimax_deterministic
+            # Unused by the kernel; any fp32 pointer satisfies the signature.
+            else grad_multimax_ranges
+        )
         # Extract scalar values once (one host<->device sync for an [4]
         # tensor; negligible vs the chunk's GEMM/CE cost). Using fp32 for
         # numerical stability inside the kernel.
@@ -170,6 +191,8 @@ def fused_linear_cross_entropy_forward(
         grad_multimax_ranges = None
         grad_multimax_ts = None
         multimax_requires_grad = False
+        multimax_deterministic = False
+        multimax_partials = None
         _r_vals = None
         _t_vals = None
 
@@ -221,12 +244,23 @@ def fused_linear_cross_entropy_forward(
                 t3=_t_vals[3],
                 grad_r_ptr=grad_multimax_ranges,
                 grad_t_ptr=grad_multimax_ts,
+                partial_ptr=multimax_partials,
                 reduction=reduction,
                 HAS_GRADIENTS=needs_grad_logits,
                 HAS_MULTIMAX_GRADIENTS=multimax_requires_grad,
+                DETERMINISTIC=multimax_deterministic,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=ce_num_warps,
             )
+            if multimax_deterministic:
+                multimax_grad_reduce_kernel[(1,)](
+                    partial_ptr=multimax_partials,
+                    n_rows=n_rows,
+                    grad_r_ptr=grad_multimax_ranges,
+                    grad_t_ptr=grad_multimax_ts,
+                    BLOCK_ROWS=MULTIMAX_REDUCE_BLOCK_ROWS,
+                    num_warps=4,
+                )
         else:
             liger_cross_entropy_kernel[(n_rows,)](
                 X_ptr=logits_chunk,

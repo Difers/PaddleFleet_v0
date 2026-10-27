@@ -248,9 +248,11 @@ def _launch_multimax(x_np, y_np, ignore_index, reduction, r, t):
         t3=float(t[3]),
         grad_r_ptr=grad_r,
         grad_t_ptr=grad_t,
+        partial_ptr=grad_r,  # unused on the atomic path
         reduction=reduction,
         HAS_GRADIENTS=True,
         HAS_MULTIMAX_GRADIENTS=True,
+        DETERMINISTIC=False,
         BLOCK_SIZE=triton.next_power_of_2(v),
         num_warps=4,
     )

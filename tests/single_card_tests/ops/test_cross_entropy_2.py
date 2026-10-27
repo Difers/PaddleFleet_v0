@@ -217,10 +217,12 @@ def _launch_multimax(logits, targets, r, t, ignore_index, reduction):
         float(t[3]),
         grad_r,
         grad_t,
+        grad_r,  # partial_ptr: unused on the atomic path
         reduction,
         block,
         True,  # HAS_GRADIENTS
         True,  # HAS_MULTIMAX_GRADIENTS
+        False,  # DETERMINISTIC
     )
     paddle.device.cuda.synchronize()
     return {

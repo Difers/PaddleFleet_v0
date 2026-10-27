@@ -327,7 +327,7 @@ class TestFusedMultimaxNumerical(unittest.TestCase):
         loss.backward()
         return loss, x_ref.grad, w_ref.grad, r_ref.grad, t_ref.grad
 
-    def _run_fused(self, x, w, targets, ranges, ts, ignore_index):
+    def _run_fused(self, x, w, targets, ranges, ts, ignore_index, num_chunks=1):
         from paddlefleet.triton_ops.fused_linear_cross_entropy import (
             LigerFusedLinearCrossEntropyFunction,
         )
@@ -348,7 +348,7 @@ class TestFusedMultimaxNumerical(unittest.TestCase):
             None,  # bias
             ignore_index,
             "none",
-            1,  # num_chunks
+            num_chunks,
             False,  # ec_align
             r_f,
             t_f,
@@ -551,6 +551,57 @@ class TestFusedMultimaxNumerical(unittest.TestCase):
         self.assertTrue(
             paddle.allclose(gr_ref, r_f.grad, atol=1e-3, rtol=1e-3).item()
         )
+
+    def _make_many_row_inputs(self, BT=4096, H=32, V=512, ignore_index=-100):
+        """Enough rows that the atomic path's sum order varies run to run."""
+        paddle.seed(7)
+        x = paddle.randn([BT, H], dtype="float32")
+        w = paddle.randn([V, H], dtype="float32") * 0.3
+        targets = paddle.randint(0, V, [BT], dtype="int64")
+        targets[::17] = ignore_index
+        ranges = paddle.to_tensor([1.0, -1.0, 0.5, -0.5], dtype="float32")
+        ts = paddle.to_tensor([0.3, 0.4, 0.1, 0.2], dtype="float32")
+        return x, w, targets, ranges, ts, ignore_index
+
+    def _run_fused_with_flag(self, deterministic, inputs, num_chunks):
+        flag = "FLAGS_cudnn_deterministic"
+        old = paddle.get_flags([flag])[flag]
+        paddle.set_flags({flag: deterministic})
+        try:
+            return self._run_fused(*inputs, num_chunks=num_chunks)
+        finally:
+            paddle.set_flags({flag: old})
+
+    def test_fused_multimax_deterministic_grads_bitwise_repeatable(self):
+        """FLAGS_cudnn_deterministic: grad_ranges / grad_ts are bit-identical
+        across repeated backwards (single and multi chunk), and match both the
+        Python reference and the atomic path numerically.
+        """
+        inputs = self._make_many_row_inputs()
+        _, _, _, gr_ref, gt_ref = self._run_reference(*inputs)
+        for num_chunks in (1, 3):
+            _, _, _, gr0, gt0 = self._run_fused_with_flag(
+                True, inputs, num_chunks
+            )
+            for _ in range(20):
+                _, _, _, gr, gt = self._run_fused_with_flag(
+                    True, inputs, num_chunks
+                )
+                for a, b in ((gr0, gr), (gt0, gt)):
+                    np.testing.assert_array_equal(
+                        a.numpy().view(np.int32), b.numpy().view(np.int32)
+                    )
+            for got, ref in ((gr0, gr_ref), (gt0, gt_ref)):
+                np.testing.assert_allclose(
+                    got.numpy(), ref.numpy(), rtol=1e-3, atol=1e-3
+                )
+            _, _, _, gr_atomic, gt_atomic = self._run_fused_with_flag(
+                False, inputs, num_chunks
+            )
+            for got, atomic in ((gr0, gr_atomic), (gt0, gt_atomic)):
+                np.testing.assert_allclose(
+                    got.numpy(), atomic.numpy(), rtol=1e-5, atol=1e-5
+                )
 
 
 if __name__ == "__main__":

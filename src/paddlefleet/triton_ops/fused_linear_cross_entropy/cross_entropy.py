@@ -26,8 +26,9 @@ the learnable SegLU-style segmented modulation
                 + t2·max(r2-x,0)^2 + t3·max(x-r3,0)^2
 into the same kernel: SegLU is applied in registers during both the lse pass
 and the grad-write pass; per-row partial sums for grad_ranges/grad_ts are
-accumulated in registers and atomic-added to global [4]-shape fp32 buffers.
-This avoids materializing the four ReLU intermediates and SegLU output as
+accumulated in registers and atomic-added to global [4]-shape fp32 buffers
+(under FLAGS_cudnn_deterministic: stored per row and summed in a fixed order
+by `multimax_grad_reduce_kernel`). This avoids materializing the four ReLU intermediates and SegLU output as
 separate tensors, dropping per-chunk peak memory back to ~1× [C, V].
 """
 
@@ -140,17 +141,23 @@ def liger_cross_entropy_multimax_kernel(  # pragma: no cover - triton kernel bod
     # Per-chunk fp32 [4] grad accumulators for ranges/ts.
     grad_r_ptr,
     grad_t_ptr,
+    # fp32 [n_rows, 8] per-row partials (ranges then ts); DETERMINISTIC only.
+    partial_ptr,
     reduction: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_GRADIENTS: tl.constexpr,
     HAS_MULTIMAX_GRADIENTS: tl.constexpr,
+    DETERMINISTIC: tl.constexpr,
 ):
     """Liger CE kernel with fused SegLU activation + closed-form SegLU backward.
 
     Forward:  L = lse(SegLU(X)) - SegLU(X)[y]   (per row)
-    Backward: writes grad_x = dL/dX in place into X_ptr; atomic-adds the
-              per-row partial sums for grad_ranges and grad_ts into the
-              fp32 [4] global buffers grad_r_ptr / grad_t_ptr.
+    Backward: writes grad_x = dL/dX in place into X_ptr. The per-row partial
+              sums for grad_ranges and grad_ts are atomic-added into the
+              fp32 [4] global buffers grad_r_ptr / grad_t_ptr; with
+              DETERMINISTIC they are stored to row `program_id` of
+              partial_ptr instead and summed in a fixed order by
+              `multimax_grad_reduce_kernel`.
 
     SegLU is computed in registers from the loaded X block, so no extra HBM
     traffic relative to the no-multimax kernel.
@@ -166,6 +173,12 @@ def liger_cross_entropy_multimax_kernel(  # pragma: no cover - triton kernel bod
         for i in range(0, n_cols, BLOCK_SIZE):
             X_offsets = i + tl.arange(0, BLOCK_SIZE)
             tl.store(X_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
+        if HAS_MULTIMAX_GRADIENTS and DETERMINISTIC:
+            # Every row owns its 8 slots, so the reduce never reads stale data.
+            tl.store(
+                partial_ptr + program_id * 8 + tl.arange(0, 8),
+                tl.zeros([8], dtype=tl.float32),
+            )
         return
 
     loss_ptr += program_id * loss_stride
@@ -282,16 +295,30 @@ def liger_cross_entropy_multimax_kernel(  # pragma: no cover - triton kernel bod
                 gr3 += -2.0 * t3 * tl.sum(grad_out * m3_b)
 
         if HAS_MULTIMAX_GRADIENTS:
-            # One atomic_add per row per scalar (8 total). Race-free across
-            # programs and well below kernel runtime.
-            tl.atomic_add(grad_r_ptr + 0, gr0)
-            tl.atomic_add(grad_r_ptr + 1, gr1)
-            tl.atomic_add(grad_r_ptr + 2, gr2)
-            tl.atomic_add(grad_r_ptr + 3, gr3)
-            tl.atomic_add(grad_t_ptr + 0, gt0)
-            tl.atomic_add(grad_t_ptr + 1, gt1)
-            tl.atomic_add(grad_t_ptr + 2, gt2)
-            tl.atomic_add(grad_t_ptr + 3, gt3)
+            if DETERMINISTIC:
+                # Row-owned slots; the fixed-order sum happens in
+                # `multimax_grad_reduce_kernel`.
+                row_partial_ptr = partial_ptr + program_id * 8
+                tl.store(row_partial_ptr + 0, gr0)
+                tl.store(row_partial_ptr + 1, gr1)
+                tl.store(row_partial_ptr + 2, gr2)
+                tl.store(row_partial_ptr + 3, gr3)
+                tl.store(row_partial_ptr + 4, gt0)
+                tl.store(row_partial_ptr + 5, gt1)
+                tl.store(row_partial_ptr + 6, gt2)
+                tl.store(row_partial_ptr + 7, gt3)
+            else:
+                # One atomic_add per row per scalar (8 total). Race-free
+                # across programs and well below kernel runtime, but the
+                # fp32 sum order follows program scheduling.
+                tl.atomic_add(grad_r_ptr + 0, gr0)
+                tl.atomic_add(grad_r_ptr + 1, gr1)
+                tl.atomic_add(grad_r_ptr + 2, gr2)
+                tl.atomic_add(grad_r_ptr + 3, gr3)
+                tl.atomic_add(grad_t_ptr + 0, gt0)
+                tl.atomic_add(grad_t_ptr + 1, gt1)
+                tl.atomic_add(grad_t_ptr + 2, gt2)
+                tl.atomic_add(grad_t_ptr + 3, gt3)
 
     tl.debug_barrier()
 
@@ -301,3 +328,39 @@ def liger_cross_entropy_multimax_kernel(  # pragma: no cover - triton kernel bod
         loss = loss / n_non_ignore
 
     tl.store(loss_ptr, loss)
+
+
+@enable_compat_on_triton_kernel
+@triton.jit
+def multimax_grad_reduce_kernel(  # pragma: no cover - triton kernel body compiles to PTX, not python-instrumentable
+    partial_ptr,
+    n_rows,
+    grad_r_ptr,
+    grad_t_ptr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Sum [n_rows, 8] per-row multimax partials in a fixed order.
+
+    Launched with grid (1,): one program walks the rows in BLOCK_ROWS tiles,
+    accumulates element-wise, then tree-reduces the tile, so the fp32 sum
+    order depends only on n_rows. Columns 0-3 are added into grad_r_ptr and
+    4-7 into grad_t_ptr (load + store, keeping cross-chunk accumulation).
+    """
+    cols = tl.arange(0, 8)
+    acc = tl.zeros([BLOCK_ROWS, 8], dtype=tl.float32)
+    for i in range(0, n_rows, BLOCK_ROWS):
+        rows = (i + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
+        acc += tl.load(
+            partial_ptr + rows[:, None] * 8 + cols[None, :],
+            mask=rows[:, None] < n_rows,
+            other=0.0,
+        )
+    total = tl.sum(acc, axis=0)
+
+    is_r = cols < 4
+    r_offsets = tl.where(is_r, cols, 0)
+    t_offsets = tl.where(is_r, 0, cols - 4)
+    prev_r = tl.load(grad_r_ptr + r_offsets, mask=is_r, other=0.0)
+    tl.store(grad_r_ptr + r_offsets, prev_r + total, mask=is_r)
+    prev_t = tl.load(grad_t_ptr + t_offsets, mask=~is_r, other=0.0)
+    tl.store(grad_t_ptr + t_offsets, prev_t + total, mask=~is_r)
