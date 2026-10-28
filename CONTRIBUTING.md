@@ -63,9 +63,13 @@ uv pip install -e . -vv
 bash scripts/install_ops_wheel.sh
 ```
 
+> CI 发布的 `paddlefleet_ops` wheel 在 Ubuntu 24.04 上编译，运行时需要 glibc >= 2.39。
+> wheel 标签是 `linux_x86_64`，pip 不会校验 glibc 版本，在更旧的系统上能装上但 `import` 时会报
+> `GLIBC_2.3x not found`，这种情况请改用 Ubuntu 24.04 及以上的环境，或自行从源码编译。
+
 如果需要开发自定义算子，可以使用 editable 方式安装。
 
-编译 `paddlefleet_ops` 需要 GCC >= 13（DeepGEMM 依赖 C++20 `<format>`）和 elfutils 头文件。可以执行以下脚本检查并准备工具链（需要 root 权限，支持 yum/dnf 和 apt）：
+编译 `paddlefleet_ops` 需要 GCC >= 13（DeepGEMM 依赖 C++20 `<format>`）和 elfutils 头文件，推荐使用 Ubuntu 24.04 环境。可以执行以下脚本检查工具链，缺少时按提示安装 `g++-13` 和 `libdw-dev`：
 
 ```bash
 source ci/setup_ops_toolchain.sh

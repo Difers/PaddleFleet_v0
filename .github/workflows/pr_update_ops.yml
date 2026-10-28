@@ -117,9 +117,9 @@ jobs:
       matrix:
         python_version: ["3.12"]
         cuda:
-          - {CUDA_VERSION: CUDA12.9, IMAGE_TAG: cuda12.9-cudnn9.9-trt10.5-gcc11, bos_CUDA: cu129, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
-          - {CUDA_VERSION: CUDA13.0, IMAGE_TAG: cuda13.0-cudnn9.13-trt10.13-gcc11, bos_CUDA: cu130, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
-          - {CUDA_VERSION: CUDA13.2, IMAGE_TAG: cuda13.2-cudnn9.20-trt10.16-gcc11, bos_CUDA: cu132, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
+          - {CUDA_VERSION: CUDA12.9, IMAGE_TAG: ubuntu24-cuda129-py312-dev-fleet, bos_CUDA: cu129, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
+          - {CUDA_VERSION: CUDA13.0, IMAGE_TAG: ubuntu24-cuda130-py312-dev-fleet, bos_CUDA: cu130, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
+          - {CUDA_VERSION: CUDA13.2, IMAGE_TAG: ubuntu24-cuda132-py312-dev-fleet, bos_CUDA: cu132, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
     env:
       TASK: PR-PaddleFleet-ops-${{ matrix.cuda.CUDA_VERSION }}-${{ matrix.python_version }}
       PIP_CACHE_DIR: /home/.cache/pip
@@ -133,7 +133,7 @@ jobs:
     steps:
       - name: Check docker image and run container
         run: |
-          docker_image="ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle_manylinux_devel:${{ matrix.cuda.IMAGE_TAG }}"
+          docker_image="ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:${{ matrix.cuda.IMAGE_TAG }}"
           docker pull $docker_image
           container_name=${TASK}-${{ matrix.python_version }}-$(date +%Y%m%d-%H%M%S)
           echo "container_name=${container_name}" >> ${{ github.env }}
@@ -166,8 +166,6 @@ jobs:
         run: |
           docker exec -t ${{ env.container_name }} /bin/bash -xc '
           rm -rf * .[^.]*
-          export LD_LIBRARY_PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/lib/:${LD_LIBRARY_PATH}
-          export PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/bin/:${PATH}
           source /root/proxy
           set -e
           wget --tries=5 --no-proxy https://only-internal-network-support.bj.bcebos.com/PaddleFleet/${BRANCH}/${PR_ID}/${COMMIT_ID}/PaddleFleet.tar.gz --no-check-certificate
@@ -188,8 +186,8 @@ jobs:
       - name: Build wheel
         run: |
           docker exec -t ${{ env.container_name }} /bin/bash -xc '
-          export LD_LIBRARY_PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/lib/:${LD_LIBRARY_PATH}
-          export PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/bin/:${PATH}
+          # CPU builder has no driver; cuda-compat provides libcuda.so.1 for `import paddle`.
+          export LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH}
           export UV_PYTHON=${{ matrix.python_version }}
           source /root/proxy
           set -e
@@ -224,8 +222,6 @@ jobs:
       - name: Upload wheel
         run: |
           docker exec -t ${{ env.container_name }} /bin/bash -xc '
-          export LD_LIBRARY_PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/lib/:${LD_LIBRARY_PATH}
-          export PATH=/opt/_internal/cpython-${{ matrix.python_version }}.0/bin/:${PATH}
           set -e
           wget --no-proxy https://xly-devops.bj.bcebos.com/home/bos_new.tar.gz --no-check-certificate
           mkdir bos
@@ -296,7 +292,7 @@ jobs:
       matrix:
         python_version: ["3.12"]
         cuda:
-          - {CUDA_VERSION: CUDA13.2, bos_CUDA: cu132, IMAGE_TAG: cuda132-dev-arm-py312}
+          - {CUDA_VERSION: CUDA13.2, bos_CUDA: cu132, IMAGE_TAG: cuda132-dev-arm-py312-fleet}
     env:
       TASK: PaddleFleet-nightly-arm-${{ matrix.cuda.CUDA_VERSION }}
       PIP_CACHE_DIR: /home/.cache/pip
@@ -370,6 +366,8 @@ jobs:
         run: |
           docker exec -t ${{ env.container_name }} /bin/bash -xc '
           set -e
+          # Builder has no driver; cuda-compat provides libcuda.so.1 for `import paddle`.
+          export LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH}
           export UV_PYTHON=${{ matrix.python_version }}
           export PIP_BREAK_SYSTEM_PACKAGES=1
           source /root/proxy
@@ -389,9 +387,6 @@ jobs:
           export IS_NVIDIA=True
           python -m pip install --break-system-packages packaging "setuptools>=66.1.0" wheel "ninja==1.11.1.1" "pybind11[global]>=2.13,<3"
           python -m pip install --break-system-packages "nvidia-nvshmem-cu13>=3.3.9,<3.5"
-          # HybridEP links against NVML by soname; install dev stubs for libnvidia-ml.so.1.
-          apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev
-          rm -rf /var/lib/apt/lists/*
           source ci/setup_ops_toolchain.sh || exit 1
           uv build --wheel --package paddlefleet-ops --out-dir dist --no-build-isolation -v
           '
