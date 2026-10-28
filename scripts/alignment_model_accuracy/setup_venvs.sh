@@ -194,9 +194,10 @@ setup_paddle_venv() {
     # )
 
     # paddlefleet_ops
+    # triton 3.9 breaks fla autotune (key BT not a kernel argument), pin to 3.8.0
     UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install --python "${paddle_py}" --force-reinstall \
-    --extra-index-url "${nightly_index}" \
-        "${PADDLEFLEET_OPS_WHEEL}"
+    --extra-index-url "${nightly_index}" --index-strategy unsafe-best-match \
+        "${PADDLEFLEET_OPS_WHEEL}" "triton==3.8.0"
     # uv pip install --python "${paddle_py}" -v --no-build-isolation \
     #     -e ./PaddleFleet/packages/paddlefleet_ops
 
