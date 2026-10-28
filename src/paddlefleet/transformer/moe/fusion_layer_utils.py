@@ -1124,7 +1124,11 @@ class MlpNode:
                 # deep_gemm: slice stacked weight to [1, K, N]
                 gemm_node.moe_expert_fusion = True
                 parent = fused_gemm_node.grouped_gemm_experts
-                if hasattr(parent.weight1, "fp8_weight_stacked"):
+                if (
+                    hasattr(parent.weight1, "fp8_weight_stacked")
+                    or getattr(parent.weight1, "fp4_weight_stacked", None)
+                    is not None
+                ):
                     from paddlefleet.transformer.moe.fp8_utils import (
                         _PerExpertWeightProxy,
                     )

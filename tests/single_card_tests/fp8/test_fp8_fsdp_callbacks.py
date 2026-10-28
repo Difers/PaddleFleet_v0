@@ -35,12 +35,16 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import paddle
+
 from paddlefleet.trainer import trainer_callback
 from paddlefleet.trainer.trainer_callback import (
     FP8QuantWeightCallback,
     SonicMoELayoutSwitchCallback,
 )
 from paddlefleet.trainer.trainer_utils import ShardingOption
+from paddlefleet.transformer.moe.moe_layer import MoELayer
+from paddlefleet.transformer.transformer_layer import TransformerLayer
 
 _GET_FSDP_CONTEXT = "paddle.distributed.fsdp._fsdp_context.get_fsdp_context"
 _TRANSFORMER_LAYER = (
@@ -88,14 +92,16 @@ class _FakeParam:
 class _FakeTransformerLayer:
     """Stands in for ``TransformerLayer``; checks it is quantized unsharded."""
 
-    def __init__(self, ctx, prefix):
+    def __init__(self, ctx, prefix, use_w4a8=False):
         self._ctx = ctx
         self.expert_params = [
             _FakeParam(f"{prefix}.up_gate_proj"),
             _FakeParam(f"{prefix}.down_proj"),
         ]
         experts = SimpleNamespace(parameters=lambda: list(self.expert_params))
-        self.mlp = SimpleNamespace(grouped_gemm_experts=experts)
+        self.mlp = SimpleNamespace(
+            grouped_gemm_experts=experts, use_w4a8=use_w4a8
+        )
         self.quant_calls = []
 
     def sublayers(self, include_self=False):
@@ -112,6 +118,7 @@ class _FakeFSDPContext:
     def __init__(self):
         self.unsharded = None
         self.unshard_log = []
+        self.reshard_log = []
         self.buffer_manager = SimpleNamespace(buffer_groups=[])
 
     @contextlib.contextmanager
@@ -122,6 +129,7 @@ class _FakeFSDPContext:
         try:
             yield
         finally:
+            self.reshard_log.append([p.name for p in params])
             self.unsharded = None
 
     def add_group(self, buffer_name, param_names, is_expert):
@@ -161,7 +169,8 @@ class TestFP8QuantWeightCallbackUnderFSDP(unittest.TestCase):
         )
         self.ctx.add_group("fuse_params_dense_0", ["d.w"], is_expert=False)
         self.layers = [
-            _FakeTransformerLayer(self.ctx, f"layer{i}") for i in range(2)
+            _FakeTransformerLayer(self.ctx, "layer0", use_w4a8=False),
+            _FakeTransformerLayer(self.ctx, "layer1", use_w4a8=True),
         ]
         self.model = _FSDPModel(self.layers)
         self.master_weights = {
@@ -196,12 +205,42 @@ class TestFP8QuantWeightCallbackUnderFSDP(unittest.TestCase):
         # _FSDPModel.fp8_quant_weight raises and _WrappedOptimizer has no
         # clear_param_storage, so the stage1 path would fail here.
         self._step(_args([ShardingOption.FSDP], offload_master=False))
-        self.assertEqual(
-            self.ctx.unshard_log,
-            [[p.name for p in layer.expert_params] for layer in self.layers],
-        )
-        for layer in self.layers:
-            self.assertEqual(layer.quant_calls, [(True, False)])
+        expected_params = [
+            [p.name for p in layer.expert_params] for layer in self.layers
+        ]
+        self.assertEqual(self.ctx.unshard_log, expected_params)
+        self.assertEqual(self.ctx.reshard_log, expected_params)
+        self.assertIsNone(self.ctx.unsharded)
+        self.assertEqual(self.layers[0].quant_calls, [(True, False)])
+        self.assertEqual(self.layers[1].quant_calls, [(True, False)])
+
+    def test_w4a8_rejection_propagates_and_reshards(self):
+        layer = self.layers[0]
+        moe = MoELayer.__new__(MoELayer)
+        paddle.nn.Layer.__init__(moe)
+        moe.moe_use_fusion_node = True
+        moe.fp8 = "e4m3"
+        moe.use_w4a8 = True
+        moe.grouped_gemm_experts = layer.mlp.grouped_gemm_experts
+        layer.mlp = moe
+
+        def quantize(batch_mode, quant_transpose):
+            self.assertEqual(self.ctx.unsharded, layer.expert_params)
+            TransformerLayer.fp8_quant_weight(
+                layer, batch_mode=batch_mode, quant_transpose=quant_transpose
+            )
+
+        layer.fp8_quant_weight = quantize
+        with self.assertRaisesRegex(
+            ValueError, "Offline W4A8 requires quant_transpose=True or None"
+        ):
+            self._step(_args([ShardingOption.FSDP]))
+        expected = [[p.name for p in layer.expert_params]]
+        self.assertEqual(self.ctx.unshard_log, expected)
+        self.assertEqual(self.ctx.reshard_log, expected)
+        self.assertIsNone(self.ctx.unsharded)
+        self.assertEqual(self.layers[1].quant_calls, [])
+        self.assertEqual(self.offloaded, [])
 
     def test_offloads_and_reloads_expert_master_weights_only(self):
         self._step(_args([ShardingOption.FSDP]))
@@ -215,8 +254,8 @@ class TestFP8QuantWeightCallbackUnderFSDP(unittest.TestCase):
         self._step(_args([ShardingOption.FSDP]))
         self.assertEqual(self.offloaded, [])
         self.assertEqual(self.reloaded, [])
-        for layer in self.layers:
-            self.assertEqual(layer.quant_calls, [(True, False)])
+        self.assertEqual(self.layers[0].quant_calls, [(True, False)])
+        self.assertEqual(self.layers[1].quant_calls, [(True, False)])
 
     def test_no_offload_when_disabled(self):
         self._step(_args([ShardingOption.FSDP], offload_master=False))

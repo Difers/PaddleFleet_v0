@@ -29,6 +29,7 @@ Run:
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import paddle
@@ -677,6 +678,99 @@ class TestW4A8GroupGemm(unittest.TestCase):
         cos_pg = _cos(results[True][1], results[False][1])
         self.assertGreater(cos_dx, 0.999, f"dx cos={cos_dx}")
         self.assertGreater(cos_pg, 0.999, f"probs_grad cos={cos_pg}")
+
+    def test_offline_cache_forward_backward_matches_online_exactly(self):
+        """Cleared BF16 experts still produce identical output and all grads.
+
+        Gate-up recompute consumes the forward orientation again in backward;
+        dgrad consumes the independently quantized reverse orientation. Include
+        zero-token experts and rectangular weights to exercise both layouts.
+        """
+        from paddlefleet.transformer.moe.moe_layer import MoELayer
+
+        num_experts, k, n, tokens = 3, 128, 256, [128, 0, 256]
+        for activation, recompute, dequant in (
+            ("swiglu", False, False),
+            ("swiglu", True, False),
+            ("swiglu", True, True),
+            ("situ", True, True),
+        ):
+            with self.subTest(
+                activation=activation, recompute=recompute, dequant=dequant
+            ):
+                results = []
+                for offline in (False, True):
+                    paddle.seed(2026)
+                    node, experts = self._make_node(
+                        num_experts,
+                        k,
+                        n,
+                        dequant_input=dequant,
+                        recompute_moe_gate_up=recompute,
+                        activation_type=activation,
+                    )
+                    if offline:
+                        layer = SimpleNamespace(
+                            moe_use_fusion_node=True,
+                            fp8="e4m3",
+                            use_w4a8=True,
+                            use_ue8m0=True,
+                            grouped_gemm_experts=experts,
+                        )
+                        MoELayer.fp8_quant_weight(layer, batch_mode=True)
+                        for weight in (experts.weight1, experts.weight2):
+                            weight._clear_data()
+                            self.assertFalse(weight._is_initialized())
+                    paddle.seed(7)
+                    x = paddle.randn([sum(tokens), k], dtype="bfloat16")
+                    probs = paddle.rand([sum(tokens)], dtype="float32")
+                    out_grad = paddle.randn([sum(tokens), k], dtype="bfloat16")
+                    # Any hidden online fallback is a bug once BF16 is freed.
+                    with patch.object(
+                        fp8_utils,
+                        "mxfp4_stack_quant_without_cache",
+                        wraps=(
+                            None
+                            if offline
+                            else fp8_utils.mxfp4_stack_quant_without_cache
+                        ),
+                        side_effect=(
+                            AssertionError("offline GEMM read BF16 weights")
+                            if offline
+                            else None
+                        ),
+                    ) as raw_quant:
+                        out = node.forward(
+                            x, probs.unsqueeze(-1), tokens
+                        ).clone()
+                        dx, probs_grad = node.backward(out_grad.clone(), probs)
+                        if offline:
+                            raw_quant.assert_not_called()
+                        else:
+                            self.assertGreaterEqual(raw_quant.call_count, 4)
+                    results.append(
+                        tuple(
+                            tensor.clone()
+                            for tensor in (
+                                out,
+                                dx,
+                                probs_grad,
+                                experts.weight1.main_grad,
+                                experts.weight2.main_grad,
+                            )
+                        )
+                    )
+                for name, online, cached in zip(
+                    ("output", "dx", "dprobs", "dw1", "dw2"), *results
+                ):
+                    self.assertEqual(online.dtype, cached.dtype, name)
+                    self.assertEqual(online.shape, cached.shape, name)
+                    self.assertTrue(
+                        bool(
+                            (online.view("int8") == cached.view("int8")).all()
+                        ),
+                        f"offline {name} differs from online",
+                    )
 
     # ---------------- private-method branches ----------------
 

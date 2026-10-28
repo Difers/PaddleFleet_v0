@@ -253,6 +253,40 @@ def fused_stack_quant(
     return w, scale
 
 
+def mxfp4_stack_quant_without_cache(weights, transpose, use_ue8m0=True):
+    """Quantize live BF16 weights, never a previously cached FP4 payload."""
+    if not use_ue8m0:
+        raise ValueError(
+            "mxfp4 stack quant requires use_ue8m0=True; "
+            "the fused SM100 kernels use UE8M0 scales"
+        )
+    if (
+        isinstance(weights, (list, tuple))
+        and len(weights) == 1
+        and weights[0].ndim == 2
+    ):
+        weights = weights[0].unsqueeze(0)
+    weights = _stack_expert_weights(weights)
+    return mxfp4_stack_quantize_1x32(weights, transpose)
+
+
+def mxfp4_stack_quant(weights, transpose, use_ue8m0=True):
+    """Use an offline FP4 cache before touching cleared BF16 storage."""
+    if not use_ue8m0:
+        raise ValueError(
+            "mxfp4 stack quant requires use_ue8m0=True; "
+            "the fused SM100 kernels use UE8M0 scales"
+        )
+    owner = weights[0] if isinstance(weights, (list, tuple)) else weights
+    if hasattr(owner, "fp4_weight_stacked"):
+        suffix = "_transpose" if transpose else ""
+        return (
+            getattr(owner, "fp4_weight_stacked" + suffix),
+            getattr(owner, "fp4_scale_stacked" + suffix),
+        )
+    return mxfp4_stack_quant_without_cache(weights, transpose, use_ue8m0)
+
+
 def tilewise_quant(x):
     """
     Tile-wise FP8 quantization: quantize input tensor to FP8 with per-tile (1x128) scaling.
@@ -325,16 +359,6 @@ def _w4a8_quant_pack_for_hybridep_dispatch(x):
     """
     x_fp8, x_sf = _mxfp8_quant(x)
     return x_fp8, pack_ue8m0_to_fp32_slot(x_sf)
-
-
-def _mxfp4_stack_quant(weights, transpose, use_ue8m0=True):
-    if not use_ue8m0:
-        raise ValueError(
-            "mxfp4 stack quant requires use_ue8m0=True; "
-            "the fused SM100 kernels use UE8M0 scales"
-        )
-    weights = _stack_expert_weights(weights)
-    return mxfp4_stack_quantize_1x32(weights, transpose)
 
 
 def _mxfp8_weighted_swiglu_quant(o1, probs, clamp_value=None):
@@ -549,6 +573,28 @@ class _PerExpertWeightView:
     def fp8_scale_stacked_transpose(self):
         return self._slice_stacked("fp8_scale_stacked_transpose")
 
+    def _slice_fp4(self, attr_name):
+        t = getattr(self._parent, attr_name, None)
+        if t is None:
+            return None
+        return t._slice(self._local_id, self._local_id + 1)
+
+    @property
+    def fp4_weight_stacked(self):
+        return self._slice_fp4("fp4_weight_stacked")
+
+    @property
+    def fp4_scale_stacked(self):
+        return self._slice_fp4("fp4_scale_stacked")
+
+    @property
+    def fp4_weight_stacked_transpose(self):
+        return self._slice_fp4("fp4_weight_stacked_transpose")
+
+    @property
+    def fp4_scale_stacked_transpose(self):
+        return self._slice_fp4("fp4_scale_stacked_transpose")
+
     @property
     def main_grad(self):
         mg = getattr(self._parent, "main_grad", None)
@@ -703,7 +749,11 @@ class ExpertsGroupGemmContiguousNode:
                 custom_map, "num_experts_per_device", parent.weight1.shape[0]
             )
             local_id = expert_id - moe_rank * num_experts_per_device
-            if hasattr(parent.weight1, "fp8_weight_stacked"):
+            if (
+                hasattr(parent.weight1, "fp8_weight_stacked")
+                or getattr(parent.weight1, "fp4_weight_stacked", None)
+                is not None
+            ):
                 # Offline quant: bf16 weight may have been cleared, use proxy
                 self.grouped_gemm_experts = _PerExpertWeightProxy(
                     parent, local_id
@@ -1115,7 +1165,7 @@ class ExpertsGroupGemmContiguousNode:
                 assert self.input is not None
                 x = self.input
         # [E, K, N] -> [E, N, K/2]
-        w1_fp4, w1_sf = _mxfp4_stack_quant(
+        w1_fp4, w1_sf = mxfp4_stack_quant(
             expert_w1,
             transpose=True,
             use_ue8m0=self.use_ue8m0,
@@ -1173,7 +1223,7 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
         """
         # Online weight quant: [E, H, K] -> [E, K, H/2]
-        w2_fp4, w2_sf = _mxfp4_stack_quant(
+        w2_fp4, w2_sf = mxfp4_stack_quant(
             expert_w2,
             transpose=True,
             use_ue8m0=self.use_ue8m0,
@@ -1204,7 +1254,7 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, n] = [m_sum, k] * [num_groups, k, n]
         w2 [E, N, K] not transposed; the contracting dim is K (do3's columns).
         """
-        w2_fp4, w2_sf = _mxfp4_stack_quant(
+        w2_fp4, w2_sf = mxfp4_stack_quant(
             expert_w2,
             transpose=False,
             use_ue8m0=self.use_ue8m0,
@@ -1262,7 +1312,7 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
         w1 [E, K, N] not transposed; the contracting dim is N (do1's columns).
         """
-        w1_fp4, w1_sf = _mxfp4_stack_quant(
+        w1_fp4, w1_sf = mxfp4_stack_quant(
             expert_w1,
             transpose=False,
             use_ue8m0=self.use_ue8m0,

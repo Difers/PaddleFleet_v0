@@ -17,7 +17,6 @@
 import os
 import sys
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 import paddle
@@ -62,18 +61,6 @@ if IS_BLACKWELL:
 
 def _fp8_bits(value):
     return value.view("int8")
-
-
-class TestW4A8RuntimeDispatch(unittest.TestCase):
-    def test_offline_expert_quant_is_rejected(self):
-        # Offline quant frees the BF16 experts the W4A8 GEMMs quantize from.
-        from paddlefleet.transformer.moe.moe_layer import MoELayer
-
-        layer = SimpleNamespace(
-            moe_use_fusion_node=True, fp8="e4m3", use_w4a8=True
-        )
-        with self.assertRaisesRegex(ValueError, "offline_quant_expert_weight"):
-            MoELayer.fp8_quant_weight(layer)
 
 
 @unittest.skipUnless(IS_BLACKWELL, "requires a Blackwell CUDA device")

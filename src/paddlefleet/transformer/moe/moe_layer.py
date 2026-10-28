@@ -73,7 +73,10 @@ from paddlefleet.transformer.transformer_config import (
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
-from .fp8_utils import fused_stack_quant_without_cache
+from .fp8_utils import (
+    fused_stack_quant_without_cache,
+    mxfp4_stack_quant_without_cache,
+)
 from .fused_a2a import configure_buffer
 from .fusion_layer_utils import (
     FusionMoePyLayer,
@@ -2335,14 +2338,12 @@ class MoELayer(nn.Layer):
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
         if not (self.moe_use_fusion_node and self.fp8):
             return
-        if getattr(self, "use_w4a8", False):
-            # Offline quant frees the BF16 expert storage right after this call,
-            # but the W4A8 expert GEMMs quantize FP4 from that BF16 every
-            # fwd/bwd.
+        use_w4a8 = getattr(self, "use_w4a8", False)
+        if use_w4a8 and quant_transpose is False:
+            # Packed 1x32 FP4 cannot switch quantization axes by transposing.
             raise ValueError(
-                "use_w4a8 does not support offline_quant_expert_weight: it "
-                "frees the BF16 expert weights that W4A8 quantizes from. Set "
-                "offline_quant_expert_weight=False."
+                "Offline W4A8 requires quant_transpose=True or None: both "
+                "orientations must be quantized from BF16 before its release."
             )
         if hasattr(self, "grouped_gemm_experts") and isinstance(
             self.grouped_gemm_experts, SonicMoEExpert
@@ -2356,6 +2357,20 @@ class MoELayer(nn.Layer):
             """Helper function to quantize a list of weights."""
             if weight_obj is None:
                 weight_obj = weight_list[0]
+
+            if use_w4a8:
+                fp4_weight, fp4_scale = mxfp4_stack_quant_without_cache(
+                    weight_list, transpose=False, use_ue8m0=self.use_ue8m0
+                )
+                fp4_weight_t, fp4_scale_t = mxfp4_stack_quant_without_cache(
+                    weight_list, transpose=True, use_ue8m0=self.use_ue8m0
+                )
+                # Refresh from live BF16 even when an older cache exists.
+                weight_obj.fp4_weight_stacked = fp4_weight
+                weight_obj.fp4_scale_stacked = fp4_scale
+                weight_obj.fp4_weight_stacked_transpose = fp4_weight_t
+                weight_obj.fp4_scale_stacked_transpose = fp4_scale_t
+                return
 
             # 始终量化非转置版（行为对齐，fp8_weight_stacked 始终存在）
             fp8_weight, fp8_scale = fused_stack_quant_without_cache(
@@ -2387,6 +2402,13 @@ class MoELayer(nn.Layer):
                     weight_obj.fp8_scale_stacked_transpose = converted_scale
 
         if hasattr(self, "grouped_gemm_experts"):
+            if use_w4a8:
+                for weight in (
+                    self.grouped_gemm_experts.weight1,
+                    self.grouped_gemm_experts.weight2,
+                ):
+                    quantize_weights(weight, weight, quant_transpose)
+                return
             if batch_mode:
                 expert_w1 = self.grouped_gemm_experts.weight1
                 expert_w2 = self.grouped_gemm_experts.weight2
@@ -2454,7 +2476,7 @@ class MoELayer(nn.Layer):
                     )
 
     def clear_fp8_quant_weight(self):
-        """Clear cached FP8 quantized weights to release memory."""
+        """Clear cached FP8 and FP4 quantized weights to release memory."""
 
         logger.info(
             "Clearing FP8 quantized weights in MoE layer: "
@@ -2472,8 +2494,15 @@ class MoELayer(nn.Layer):
             "fp8_scale_stacked_transpose",
         )
 
+        fp4_attrs = (
+            "fp4_weight_stacked",
+            "fp4_scale_stacked",
+            "fp4_weight_stacked_transpose",
+            "fp4_scale_stacked_transpose",
+        )
+
         def _clear_attrs(weight_obj):
-            for attr in fp8_attrs:
+            for attr in fp8_attrs + fp4_attrs:
                 if hasattr(weight_obj, attr):
                     delattr(weight_obj, attr)
 
