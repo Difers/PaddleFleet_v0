@@ -303,6 +303,73 @@ def _ec_compatible_rope_apply(
     return xq_out.cast(q_pe.dtype), xk_out.cast(k_pe.dtype)
 
 
+class _FixedOrderDownProj(paddle.autograd.PyLayer):
+    """``q_a_proj`` and ``kv_a_proj_with_mqa`` behind one autograd node.
+
+    ``hidden_states`` feeds both down projections and, under gated attention
+    without ``gated_attn_use_q_lora``, ``gate_proj`` as well. Without q_lora the
+    first consumer is ``q_proj`` itself, fed with ``hidden_states`` directly;
+    the node then returns a copy as ``q_compressed`` so the same three-way sum
+    is still split into two-term ones. Composed plainly,
+    autograd adds those three contributions to ``d hidden_states`` in whatever
+    order their nodes become ready, and ``mla_qkv_recompute`` changes that
+    order: it folds the up-projection into one ``RecomputeWithoutOutput``
+    node, so the two down-projection gradients arrive together instead of
+    staggered. bf16 addition is not associative, so the sum drifts by an ULP.
+    Behind this node ``hidden_states`` has two consumers (this node and the
+    gate), and inside it ``segment_input`` has two (q_a / kv_a); two-term sums
+    are commutative, so the result no longer depends on the schedule.
+
+    Same mechanics as ``dsv4_hybrid_attention._FixedOrderQKV``:
+    ``build_graph`` is read by the caller because ``paddle.is_grad_enabled()``
+    is always False inside ``PyLayer.forward``, and the outputs are returned
+    detached so ``backward`` walks the inner graph instead of this node.
+    """
+
+    @staticmethod
+    def forward(ctx, module, hidden_states, build_graph):
+        segment_input = hidden_states.detach()
+        segment_input.stop_gradient = hidden_states.stop_gradient
+
+        with paddle.set_grad_enabled(build_graph):
+            q_compressed, kv_compressed, k_pos_emb = module._down_proj(
+                segment_input
+            )
+            # Without q_lora, _down_proj hands its input back as q_compressed;
+            # returning that would make the node's output its own input. A copy
+            # (bitwise equal in bf16) keeps q_proj's gradient inside this node.
+            if q_compressed is segment_input:
+                q_compressed = segment_input.clone()
+
+        ctx.hidden_stop_gradient = hidden_states.stop_gradient
+        ctx.build_graph = build_graph
+        if build_graph:
+            ctx.save_for_backward(
+                segment_input, q_compressed, kv_compressed, k_pos_emb
+            )
+        return q_compressed.detach(), kv_compressed.detach(), k_pos_emb.detach()
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        if ctx.hidden_stop_gradient or not ctx.build_graph:
+            return None
+
+        segment_input, *outputs = ctx.saved_tensor()
+        pairs = [
+            (output, grad)
+            for output, grad in zip(outputs, output_grads)
+            if grad is not None
+        ]
+        if pairs:
+            with paddle.amp.auto_cast(enable=False):
+                paddle.autograd.backward(
+                    [output for output, _ in pairs],
+                    [grad for _, grad in pairs],
+                )
+
+        return segment_input.grad
+
+
 @dataclass
 class MLASelfAttentionSublayersSpec:
     """Sublayers for MLA self-attention layer."""
@@ -1898,6 +1965,114 @@ class MLASelfAttention(MultiLatentAttention):
             return False
         return getattr(forward_meta, "step_use_cudagraph", False)
 
+    def _down_proj(self, hidden_states):
+        """q_a_proj / kv_a_proj_with_mqa and their layernorms.
+
+        Returns ``(q_compressed, kv_compressed, k_pos_emb)``. Called directly
+        or through ``_FixedOrderDownProj``.
+        """
+        # =========================================
+        # QKV down projection and layernorm
+        # =========================================
+        if self.q_lora_rank is not None:
+            # if q_a_proj is ColumnParallelLinear:
+            #     q_compressed: [b, s, q_lora_rank / TP]
+            q_compressed, _ = deferrable_linear(
+                self.config, "attn_q_proj", self.q_a_proj, hidden_states
+            )
+
+            # When output is sharded (ColumnParallelLinear):
+            # Gather output to restore output dim q_lora_rank;
+            # Scatter sequence back to s / TP if sequence-parallel
+            if q_compressed.size(-1) != self.q_lora_rank:
+                q_compressed = gather_from_tensor_model_parallel_region(
+                    q_compressed
+                )
+                if self.config.sequence_parallel:
+                    q_compressed = scatter_to_sequence_parallel_region(
+                        q_compressed
+                    )
+            # Ablation boundary: q_a_proj output (post TP-gather / SP-scatter).
+            q_compressed = inspect_tensor(
+                "mla_q_a_proj_output", get_current_layer(), q_compressed
+            )
+        else:
+            q_compressed = hidden_states
+
+        # if kv_a_proj_with_mqa is ColumnParallelLinear:
+        #     kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim) / TP]
+        kv_combined, _ = deferrable_linear(
+            self.config,
+            "attn_kv_proj",
+            self.kv_a_proj_with_mqa,
+            hidden_states,
+        )
+        if kv_combined.size(-1) != self.kv_lora_rank + self.qk_rope_head_dim:
+            # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            # kv_compressed:[b, s, kv_lora_rank], k_pos_emb: [b, s, qk_rope_head_dim]
+            kv_compressed, k_pos_emb = paddle.split(
+                kv_combined,
+                [self.kv_lora_rank, self.qk_rope_head_dim],
+                axis=-1,
+            )
+            if self.config.sequence_parallel:
+                # kv_compressed:[b, s / TP, kv_lora_rank]
+                kv_compressed = scatter_to_sequence_parallel_region(
+                    kv_compressed
+                )
+        else:
+            # kv_compressed:[b, s / TP, kv_lora_rank], k_pos_emb: [b, s / TP, qk_rope_head_dim]
+            kv_compressed, k_pos_emb = paddle.split(
+                kv_combined,
+                [self.kv_lora_rank, self.qk_rope_head_dim],
+                axis=-1,
+            )
+            if (
+                get_pg_size(self.pg_collection.tp) > 1
+                and self.config.sequence_parallel
+            ):
+                # k_pos_emb: [b, s, qk_rope_head_dim]
+                k_pos_emb = gather_from_sequence_parallel_region(
+                    k_pos_emb, group=self.pg_collection.tp
+                )
+
+        # Ablation boundary: kv_a_proj_with_mqa output (compressed part, after
+        # TP-gather / split / SP-scatter). Input is hidden_states, already
+        # probed at mla_hidden_states_input.
+        kv_compressed = inspect_tensor(
+            "mla_kv_a_proj_output", get_current_layer(), kv_compressed
+        )
+
+        # if packed_seq_params is not None:
+        #     # PaddleFleet batch-first: [b=1, t, h] -> squeeze dim0 (batch) -> [t, h]
+        #     # (SP seq-first: [t, b=1, h] -> squeeze dim1 (batch) -> [t, h])
+        #     batch_dim = 1 if self.config.sequence_parallel else 0
+        #     q_compressed = q_compressed.squeeze(batch_dim)
+        #     kv_compressed = kv_compressed.squeeze(batch_dim)
+        #     k_pos_emb = k_pos_emb.squeeze(batch_dim)
+
+        # =========================================
+        # Apply norm
+        # =========================================
+
+        if self.q_lora_rank is not None:
+            # q_compressed: [num_tokens, q_lora_rank]
+            q_compressed = self.q_a_layernorm(q_compressed)
+            # Ablation boundary: q_a_layernorm output.
+            q_compressed = inspect_tensor(
+                "mla_q_a_norm_output", get_current_layer(), q_compressed
+            )
+
+        kv_compressed = self.kv_a_layernorm(kv_compressed)
+        # Ablation boundary: kv_a_layernorm output (feeds kv_b_proj; input is
+        # the value already probed at mla_kv_a_proj_output).
+        kv_compressed = inspect_tensor(
+            "mla_kv_a_norm_output", get_current_layer(), kv_compressed
+        )
+
+        return q_compressed, kv_compressed, k_pos_emb
+
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -2050,105 +2225,28 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
-        # =========================================
-        # QKV down projection and layernorm
-        # =========================================
-        if self.q_lora_rank is not None:
-            # if q_a_proj is ColumnParallelLinear:
-            #     q_compressed: [b, s, q_lora_rank / TP]
-            q_compressed, _ = deferrable_linear(
-                self.config, "attn_q_proj", self.q_a_proj, hidden_states
-            )
-
-            # When output is sharded (ColumnParallelLinear):
-            # Gather output to restore output dim q_lora_rank;
-            # Scatter sequence back to s / TP if sequence-parallel
-            if q_compressed.size(-1) != self.q_lora_rank:
-                q_compressed = gather_from_tensor_model_parallel_region(
-                    q_compressed
-                )
-                if self.config.sequence_parallel:
-                    q_compressed = scatter_to_sequence_parallel_region(
-                        q_compressed
-                    )
-            # Ablation boundary: q_a_proj output (post TP-gather / SP-scatter).
-            q_compressed = inspect_tensor(
-                "mla_q_a_proj_output", get_current_layer(), q_compressed
+        # q_a_proj / kv_a_proj_with_mqa through one node so the gradient sum
+        # into hidden_states is independent of mla_qkv_recompute; see
+        # _FixedOrderDownProj. Without q_lora, q_proj and kv_a_proj consume
+        # hidden_states directly; that is a two-term sum unless the gate reads
+        # hidden_states too, so only that case pays the node's extra
+        # [num_tokens, hidden_size] copy of q_compressed.
+        gate_reads_hidden = (
+            self.gated_attention and not self.gated_attn_use_q_lora
+        )
+        if (
+            self.training
+            and not is_decode
+            and not hidden_states.stop_gradient
+            and (self.q_lora_rank is not None or gate_reads_hidden)
+        ):
+            q_compressed, kv_compressed, k_pos_emb = _FixedOrderDownProj.apply(
+                self, hidden_states, paddle.is_grad_enabled()
             )
         else:
-            q_compressed = hidden_states
-
-        # if kv_a_proj_with_mqa is ColumnParallelLinear:
-        #     kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim) / TP]
-        kv_combined, _ = deferrable_linear(
-            self.config,
-            "attn_kv_proj",
-            self.kv_a_proj_with_mqa,
-            hidden_states,
-        )
-        if kv_combined.size(-1) != self.kv_lora_rank + self.qk_rope_head_dim:
-            # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
-            # kv_compressed:[b, s, kv_lora_rank], k_pos_emb: [b, s, qk_rope_head_dim]
-            kv_compressed, k_pos_emb = paddle.split(
-                kv_combined,
-                [self.kv_lora_rank, self.qk_rope_head_dim],
-                axis=-1,
+            q_compressed, kv_compressed, k_pos_emb = self._down_proj(
+                hidden_states
             )
-            if self.config.sequence_parallel:
-                # kv_compressed:[b, s / TP, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(
-                    kv_compressed
-                )
-        else:
-            # kv_compressed:[b, s / TP, kv_lora_rank], k_pos_emb: [b, s / TP, qk_rope_head_dim]
-            kv_compressed, k_pos_emb = paddle.split(
-                kv_combined,
-                [self.kv_lora_rank, self.qk_rope_head_dim],
-                axis=-1,
-            )
-            if (
-                get_pg_size(self.pg_collection.tp) > 1
-                and self.config.sequence_parallel
-            ):
-                # k_pos_emb: [b, s, qk_rope_head_dim]
-                k_pos_emb = gather_from_sequence_parallel_region(
-                    k_pos_emb, group=self.pg_collection.tp
-                )
-
-        # Ablation boundary: kv_a_proj_with_mqa output (compressed part, after
-        # TP-gather / split / SP-scatter). Input is hidden_states, already
-        # probed at mla_hidden_states_input.
-        kv_compressed = inspect_tensor(
-            "mla_kv_a_proj_output", get_current_layer(), kv_compressed
-        )
-
-        # if packed_seq_params is not None:
-        #     # PaddleFleet batch-first: [b=1, t, h] -> squeeze dim0 (batch) -> [t, h]
-        #     # (SP seq-first: [t, b=1, h] -> squeeze dim1 (batch) -> [t, h])
-        #     batch_dim = 1 if self.config.sequence_parallel else 0
-        #     q_compressed = q_compressed.squeeze(batch_dim)
-        #     kv_compressed = kv_compressed.squeeze(batch_dim)
-        #     k_pos_emb = k_pos_emb.squeeze(batch_dim)
-
-        # =========================================
-        # Apply norm
-        # =========================================
-
-        if self.q_lora_rank is not None:
-            # q_compressed: [num_tokens, q_lora_rank]
-            q_compressed = self.q_a_layernorm(q_compressed)
-            # Ablation boundary: q_a_layernorm output.
-            q_compressed = inspect_tensor(
-                "mla_q_a_norm_output", get_current_layer(), q_compressed
-            )
-
-        kv_compressed = self.kv_a_layernorm(kv_compressed)
-        # Ablation boundary: kv_a_layernorm output (feeds kv_b_proj; input is
-        # the value already probed at mla_kv_a_proj_output).
-        kv_compressed = inspect_tensor(
-            "mla_kv_a_norm_output", get_current_layer(), kv_compressed
-        )
 
         # === MD5 probes for MLA intermediate values ===
         from paddlefleet.transformer.transformer_layer import TransformerLayer
