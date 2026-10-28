@@ -36,7 +36,7 @@ common_dependencies: list[str] = []
 def get_special_setup_deps():
     if backends.IS_NVIDIA:
         deps = [
-            "triton",  # for deep_gemm, flashmask
+            "triton<3.9",  # for deep_gemm, flashmask; 3.9 rejects fla's autotune key "BT"
             "einops",  # for flash-linear-attention
             "nvidia-cutlass-dsl[cu13]==4.5.2",  # for sonic_moe, flash_attention, cudnn-frontend, and MoonEP
             "filelock",  # for sonic_moe
