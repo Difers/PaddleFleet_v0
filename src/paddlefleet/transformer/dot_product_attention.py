@@ -504,12 +504,13 @@ class DotProductAttention(FleetLayer):
                 [attn_mask_startend_row_indices, append_indices_expand],
                 axis=-1,
             )
-        elif (
-            attn_mask_startend_row_indices.shape[-1] == 2
-            and self.config.experimental_dataflow
+        elif attn_mask_startend_row_indices.shape[-1] == 2 and (
+            self.config.experimental_dataflow
+            or self.attn_mask_type != AttnMaskType.causal
         ):
-            # In EB dataflow, attn_mask_startend_row_indices.shape[-1] == 2
-            # means attn_mask_startend_row_indices is ready, do not need to concat
+            # Two columns are the ready (LTS, UTE) pairs the non-causal CP kernel
+            # consumes: guaranteed by the EB dataflow, and the only reading for a
+            # non-causal layer (a causal one could mean (LTS, LTE)).
             pass
         else:
             raise ValueError(

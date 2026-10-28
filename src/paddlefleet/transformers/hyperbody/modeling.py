@@ -47,6 +47,7 @@ across the boundary -> cross-stage P2P is not viable yet).
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
 
 import paddle
@@ -59,6 +60,10 @@ from paddle.distributed.fleet.meta_parallel import (
     build_spec_layer,
 )
 
+from paddlefleet.context_parallel_utils import (
+    ContextParallelGatherOp,
+    ContextParallelScatterOp,
+)
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
 from paddlefleet.models.gpt.gpt_layer_specs import (
     _get_effective_mtp_layers,
@@ -558,6 +563,14 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         )
 
         rope = self._packed_rope(max_seqlen, seg_lens)
+        if getattr(self.config, "hyperencoder_cp_shard", False):
+            # Every CP rank packed the same global sequence, so the cut is a
+            # scatter whatever the decoder's data source: forward slices, backward
+            # all-gathers, i.e. the replicated frontend sees the full grad. Row
+            # indices stay global (flashmask_attention_cp slices them per chunk).
+            mode = self.config.cp_balance_mode
+            x = ContextParallelScatterOp.apply(x, axis=1, mode=mode)
+            rope = ContextParallelScatterOp.apply(rope, axis=1, mode=mode)
 
         return {
             "hidden_states": x,
@@ -705,7 +718,14 @@ class HyperBodyEncoderBridge(FleetLayer):
     def _forward_packed(self, dict_args, layout):
         # hidden_states is [1, ΣL_i(+pad), H_enc]; slice each segment's trailing
         # query rows via the packed layout, out-project, concat -> [ΣQ_i, H_dec].
-        h = self.final_norm(dict_args["hidden_states"])[0]  # [T, H_enc]
+        h = dict_args["hidden_states"]
+        if getattr(
+            self.config, "hyperencoder_cp_shard", False
+        ):  # inverse of the frontend scatter
+            h = ContextParallelGatherOp.apply(
+                h, axis=1, mode=self.config.cp_balance_mode
+            )
+        h = self.final_norm(h)[0]  # [T, H_enc]
         starts = layout["segment_starts"]
         n_contexts = layout["n_contexts"]
         n_queries = layout["n_queries"]
@@ -1165,13 +1185,67 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     # key (and the same cross-layer aggregate). The tag routes the encoder's
     # metrics to ``<monitor>_enc/...``; see internal_medicine LayerId.
     view.metric_layer_region = "enc"
-    # This region is replicated across CP: every CP rank holds the whole
-    # sequence, so its local sequence IS the global one. Anything that scales a
-    # per-rank statistic by cp -- the aux-loss denominator, its probs gather,
-    # the attention's KV gather -- is then off by cp.
-    view.cp_replicated_sequence = True
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
+    _configure_encoder_cp(view, config)
     return view
+
+
+def _configure_encoder_cp(view, config):
+    """Pick the encoder's CP layout (inert at CP=1).
+
+    * default: the encoder is replicated across CP -- every rank holds the
+      whole sequence, so whatever scales a per-rank statistic by cp (aux-loss
+      denominator, probs gather, KV gather) must see ``cp_replicated_sequence``.
+    * ``hyperencoder_cp_shard``: the trunk is a CP region like the decoder. The
+      frontend scatters the packed sequence, the trunk runs
+      ``flashmask_attention_cp`` on the global (LTS, UTE) row indices, the
+      bridge gathers back. The pad is widened to a multiple of ``2*cp``.
+
+    Only the layouts whose CP math was checked against the replicated encoder
+    are accepted; everything else fails here rather than training silently
+    wrong.
+    """
+    cp = config.context_parallel_size or 1
+    shard = bool(config.encoder_config.hyperencoder_cp_shard) and cp > 1
+    view.hyperencoder_cp_shard = shard
+    view.cp_replicated_sequence = not shard
+    if not shard:
+        return
+    from paddlefleet.models.hyperencoder.attn_backend import use_packed_decoder
+
+    mode = config.cp_balance_mode
+    # Runtime switches may be setattr'd after __init__, so re-check here.
+    if not use_packed_decoder(view):
+        raise ValueError(
+            "hyperencoder_cp_shard needs the packed flashmask encoder "
+            "(hyperencoder_attn_backend='flashmask', "
+            "hyperencoder_packed_decoder=True)."
+        )
+    if mode not in ("dualchunk_allgather", "contiguous_allgather"):
+        raise ValueError(
+            "hyperencoder_cp_shard needs cp_balance_mode 'dualchunk_allgather' "
+            f"or 'contiguous_allgather', got {mode!r}."
+        )
+    # The encoder derives sequence_parallel from TP: a second sequence split
+    # on top of CP that has not been checked yet.
+    if view.tensor_model_parallel_size > 1:
+        raise NotImplementedError("hyperencoder_cp_shard with TP > 1.")
+    if view.moe_router_load_balancing_type != "seq_aux_loss":
+        raise NotImplementedError(
+            "hyperencoder_cp_shard needs moe_router_load_balancing_type="
+            f"'seq_aux_loss', got {view.moe_router_load_balancing_type!r}."
+        )
+    # The overlapped FlashMask CP kernel only takes a local length in
+    # {4096, ..., 131072}, while the packed encoder length varies per batch
+    # (padded to seq_align only), and its CP math was not checked here.
+    if getattr(config, "flashmask_cp_overlap", False):
+        raise NotImplementedError(
+            "hyperencoder_cp_shard with flashmask_cp_overlap=True."
+        )
+    view.cp_balance_mode = mode
+    view.flashmask_cp_overlap = False
+    # The scatter cuts 2*cp chunks; FlashMask CP also needs an even local length.
+    view.hyperencoder_seq_align = math.lcm(view.hyperencoder_seq_align, 2 * cp)
 
 
 def _is_moe_expert_param(p):
@@ -1190,8 +1264,8 @@ def _is_moe_expert_param(p):
     return isinstance(color, dict) and color.get("color") == "moe_expert"
 
 
-def _mark_encoder_region(model):
-    """Mark the encoder region for the CP grad scale.
+def _mark_encoder_region(model, encoder_view):
+    """Mark the replicated part of the encoder for the CP grad scale.
 
     - MoE expert params -> `expert_cp_replicated` (their grad is inflated by cp;
       the trainer divides it by cp).
@@ -1200,19 +1274,24 @@ def _mark_encoder_region(model):
 
     Inert at CP=1 (the scale is skipped entirely), so it is safe to run
     unconditionally. The encoder region is every sequential layer whose name
-    prefix starts with "encoder".
+    prefix starts with "encoder". Under ``hyperencoder_cp_shard`` the trunk
+    ("encoder.layers.*") holds per-rank partial grads like the decoder and keeps
+    the default CP handling; frontend and bridge stay replicated (the scatter /
+    gather backward hands them the full grad) and stay marked.
     """
     from paddlefleet.context_parallel_utils import (
         mark_context_parallel_parameter_disable_scale_grad,
     )
 
+    sharded = ("encoder.layers.",) if encoder_view.hyperencoder_cp_shard else ()
     prefixes = model.get_sequential_name_prefixes()
     assert len(model.run_function) == len(prefixes), (
         "layer/prefix count mismatch — PipelineLayer grouped the layers "
         "(use_cudagraph=True?). The index alignment below would mis-mark."
     )
     for i, layer in enumerate(model.run_function):
-        if not prefixes.get(str(i), "").startswith("encoder"):
+        prefix = prefixes.get(str(i), "")
+        if not prefix.startswith("encoder") or prefix.startswith(sharded):
             continue
         for p in layer.parameters():
             if _is_moe_expert_param(p):
@@ -1328,7 +1407,7 @@ def build_hyperbody_unified_model(
         num_stages=num_stages,
         seg_method="layer:TransformerLayer|EmptyLayer",
     )
-    _mark_encoder_region(model)
+    _mark_encoder_region(model, encoder_view)
     return model
 
 

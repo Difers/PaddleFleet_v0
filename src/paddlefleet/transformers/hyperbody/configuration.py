@@ -304,6 +304,9 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         hyperencoder_seq_align: int = 128,
         hyperencoder_attn_backend: str = "dp",
         hyperencoder_packed_decoder: bool = False,
+        # Shard the packed encoder trunk over CP (flashmask only). Off: every CP
+        # rank runs the whole encoder sequence (cp_replicated_sequence).
+        hyperencoder_cp_shard: bool = False,
         # Encoder-only MoE aux loss, independent of the global coef (the decoder
         # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
         # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
@@ -371,6 +374,13 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         self.hyperencoder_seq_align = int(hyperencoder_seq_align)
         self.hyperencoder_attn_backend = hyperencoder_attn_backend
         self.hyperencoder_packed_decoder = hyperencoder_packed_decoder
+        self.hyperencoder_cp_shard = bool(hyperencoder_cp_shard)
+        if self.hyperencoder_cp_shard and not bool(hyperencoder_packed_decoder):
+            raise ValueError(
+                "encoder_config.hyperencoder_cp_shard=True requires the packed "
+                "flashmask encoder (hyperencoder_attn_backend='flashmask', "
+                "hyperencoder_packed_decoder=True)."
+            )
         # The two switches move together (see models/hyperencoder/attn_backend):
         # 'flashmask' is the packed path, 'dp' the dense one. Fail at config
         # build time rather than at model build. Case-insensitive to mirror the

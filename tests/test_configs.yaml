@@ -300,6 +300,9 @@ tests:
   - test_case: [tests/multi_card_tests/test_mixed_sharding_optimizer.py]
     products:
       - num_gpus: 2
+  - test_case: [tests/multi_card_tests/test_hyperbody_encoder_cp_shard.py]
+    products:
+      - num_gpus: 4
   # default fallback for remaining multi_card_tests
   - test_case: [tests/multi_card_tests/pipeline_parallel/*.py]
     products:

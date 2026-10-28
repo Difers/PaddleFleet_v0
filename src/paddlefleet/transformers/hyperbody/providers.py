@@ -384,6 +384,8 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
     hyperencoder_attn_backend: str = "dp"
     #: Run the trunk as a single packed call. Must match the ``flashmask`` backend.
     hyperencoder_packed_decoder: bool = False
+    #: Shard the packed trunk over CP (set by HyperBody's ``_configure_encoder_cp``).
+    hyperencoder_cp_shard: bool = False
 
     # No `transform_rules`: `HyperEncoderConfig` field names are exactly the same
     # as on the Fleet side, so none needs renaming.

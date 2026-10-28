@@ -28,9 +28,9 @@ The two switches move together: ``flashmask`` is the packed path and ``dp`` is
 the dense one (:func:`use_packed_decoder` rejects the mixed combinations). Both
 keep the stock ``DotProductAttention`` as ``core_attention`` and differ only in
 which mask is fed and in ``_attn_implementation`` (``eager`` for ``dp``,
-non-eager for ``flashmask``). The encoder is never sharded over CP: every CP
-rank holds the whole sequence (``cp_replicated_sequence``), so
-``DotProductAttention`` runs it with a CP size of 1.
+non-eager for ``flashmask``). The encoder is replicated over CP
+(``cp_replicated_sequence``) unless HyperBody sets ``hyperencoder_cp_shard``
+(flashmask only), which shards the packed trunk over CP.
 """
 
 from __future__ import annotations
