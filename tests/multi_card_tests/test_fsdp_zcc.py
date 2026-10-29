@@ -419,6 +419,9 @@ class TestTrainerFsdpWiring(unittest.TestCase):
             "context_parallel_size": 1,
             "gradient_accumulation_steps": 2,
             "amp_master_grad": False,
+            # take the real defaults so the default path is pinned too
+            "fsdp_prefetch_units": TrainingArguments.fsdp_prefetch_units,
+            "fsdp_comm_unit_size": TrainingArguments.fsdp_comm_unit_size,
         }
         args.update(overrides)
         trainer = Trainer.__new__(Trainer)
@@ -508,7 +511,40 @@ class TestTrainerFsdpWiring(unittest.TestCase):
             mp_policy=None,
             optimizer=trainer.optimizer,
             grad_accum_steps=2,
+            prefetch_units=1,
+            comm_unit_size=None,
         )
+
+    def test_wrap_model_fsdp_prefetch_args(self):
+        # fsdp_* TrainingArguments must reach fully_shard unchanged
+        cases = [
+            ({}, 1, None),
+            ({"fsdp_prefetch_units": 2}, 2, None),
+            ({"fsdp_prefetch_units": 0}, 0, None),
+            ({"fsdp_comm_unit_size": 1 << 20}, 1, 1 << 20),
+            ({"fsdp_comm_unit_size": 0}, 1, 0),
+        ]
+        for overrides, units, size in cases:
+            with self.subTest(**overrides):
+                model = TinyModel()
+                trainer = self._trainer(
+                    model, self._optimizer(model), **overrides
+                )
+                trainer.using_fleet_model = True
+                with (
+                    patch.object(
+                        fleet, "distributed_model", side_effect=lambda m: m
+                    ),
+                    patch(
+                        "paddlefleet.trainer.trainer.fully_shard",
+                        side_effect=lambda m, **kwargs: m,
+                    ) as shard,
+                ):
+                    trainer._wrap_model(model, training=True)
+
+                kwargs = shard.call_args.kwargs
+                self.assertEqual(kwargs["prefetch_units"], units)
+                self.assertEqual(kwargs["comm_unit_size"], size)
 
     def test_wrap_model_sharding_stage1_without_pipeline(self):
         model = TinyModel()

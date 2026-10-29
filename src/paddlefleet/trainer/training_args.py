@@ -776,6 +776,26 @@ class TrainingArguments:
         },
     )
 
+    fsdp_prefetch_units: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Only for `sharding fsdp`. Number of FSDP units all_gathered ahead (prefetch by layer); "
+                "0 disables prefetch. Ignored when `fsdp_comm_unit_size` is set."
+            )
+        },
+    )
+    fsdp_comm_unit_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Only for `sharding fsdp`. If set, prefetch by size: params are all_gathered "
+                "`fsdp_comm_unit_size // 2` elements ahead and at most `fsdp_comm_unit_size` grad elements stay in "
+                "reduce_scatter; 0 disables prefetch. Default None, i.e. prefetch by layer."
+            )
+        },
+    )
+
     dsa_indexer_loss_coeff: float = field(
         default=0.0,
         metadata={

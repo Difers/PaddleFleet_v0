@@ -5821,6 +5821,8 @@ class Trainer:
                     mp_policy=fsdp_mp_policy,
                     optimizer=self.optimizer,
                     grad_accum_steps=self.args.gradient_accumulation_steps,
+                    prefetch_units=self.args.fsdp_prefetch_units,
+                    comm_unit_size=self.args.fsdp_comm_unit_size,
                 )
             else:
                 self.optimizer = self._wrap_distributed_optimizer(
