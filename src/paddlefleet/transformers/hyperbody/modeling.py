@@ -71,6 +71,11 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_layers_spec,
     get_gpt_spec,
 )
+from paddlefleet.models.gpt.aoa_multi_tower import (
+    AOATower,
+    gen_multi_tower_aoa,
+    gen_multi_tower_inv_aoa,
+)
 from paddlefleet.models.hyperbody import (
     MlpProjector,
     get_hyperbody_decoder_layer_specs,
@@ -914,6 +919,9 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
 
     def __init__(self, sublayers_spec, **kwargs) -> None:
         self.config = kwargs["config"]
+        # The encoder region's provider view; modular AOA needs one context per
+        # region and this is the only handle on the encoder's.
+        self._encoder_view = kwargs.pop("encoder_view", None)
         pp = self.config.pipeline_model_parallel_size
         # single(logical) <-> pipeline(numeric) key maps, built lazily by
         # ``_set_pipeline_name_mapping`` (mirrors GPTModel / PipelinePretrainedModel).
@@ -1116,6 +1124,154 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
         self._single_to_pp_mapping = single_to_pp
         self._pp_to_single_mapping = pp_to_single
         return single_to_pp
+
+    # Modular AOA: this model is multi-tower. The identity fallback strips
+    # exactly one model root and this model has two (``encoder.*`` and
+    # ``model.*``), so it declares one tower per region. Deliberately no
+    # ``_model_name_prefix()``: a two-root model cannot answer "the one root".
+
+    def _aoa_unit_region(self, structured_prefix: str) -> str:
+        """The ``name_prefix`` the live unit at ``structured_prefix`` was named
+        with. ``_iter_pipeline_units`` hands out a numeric slot (``"44."``) or
+        ``"shared_layers.<key>."``; a third shape means the pipeline grouped
+        the layers differently, which the partition must not guess at.
+        """
+        key = structured_prefix.rstrip(".")
+        prefixes = self.get_sequential_name_prefixes()
+        if key in prefixes:
+            return prefixes[key]
+        container, _, shared_key = key.partition(".")
+        if container == "shared_layers" and shared_key:
+            return self._shared_layer_prefix(shared_key)
+        raise RuntimeError(
+            f"AOA tower partition cannot place the live unit "
+            f"{structured_prefix!r}: not a sequential slot or shared layer."
+        )
+
+    def _aoa_mtp_fan_out(self) -> dict[str, str]:
+        """``{model layer prefix: checkpoint layer prefix}`` for MTP warm-start:
+        an archive with fewer MTP depths warm-starts the extra depths from the
+        last depth it has, so those layers read a *different* checkpoint layer
+        than they are named after. Empty unless the trainer put
+        ``source_mtp_layers`` on the config.
+        """
+        source = getattr(self.config, "source_mtp_layers", None)
+        depth = _get_effective_mtp_layers(self.config)
+        if source is None or not 0 < source < depth:
+            return {}
+        first = self.config.num_hidden_layers
+        checkpoint_prefix = f"model.layers.{first + source - 1}"
+        fan_out = {
+            f"model.layers.{first + index}": checkpoint_prefix
+            for index in range(source, depth)
+        }
+        missing = set(fan_out) - set(
+            self.get_sequential_name_prefixes().values()
+        )
+        if missing:
+            raise RuntimeError(
+                f"MTP warm-start expects MTP layers named {sorted(missing)}, "
+                f"which no pipeline layer carries; the numbering changed."
+            )
+        return fan_out
+
+    def _aoa_towers(self, *, fan_out_mtp: bool):
+        """One tower per differently-rooted region, plus the MTP fan-out ones.
+
+        ``fan_out_mtp`` is set only for checkpoint->model: on export every
+        depth keeps its own name, so redirecting would write several model
+        tensors to one archive key and drop the extra depths.
+        """
+        fan_out = self._aoa_mtp_fan_out() if fan_out_mtp else {}
+        region_of = self._aoa_unit_region
+        mapping = getattr(self.config, "aoa_checkpoint_name_mapping", None)
+        towers = [
+            AOATower(
+                model_name_prefix="encoder",
+                config=self._encoder_view,
+                owns_unit=lambda p: region_of(p).split(".")[0] == "encoder",
+            ),
+            AOATower(
+                model_name_prefix="model",
+                config=self.config,
+                # A fanned-out layer is owned by its own tower below, and every
+                # live unit must belong to exactly one.
+                owns_unit=lambda p: region_of(p).split(".")[0] == "model"
+                and region_of(p) not in fan_out,
+            ),
+        ]
+        towers += [
+            AOATower(
+                model_name_prefix=model_prefix,
+                config=self.config,
+                owns_unit=lambda p, root=model_prefix: region_of(p) == root,
+                checkpoint_name_prefix=checkpoint_prefix,
+                checkpoint_name_mapping=_instantiate_layer_mapping(
+                    mapping, model_prefix, checkpoint_prefix
+                ),
+                # Several depths read this one checkpoint layer, and so does the
+                # depth named after it.
+                shares_checkpoint_root=True,
+            )
+            for model_prefix, checkpoint_prefix in fan_out.items()
+        ]
+        return towers
+
+    def _reject_unsupported_aoa_branches(self):
+        """Fail loudly on the configurations the modular path cannot express:
+        each needs the hand-written generator's "create this target from
+        nothing" statements. Checked here rather than in the constructor so a
+        model built for the hand-written path is unaffected.
+        """
+        config = self.config
+        for field, bad_value, what in (
+            ("indexer_init_from_scratch", True, "a from-scratch DSA indexer"),
+            ("topk_method", "quantile_balancing", "quantile-balancing bins"),
+            ("tie_word_embeddings", True, "tied output multimax buffers"),
+        ):
+            if getattr(config, field, None) == bad_value:
+                raise NotImplementedError(
+                    f"modular AOA does not support {field}={bad_value!r}: "
+                    f"{what} has no checkpoint source."
+                )
+        if self._encoder_view is None:
+            raise RuntimeError(
+                "modular AOA needs the encoder provider view that "
+                "build_hyperbody_unified_model passes to this layer."
+            )
+        # Without a name mapping the names would quietly resolve through the
+        # identity fallback and produce keys this archive does not have. Both
+        # mappings are an erniebot archive convention, not a Fleet one, so the
+        # erniebot bridge declares them.
+        variant = getattr(config, "experimental_attention_variant", None)
+        if variant == "dsv4_hybrid" and not getattr(
+            config, "aoa_checkpoint_name_mapping", None
+        ):
+            raise RuntimeError(
+                "modular AOA for the dsv4_hybrid decoder needs "
+                "aoa_checkpoint_name_mapping on the decoder view."
+            )
+        if not getattr(self._encoder_view, "aoa_checkpoint_name_mapping", None):
+            raise RuntimeError(
+                "modular AOA needs aoa_checkpoint_name_mapping on the encoder "
+                "view, forwarded by _build_encoder_view from HyperBodyConfig."
+            )
+
+    def gen_aoa_statements(self, config=None):
+        """Whole-model checkpoint->model entry. ``config`` is accepted for the
+        single-tower signature and ignored: the trainer's handle is the decoder
+        view, while each region needs its own, and the towers carry both.
+        """
+        self._reject_unsupported_aoa_branches()
+        return gen_multi_tower_aoa(self, self._aoa_towers(fan_out_mtp=True))
+
+    def gen_inv_aoa_statements(self, config=None):
+        """Whole-model model->checkpoint entry; mirror of the above, except
+        that every MTP depth exports under its own name."""
+        self._reject_unsupported_aoa_branches()
+        return gen_multi_tower_inv_aoa(
+            self, self._aoa_towers(fan_out_mtp=False)
+        )
 
     def state_dict(self, *args, **kwargs):
         sd = super().state_dict(*args, **kwargs)
@@ -1330,6 +1486,17 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     # metrics to ``<monitor>_enc/...``; see internal_medicine LayerId.
     view.metric_layer_region = "enc"
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
+    # AOA declarations for the encoder region: the field list above is explicit,
+    # so nothing reaches the view unless it is forwarded here. The two name
+    # fields are what modular AOA reads off this region's context;
+    # ``projector_cold_start`` is read by the bridge, which lives in it.
+    view.aoa_checkpoint_name_prefix = getattr(
+        config, "encoder_aoa_checkpoint_name_prefix", None
+    )
+    view.aoa_checkpoint_name_mapping = getattr(
+        config, "encoder_aoa_checkpoint_name_mapping", None
+    )
+    view.projector_cold_start = getattr(config, "projector_cold_start", False)
     _configure_encoder_cp(view, config)
     return view
 
@@ -1432,6 +1599,24 @@ def _configure_encoder_cp(view, config):
     view.flashmask_cp_overlap = False
     # The scatter cuts 2*cp chunks; FlashMask CP also needs an even local length.
     view.hyperencoder_seq_align = math.lcm(view.hyperencoder_seq_align, 2 * cp)
+
+
+def _instantiate_layer_mapping(mapping, model_prefix, checkpoint_prefix):
+    """The layer-scoped name mapping entries, pinned to one concrete layer pair.
+
+    A fanned-out MTP tower is rooted at its own layer but reads another one, so
+    ``$LAYER_ID`` needs a different number on each side -- which one template
+    cannot express. Entries outside a layer are dropped: this tower does not
+    own them. ``$EXPERT_ID`` is left alone, still captured by its key.
+    """
+    layer = "model.layers.$LAYER_ID"
+    return {
+        key.replace(layer, model_prefix): value.replace(
+            layer, checkpoint_prefix
+        )
+        for key, value in (mapping or {}).items()
+        if layer in key
+    }
 
 
 def _is_moe_expert_param(p):
@@ -1943,7 +2128,13 @@ def build_hyperbody_unified_model(
 
     root = LayerSpec(
         HyperBodyUnifiedModel,
-        extra_kwargs={"config": decoder_view, "tie_word_embeddings": False},
+        extra_kwargs={
+            "config": decoder_view,
+            "tie_word_embeddings": False,
+            # Modular AOA builds one context per region, so the layer keeps the
+            # encoder view too.
+            "encoder_view": encoder_view,
+        },
         sublayers_spec=sublayers_spec,
     )
     model = build_spec_layer(

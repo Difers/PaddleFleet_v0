@@ -503,6 +503,13 @@ class HyperBodyConfig(PretrainedConfig):
         # Keeps the decoder routers' ``multimodal_e_score_correction_bias`` at
         # its zero init; also set for an archive predating that buffer.
         multimodal_bias_cold_start: bool = False,
+        # MTP depths the warm-start archive has, set by the erniebot trainer
+        # when it has fewer than the model; None = it has every depth.
+        source_mtp_layers: int | None = None,
+        # The encoder region's modular AOA name declarations, forwarded to the
+        # encoder view as its ``aoa_checkpoint_name_{prefix,mapping}``.
+        encoder_aoa_checkpoint_name_prefix: str | None = None,
+        encoder_aoa_checkpoint_name_mapping: dict | None = None,
         # ===================== GLOBAL: routed llm_meta (via super) =====================
         # architecture switches (both regions; encoder provider re-pins its own)
         multi_latent_attention: bool = False,
@@ -572,6 +579,13 @@ class HyperBodyConfig(PretrainedConfig):
         self.pp_seg_method = pp_seg_method
         self.projector_cold_start = projector_cold_start
         self.multimodal_bias_cold_start = multimodal_bias_cold_start
+        self.source_mtp_layers = source_mtp_layers
+        self.encoder_aoa_checkpoint_name_prefix = (
+            encoder_aoa_checkpoint_name_prefix
+        )
+        self.encoder_aoa_checkpoint_name_mapping = (
+            encoder_aoa_checkpoint_name_mapping
+        )
 
         # WARNING: llm_meta fields must go through kwargs so set_expected_keys does
         # not reset them to LlmMetaConfig defaults. This list is IDENTICAL to the
