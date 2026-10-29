@@ -92,7 +92,11 @@ from ...utils.env import (
 from ...utils.fault_tolerance import FC_DUMP_ERROR, PC_DUMP_ERROR
 from ...utils.log import logger
 from ...utils.pdc_sdk import FLASH_DEVICE
-from ..trainer_utils import _get_fsdp_context, _is_muon_sharding_optimizer
+from ..trainer_utils import (
+    _get_fsdp_context,
+    _is_muon_sharding_optimizer,
+    _unwrap_muon_sharding_optimizer,
+)
 from . import reshard as reshard_util
 from .reshard import (
     SHARDING_STRATEGY_V1,
@@ -265,6 +269,93 @@ def _restore_master_weights_from_unified(
     return master_weights
 
 
+def _muon_classify_untracked_params(model, optimizer):
+    """Classify the params the sharding shell skipped, the way it would.
+
+    Frozen params never enter the optimizer, so they are absent from
+    `_local_2d` / `_params_2d_by_color` / `_params_1d`. Run the same
+    color-group, whole-tensor-or-not and owner steps on them so that saving
+    treats them like trainable params. Read-only: no optimizer or param state
+    is touched.
+
+    Owners are always assigned by the greedy `_partition_2d_parameters`, also
+    under `machine_balanced_2d_partition`: they only have to agree within a
+    color group, not with the optimizer.
+
+    Under MixedShardingOptimizer a frozen param has no owning sub-optimizer,
+    so `keep_whole_of` cannot answer; whole-vs-element-wise is read from the
+    MixedInnerOptimizer's full `_param_info_map` instead. This can differ from
+    the group's effective `keep_whole` (e.g. `adamh`, or an explicit
+    `keep_whole: true`); that only changes which ranks write a replica, never
+    whether one is written.
+
+    The per-param info map must cover frozen params too. An entry is kept
+    whole when its `use_muon` or `use_hyperball` is true; an entry without
+    these fields (e.g. a plain `ParamInfo`) is treated as element-wise, which
+    only makes every rank write a replica.
+
+    Returns (local_2d_names, all_2d_names, all_1d_names).
+    """
+    shell = _unwrap_muon_sharding_optimizer(optimizer)
+    shell_name = type(shell).__name__
+    if shell_name == "MuonShardingOptimizer":
+        info_map = shell._muon_param_info_map
+    elif shell_name == "MixedShardingOptimizer":
+        from paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer import (
+            unwrap_mixed_inner,
+        )
+
+        info_map = unwrap_mixed_inner(shell)._param_info_map
+    else:
+        return set(), set(), set()
+
+    tracked = set(p.name for p in shell._params_1d)
+    for color_params in shell._params_2d_by_color.values():
+        tracked.update(p.name for p in color_params)
+    untracked = [p for p in model.parameters() if p.name not in tracked]
+
+    color_to_group_info = type(shell)._build_color_to_group_info_from_params(
+        untracked, shell._hcg.get_sharding_parallel_group()
+    )
+
+    params_2d_by_color = defaultdict(list)
+    all_1d_names = set()
+    for p in untracked:
+        color = getattr(p, "color", -1)
+        color_val = color.get("color", -1) if isinstance(color, dict) else color
+        color_key = None if color_val in (-1, None) else color_val
+
+        param_info = info_map.get(p.name)
+        if param_info is None:
+            raise ValueError(
+                f"Parameter {p.name!r} (shape={list(p.shape)}) has no param "
+                f"info in {shell_name}."
+            )
+        if getattr(param_info, "use_muon", False) or getattr(
+            param_info, "use_hyperball", False
+        ):
+            params_2d_by_color[color_key].append(p)
+        else:
+            all_1d_names.add(p.name)
+
+    local_2d_names = set()
+    all_2d_names = set()
+    for color_key, params_2d in params_2d_by_color.items():
+        group_info = color_to_group_info[color_key]
+        world_size = group_info["world_size"]
+        if world_size <= 1:
+            rank2params = {0: params_2d}
+        else:
+            rank2params = shell._partition_2d_parameters(
+                list(params_2d), world_size
+            )
+        sharding_rank = max(group_info["rank"], 0)
+        local_2d_names.update(p.name for p in rank2params[sharding_rank])
+        all_2d_names.update(p.name for p in params_2d)
+
+    return local_2d_names, all_2d_names, all_1d_names
+
+
 class MuonPerParamStagingBuffer:
     """Staging buffer for Muon params that ZCC would otherwise share one-by-one.
 
@@ -375,10 +466,12 @@ def get_fused_param_mappings(
 
         local_2d_name_to_param = {p.name: p for p in local_2d_params}
 
-        # Third Muon block: map remaining params (e.g. stop_gradient parameters) via
-        # optimizer._parameter_list. Note that persistable registered buffers are NOT in
-        # _parameter_list and would not be mapped here — see the comment in
-        # _muon_manipulate_state_dict() for details.
+        # Third Muon block: map the remaining optimizer params via
+        # optimizer._parameter_list. Frozen params and persistable buffers are
+        # not in it and fall to the per-tensor `unshard_` mapping below. Frozen
+        # params are not staged on purpose: each owns its allocation, and
+        # staging copies every staged param on every save, which with a frozen
+        # backbone would duplicate most of the model on device.
         all_param_by_name = {p.name: p for p in optimizer._parameter_list}
         if hasattr(optimizer, "_origin_parameter_list"):
             for p in optimizer._origin_parameter_list:
@@ -432,9 +525,6 @@ def get_fused_param_mappings(
                 v.get_tensor()._share_cuda()
             )
 
-    # If this assertion fails under Muon, it is likely because the model contains persistable
-    # registered buffers that are included in manipulated_state_dict but cannot be mapped via
-    # optimizer._parameter_list. See the comment in _muon_manipulate_state_dict() for details.
     assert len(manipulated_state_dict) == len(param_mappings), (
         f"manipulated state dict is not fully covered in param mappings, manipulated_state_dict:{manipulated_state_dict.keys()}, param_mappings:{param_mappings.keys()}"
     )
@@ -1297,6 +1387,13 @@ class ZeroCostCheckpointCallback(TrainerCallback):
                 all_2d_names.add(p.name)
         all_1d_names = set(p.name for p in optimizer._params_1d)
 
+        untracked_local_2d, untracked_2d, untracked_1d = (
+            _muon_classify_untracked_params(model, optimizer)
+        )
+        local_2d_names |= untracked_local_2d
+        all_2d_names |= untracked_2d
+        all_1d_names |= untracked_1d
+
         for k, v in state_dict.items():
             if v.name in local_2d_names:
                 filtered[k] = v
@@ -1305,15 +1402,11 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             elif v.name in all_1d_names:
                 filtered[k] = v
             else:
-                # Parameters of type stop_gradient are saved by rank 0 by default.
-                # NOTE: persistable registered buffers (via register_buffer with persistable=True)
-                # also fall into this branch since they appear in model.state_dict() but are not
-                # in _params_2d_by_color or _params_1d. These buffers are NOT in
-                # optimizer._parameter_list, so get_fused_param_mappings() cannot create IPC
-                # mappings for them, which will cause the assertion there to fail. Currently the
-                # models used with Muon do not have persistable registered buffers, so this is
-                # not an issue. If a model with persistable buffers needs Muon + ZCC support,
-                # this branch and get_fused_param_mappings() must be updated accordingly.
+                # Only non-parameter entries get here: stop_gradient params are
+                # classified by _muon_classify_untracked_params() above. They are
+                # saved by rank 0. Persistable registered buffers land here; they are
+                # not in optimizer._parameter_list, so get_fused_param_mappings()
+                # shares them through the per-tensor `unshard_` mapping.
                 if sharding_rank == 0:
                     filtered[k] = v
 
@@ -3311,6 +3404,13 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
             for p in color_params:
                 all_2d_names.add(p.name)
         all_1d_names = set(p.name for p in optimizer._params_1d)
+
+        untracked_local_2d, untracked_2d, untracked_1d = (
+            _muon_classify_untracked_params(model, optimizer)
+        )
+        local_2d_names |= untracked_local_2d
+        all_2d_names |= untracked_2d
+        all_1d_names |= untracked_1d
 
         filtered = OrderedDict()
         for k, sw in sharded_state_dict.items():

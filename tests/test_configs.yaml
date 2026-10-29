@@ -283,6 +283,12 @@ tests:
   - test_case: [tests/multi_card_tests/test_zcc_ema_reshard_layout.py]
     products:
       - num_gpus: 4
+  # ZCC model_state with every param frozen under MuonShardingOptimizer: one
+  # replicated 2D param per rank to own and one expert shard per rank (EP on
+  # the sharding axis), so 4 ranks.
+  - test_case: [tests/multi_card_tests/test_zcc_frozen_params_round_trip.py]
+    products:
+      - num_gpus: 4
   - test_case: [tests/multi_card_tests/test_fsdp_zcc.py]
     products:
       - num_gpus: 2
