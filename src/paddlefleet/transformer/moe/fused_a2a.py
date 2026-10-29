@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import inspect
-import os
 import queue
 
 import paddle
@@ -63,7 +62,9 @@ else:
 
 _buffer = None
 _hybrid_ep_buffer = None
-_EP_BARRIER_ASYNC = None
+_EP_BARRIER_ASYNC = True
+# True after a DeepEP op with async_finish=True until the next device barrier.
+_ep_async_comm_pending = False
 _ep_fence_tensors = {}
 
 # HybridEP dispatch/combine kernels use 128-token chunks to align with default
@@ -86,24 +87,38 @@ _SONIC_PACK_SCALE_WORDS_AVAILABLE = _supports_sonic_scale_word_packing(
 
 
 def barrier_ep(ep_group):
-    """barrier_ep"""
-    if _ep_barrier_async_enabled():
+    """barrier_ep
+
+    Uses the stream-ordered fence only when ``moe_ep_barrier_async`` is on and
+    no DeepEP op issued with ``async_finish=True`` is still unsynchronized.
+    The fence only orders calc-stream work, so an async op still running on
+    the DeepEP comm stream could keep using the shared ``_buffer`` past it;
+    in that case fall back to the device-wide barrier, which also drains it.
+    """
+    global _ep_async_comm_pending
+    if _EP_BARRIER_ASYNC and not _ep_async_comm_pending:
         _stream_ordered_fence_ep(ep_group)
     else:
         paddle.distributed.barrier(ep_group)
+        _ep_async_comm_pending = False
 
 
-def _ep_barrier_async_enabled():
-    """Opt-in switch for the stream-ordered EP fence.
+def _mark_ep_async_comm(async_finish):
+    """Record that a DeepEP op may still run on the comm stream."""
+    global _ep_async_comm_pending
+    if async_finish:
+        _ep_async_comm_pending = True
 
-    Only valid while every DeepEP dispatch/combine is issued with
-    ``async_finish=False`` (the default), i.e. DeepEP work is joined back into
-    the calc stream before the next fence is enqueued.
+
+def configure_ep_barrier(moe_ep_barrier_async: bool):
+    """Select the EP barrier implementation from ``moe_ep_barrier_async``.
+
+    Process-wide, like ``configure_buffer``: the barrier protects the shared
+    module-level DeepEP ``_buffer``. Even when enabled, ``barrier_ep`` falls
+    back to the device barrier after any ``async_finish=True`` DeepEP op.
     """
     global _EP_BARRIER_ASYNC
-    if _EP_BARRIER_ASYNC is None:
-        _EP_BARRIER_ASYNC = os.getenv("FLEET_MOE_EP_BARRIER_ASYNC", "0") == "1"
-    return _EP_BARRIER_ASYNC
+    _EP_BARRIER_ASYNC = moe_ep_barrier_async
 
 
 def _ep_fence_tensor(ep_group):
@@ -460,6 +475,7 @@ def fused_dispatch_forward_func(
     states["tokens_per_expert"] = num_recv_tokens_per_expert_list
     states["handle"] = handle
 
+    _mark_ep_async_comm(async_finish)
     return recv_x, recv_token_probs, states, event
 
 
@@ -487,6 +503,7 @@ def fused_dispatch_backward_func(
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
     )
+    _mark_ep_async_comm(async_finish)
     return grad_x, None, grad_token_probs
 
 
@@ -512,6 +529,7 @@ def fused_combine_forward_func(
         previous_event=previous_event,
         allocate_on_comm_stream=allocate_on_comm_stream,
     )
+    _mark_ep_async_comm(async_finish)
     return combined_x
 
 
@@ -546,6 +564,7 @@ def fused_combine_backward_func(
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+    _mark_ep_async_comm(async_finish)
     return grad_x
 
 

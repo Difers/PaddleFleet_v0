@@ -77,7 +77,7 @@ from .fp8_utils import (
     fused_stack_quant_without_cache,
     mxfp4_stack_quant_without_cache,
 )
-from .fused_a2a import configure_buffer
+from .fused_a2a import configure_buffer, configure_ep_barrier
 from .fusion_layer_utils import (
     FusionMoePyLayer,
     HybridEPMoePyLayer,
@@ -471,6 +471,8 @@ class MoELayer(nn.Layer):
                 )
                 self.moe_deep_gemm = False
         self.moe_ep_barrier = config.moe_ep_barrier
+        # Process-wide switch read by the DeepEP barrier in fused_a2a.
+        configure_ep_barrier(config.moe_ep_barrier_async)
 
         # Latent MoE initialization
         self.use_latent_moe = (

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import random
 import time
 import unittest
@@ -146,7 +145,8 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         self._reset_fence_state()
 
     def _reset_fence_state(self):
-        fused_a2a._EP_BARRIER_ASYNC = None
+        fused_a2a.configure_ep_barrier(True)
+        fused_a2a._ep_async_comm_pending = False
         fused_a2a._ep_fence_tensors.clear()
 
     def test_fence_tensor_is_cached_per_group(self):
@@ -186,59 +186,56 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             after.numpy(), np.full([4], expected, dtype="float32")
         )
 
-    def _run_deepep_rounds(self, async_barrier):
+    def _run_deepep_rounds(self, async_barrier, async_finish=False):
         ep_rank = paddle.distributed.get_rank(self.ep_group)
         num_experts = self.ep_group.nranks * 2
         num_tokens, hidden_size, topk = 64, 128, 2
         outputs = []
 
-        with patch.dict(
-            os.environ,
-            {"FLEET_MOE_EP_BARRIER_ASYNC": "1" if async_barrier else "0"},
-        ):
-            fused_a2a._EP_BARRIER_ASYNC = None
-            for round_id in range(2):
-                values = np.arange(num_tokens * hidden_size, dtype="float32")
-                values = values.reshape(num_tokens, hidden_size)
-                values = values / (num_tokens * hidden_size)
-                values += ep_rank * 10 + round_id
-                x = paddle.to_tensor(values, dtype=paddle.bfloat16)
-                token_indices = paddle.to_tensor(
+        fused_a2a.configure_ep_barrier(async_barrier)
+        for round_id in range(2):
+            values = np.arange(num_tokens * hidden_size, dtype="float32")
+            values = values.reshape(num_tokens, hidden_size)
+            values = values / (num_tokens * hidden_size)
+            values += ep_rank * 10 + round_id
+            x = paddle.to_tensor(values, dtype=paddle.bfloat16)
+            token_indices = paddle.to_tensor(
+                [
                     [
-                        [
-                            (token_id + ep_rank + round_id) % num_experts,
-                            (
-                                token_id
-                                + ep_rank
-                                + round_id
-                                + self.ep_group.nranks
-                            )
-                            % num_experts,
-                        ]
-                        for token_id in range(num_tokens)
-                    ],
-                    dtype="int64",
-                )
-                token_probs = paddle.full(
-                    [num_tokens, topk], 1.0 / topk, dtype="float32"
-                )
+                        (token_id + ep_rank + round_id) % num_experts,
+                        (token_id + ep_rank + round_id + self.ep_group.nranks)
+                        % num_experts,
+                    ]
+                    for token_id in range(num_tokens)
+                ],
+                dtype="int64",
+            )
+            token_probs = paddle.full(
+                [num_tokens, topk], 1.0 / topk, dtype="float32"
+            )
 
-                dispatched_x, _, states, _ = fused_a2a.fused_dispatch(
-                    x,
-                    token_indices,
-                    token_probs,
-                    num_experts,
+            dispatched_x, _, states, _ = fused_a2a.fused_dispatch(
+                x,
+                token_indices,
+                token_probs,
+                num_experts,
+                self.ep_group,
+                async_finish=async_finish,
+            )
+            if async_finish:
+                # Overlap-scheduler style: the dispatch is still on the comm
+                # stream here; the next barrier_ep must not be the fence.
+                self.assertTrue(fused_a2a._ep_async_comm_pending)
+                fused_a2a.wait_for_deepep(self.ep_group.id)
+            if round_id == 0 and ep_rank == self.ep_group.nranks - 1:
+                time.sleep(0.5)
+            outputs.append(
+                fused_a2a.fused_combine(
+                    dispatched_x,
                     self.ep_group,
+                    states["handle"],
                 )
-                if round_id == 0 and ep_rank == self.ep_group.nranks - 1:
-                    time.sleep(0.5)
-                outputs.append(
-                    fused_a2a.fused_combine(
-                        dispatched_x,
-                        self.ep_group,
-                        states["handle"],
-                    )
-                )
+            )
 
         return outputs
 
@@ -264,8 +261,33 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             int(completed_rounds.numpy()[0]), 2 * self.ep_group.nranks
         )
 
-    def test_barrier_ep_uses_device_barrier_by_default(self):
-        fused_a2a._EP_BARRIER_ASYNC = False
+    @unittest.skipUnless(
+        fused_a2a.HAVE_DEEP_EP, "DeepEP is required for stream-order testing"
+    )
+    def test_async_finish_dispatch_matches_sync_barrier(self):
+        """async_finish=True ops under the fence mode must match the device
+        barrier baseline (barrier_ep falls back after async ops)."""
+        baseline = self._run_deepep_rounds(async_barrier=False)
+        paddle.distributed.barrier(self.ep_group)
+        with patch.object(
+            paddle.distributed, "barrier", wraps=paddle.distributed.barrier
+        ) as device_barrier:
+            actual = self._run_deepep_rounds(
+                async_barrier=True, async_finish=True
+            )
+        # One fallback per round: the combine right after each async dispatch.
+        self.assertEqual(device_barrier.call_count, 2)
+        self.assertFalse(fused_a2a._ep_async_comm_pending)
+
+        for round_id, (expected, result) in enumerate(zip(baseline, actual)):
+            np.testing.assert_array_equal(
+                expected.float().numpy(),
+                result.float().numpy(),
+                err_msg=f"DeepEP output differs in round {round_id}",
+            )
+
+    def test_barrier_ep_uses_device_barrier_when_disabled(self):
+        fused_a2a.configure_ep_barrier(False)
         with (
             patch.object(paddle.distributed, "barrier") as device_barrier,
             patch.object(fused_a2a, "_stream_ordered_fence_ep") as fence,
@@ -275,7 +297,7 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         fence.assert_not_called()
 
     def test_barrier_ep_uses_fence_when_enabled(self):
-        fused_a2a._EP_BARRIER_ASYNC = True
+        fused_a2a.configure_ep_barrier(True)
         with (
             patch.object(paddle.distributed, "barrier") as device_barrier,
             patch.object(fused_a2a, "_stream_ordered_fence_ep") as fence,
@@ -283,17 +305,6 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             fused_a2a.barrier_ep(self.ep_group)
         fence.assert_called_once_with(self.ep_group)
         device_barrier.assert_not_called()
-
-    def test_async_flag_reads_env_once(self):
-        with patch.dict(os.environ, {"FLEET_MOE_EP_BARRIER_ASYNC": "1"}):
-            self.assertTrue(fused_a2a._ep_barrier_async_enabled())
-        # Cached: clearing the env afterwards must not flip the switch.
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(fused_a2a._ep_barrier_async_enabled())
-
-        fused_a2a._EP_BARRIER_ASYNC = None
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(fused_a2a._ep_barrier_async_enabled())
 
 
 if __name__ == "__main__":

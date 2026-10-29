@@ -527,6 +527,12 @@ class LlmMetaConfig:
             "Whether to add barrier for MoE expert parallelization communication. Defaults to True.",
         ),
         (
+            "moe_ep_barrier_async",
+            bool,
+            True,
+            "Use a stream-ordered all_reduce fence instead of a host-blocking barrier for the MoE EP barrier. No effect when moe_ep_barrier=False. Defaults to True.",
+        ),
+        (
             "using_sonic_moe",
             bool,
             False,
