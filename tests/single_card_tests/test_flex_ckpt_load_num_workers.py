@@ -35,6 +35,11 @@ pinned down here:
      EMA state, model state and the ZCC EMA reshard) only when the knob is > 1 and the
      installed paddle accepts it; otherwise it keeps the serial read.
 
+The same stub harness also pins down which directory each model parameter is read
+from when resuming from EMA, because ``ema_state`` is an overlay rather than a full
+checkpoint: a frozen bf16 parameter has neither an EMA shadow nor a master weight,
+so it has to come from ``model_state``.
+
 ``_load_flex_checkpoint`` is driven on a stub trainer with ``dist.load_state_dict`` and
 the other collective / IO helpers mocked out, so no process group or GPU is needed.
 """
@@ -164,10 +169,20 @@ class TestEmaReshardAcceptsLoadKwargs(unittest.TestCase):
         self.assertNotIn("num_workers", load.call_args.kwargs)
 
 
-def _fp32_weight():
+def _weight(dtype, stop_gradient):
     return types.SimpleNamespace(
-        local_tensor=types.SimpleNamespace(dtype=paddle.float32)
+        local_tensor=types.SimpleNamespace(
+            dtype=dtype, stop_gradient=stop_gradient
+        )
     )
+
+
+def _fp32_weight(stop_gradient=False):
+    return _weight(paddle.float32, stop_gradient)
+
+
+def _bf16_weight(stop_gradient=False):
+    return _weight(paddle.bfloat16, stop_gradient)
 
 
 def _stub_trainer(**arg_overrides):
@@ -211,7 +226,36 @@ def _stub_trainer(**arg_overrides):
     return harness
 
 
-class TestLoadFlexCheckpointForwardsNumWorkers(unittest.TestCase):
+class _ShardingOptimizerV2Stub:
+    """Stands in for ``DygraphShardingOptimizerV2`` so ``enable_bf16_opt`` can be
+    turned on without building a real sharding optimizer."""
+
+
+def _ema_stub_trainer(**arg_overrides):
+    """EMA-resume stub whose model mixes the three parameter kinds that decide
+    where a weight has to be read from.
+
+    fp32 params have an EMA shadow in ``ema_state``; a trainable bf16 param is
+    cast back from its master weight, which is also in ``ema_state``; a frozen
+    bf16 param has neither, so only ``model_state`` holds it.
+    """
+    harness = _stub_trainer(sharded_model_from_ema=True, **arg_overrides)
+    harness.model.sharded_state_dict = lambda: {
+        "fp32.weight": _fp32_weight(),
+        "fp32.frozen": _fp32_weight(stop_gradient=True),
+        "bf16.trainable": _bf16_weight(),
+        "bf16.frozen": _bf16_weight(stop_gradient=True),
+    }
+    harness.optimizer.sharded_state_dict = lambda _model_sd: {
+        "bf16.trainable.w_0": _fp32_weight(),
+        "bf16.trainable.moment1_0": _fp32_weight(),
+    }
+    return harness
+
+
+class _LoadFlexCheckpointHarness(unittest.TestCase):
+    """Fixture driving the real ``_load_flex_checkpoint`` on the stub trainer."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -262,6 +306,22 @@ class TestLoadFlexCheckpointForwardsNumWorkers(unittest.TestCase):
             else:
                 self.assertEqual(call.kwargs["num_workers"], expected)
 
+    def _enable_bf16_opt(self, harness):
+        """Switch ``enable_bf16_opt`` on and neutralise the master-weight
+        write-back that then runs after the branch under test."""
+        harness.args.bf16 = True
+        harness.optimizer._inner_opt = _ShardingOptimizerV2Stub()
+        harness.optimizer.state_dict = lambda: {"master_weights": {}}
+        harness.model.state_dict = lambda: {}
+        self._patch(
+            trainer_module,
+            "DygraphShardingOptimizerV2",
+            new=_ShardingOptimizerV2Stub,
+        )
+        self._patch(paddle.distributed, "is_initialized", return_value=False)
+
+
+class TestLoadFlexCheckpointForwardsNumWorkers(_LoadFlexCheckpointHarness):
     def test_default_keeps_serial_read(self):
         harness = _stub_trainer()
         Trainer._load_flex_checkpoint(harness, self.ckpt)
@@ -361,14 +421,76 @@ class TestLoadFlexCheckpointForwardsNumWorkers(unittest.TestCase):
         Trainer._load_flex_checkpoint(harness, self.ckpt)
 
         self.assertEqual(
-            self._loaded_paths(), [os.path.join(self.ckpt, EMA_STATE_DIC)]
+            self._loaded_paths(),
+            [
+                os.path.join(self.ckpt, MODEL_STATE_DIC),
+                os.path.join(self.ckpt, EMA_STATE_DIC),
+            ],
         )
+        # The model_state read is collective, so it runs even when this rank
+        # holds nothing frozen -- here it asks for no key at all.
+        self.assertEqual(self.load.call_args_list[0].args[0], {})
         # Both the fp32 model weight and the master weight are read from EMA.
         self.assertEqual(
-            sorted(self.load.call_args.args[0]),
+            sorted(self.load.call_args_list[1].args[0]),
             ["linear.weight", "linear.weight.w_0"],
         )
         self._assert_num_workers(4)
+
+
+class TestEmaResumeReadsFrozenParamsFromModelState(_LoadFlexCheckpointHarness):
+    """``ema_state`` is an overlay on ``model_state``, not a full checkpoint.
+
+    It carries the EMA shadows of the fp32 params plus the EMA of the optimizer
+    master weights. A frozen param is not in the optimizer, so it has no master
+    weight to be cast back from, and a frozen bf16 param is not fp32 either, so
+    no EMA shadow was ever built for it. Since FlexCheckpoint only loads the keys
+    it was asked for, such a param used to keep its initialized value silently.
+    """
+
+    def _calls(self, harness):
+        Trainer._load_flex_checkpoint(harness, self.ckpt)
+        self.assertEqual(
+            self._loaded_paths(),
+            [
+                os.path.join(self.ckpt, MODEL_STATE_DIC),
+                os.path.join(self.ckpt, EMA_STATE_DIC),
+            ],
+        )
+        return self.load.call_args_list
+
+    def test_only_frozen_params_come_from_model_state(self):
+        model_state_call, ema_call = self._calls(_ema_stub_trainer())
+
+        model_state_keys = set(model_state_call.args[0])
+        ema_keys = set(ema_call.args[0])
+        self.assertEqual(model_state_keys, {"bf16.frozen"})
+        self.assertEqual(
+            ema_keys,
+            {"fp32.weight", "fp32.frozen", "bf16.trainable.w_0"},
+        )
+        # Disjoint, so neither read can overwrite the other: the frozen fp32
+        # param stays on its EMA value even though it is frozen too.
+        self.assertFalse(model_state_keys & ema_keys)
+
+    def test_model_state_read_keeps_aoa_config(self):
+        model_state_call, ema_call = self._calls(
+            _ema_stub_trainer(aoa_config="aoa.json")
+        )
+        self.assertEqual(model_state_call.kwargs["aoa_config"], "aoa.json")
+        self.assertEqual(ema_call.kwargs["aoa_config"], "aoa.json")
+
+    def test_model_state_read_drops_aoa_config_under_bf16_opt(self):
+        # Same directory and metadata as the non-EMA model_state read, so it has
+        # to be parsed the same way: that path drops the AOA config once the
+        # bf16 optimizer owns the mapping.
+        harness = _ema_stub_trainer(aoa_config="aoa.json")
+        self._enable_bf16_opt(harness)
+        model_state_call, ema_call = self._calls(harness)
+
+        self.assertEqual(set(model_state_call.args[0]), {"bf16.frozen"})
+        self.assertIsNone(model_state_call.kwargs["aoa_config"])
+        self.assertEqual(ema_call.kwargs["aoa_config"], "aoa.json")
 
 
 if __name__ == "__main__":

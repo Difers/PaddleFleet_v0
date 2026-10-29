@@ -1876,6 +1876,38 @@ class Trainer:
                 for k, v in optimizer_sharded_state_dict.items():
                     if k.endswith(".w_0"):
                         ema_state[k] = v
+                # A frozen param is not in the optimizer, so it has no master
+                # weight to be restored from, and it is not fp32 either, so ZCC
+                # never built an EMA shadow for it: ema_state carries no source
+                # for it at all and it would silently keep its initialized
+                # value. Its value never changes during training, so its EMA
+                # value is the parameter itself -- read it back from
+                # model_state, mirroring the frozen fallback the EMA assembler
+                # applies on the export side.
+                frozen_state = {
+                    k: v
+                    for k, v in model_sharded_state_dict.items()
+                    if v.local_tensor.stop_gradient and k not in ema_state
+                }
+                # NOTE: must stay unconditional -- dist.load_state_dict is
+                # collective here, and a rank holding no frozen param would
+                # otherwise skip it and hang the rest.
+                with _sprof_span(
+                    "load_model_state",
+                    collective=True,
+                    n=len(frozen_state),
+                ):
+                    dist.load_state_dict(
+                        frozen_state,
+                        model_states_path,
+                        aoa_config=(
+                            None if enable_bf16_opt else self.args.aoa_config
+                        ),
+                        offload=self.args.load_via_cpu,
+                        comm_method=flex_ckpt_comm_method,
+                        worker_groups=worker_groups,
+                        **_load_kwargs,
+                    )
                 dist.load_state_dict(
                     ema_state,
                     ema_path,
