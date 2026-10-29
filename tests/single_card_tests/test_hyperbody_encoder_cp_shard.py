@@ -165,6 +165,48 @@ class TestEncoderCpShardConfig(unittest.TestCase):
         view = _view(cp=1, flashmask_cp_overlap=True)
         self.assertFalse(view.hyperencoder_cp_shard)
 
+    def test_marks_aux_by_lm_tokens(self):
+        """Per-token training only flips the aux marker on the encoder view.
+
+        ``calculate_per_token_loss`` itself must NOT reach the encoder: its
+        router aux is a native pack mean over the encoder token pool (context +
+        learned query), which is not the LM supervision pool.
+        """
+        for per_token in (False, True):
+            with self.subTest(per_token=per_token):
+                view = _view(calculate_per_token_loss=per_token)
+                self.assertEqual(
+                    bool(view.hyperencoder_aux_by_lm_tokens), per_token
+                )
+                self.assertFalse(
+                    bool(getattr(view, "calculate_per_token_loss", False))
+                )
+
+    def test_marks_aux_by_lm_tokens_without_cp_shard(self):
+        # The aux correction is a per-token issue, not a CP one: it stays on
+        # when the encoder is replicated (cp=1 here) too.
+        view = _view(cp=1, calculate_per_token_loss=True)
+        self.assertFalse(view.hyperencoder_cp_shard)
+        self.assertTrue(view.hyperencoder_aux_by_lm_tokens)
+
+    def test_rejects_pp_gt1_with_per_token(self):
+        # The encoder aux scale rides a per-forward module stash, correct only
+        # at PP=1 (micro-batches run forward->backward one at a time).
+        with self.assertRaises(AssertionError):
+            _view(calculate_per_token_loss=True, pipeline_model_parallel_size=2)
+
+    def test_rejects_encoder_z_loss_under_per_token(self):
+        # An enabled encoder z-loss would be silently 1/T_global too small.
+        with self.assertRaises(NotImplementedError):
+            _view(
+                calculate_per_token_loss=True,
+                enc={"router_z_loss_coef": 0.01},
+            )
+        # Off (the default) stays allowed.
+        _view(calculate_per_token_loss=True, enc={"router_z_loss_coef": 0.0})
+        # And z-loss itself is fine when per-token is off.
+        _view(calculate_per_token_loss=False, enc={"router_z_loss_coef": 0.01})
+
     def test_widens_seq_align_to_2cp(self):
         view = _view(cp=4, enc={"hyperencoder_seq_align": 12})
         self.assertEqual(view.hyperencoder_seq_align, 24)  # lcm(12, 8)
@@ -204,7 +246,11 @@ def _frontend(cfg):
     return _bare(
         hb.HyperBodyEncoderFrontEnd,
         config=cfg,
+        # Single shared query table (this base has no short/long split).
         query=types.SimpleNamespace(weight=w),
+        # ``_bare`` skips ``__init__`` (which sets ``self.packed`` from the
+        # config) while ``forward`` / ``_forward_text_only`` read it.
+        packed=True,
         _packed_rope=lambda m, seg_lens: paddle.arange(
             sum(seg_lens) * _D, dtype="float32"
         ).reshape([1, sum(seg_lens), 1, _D]),
@@ -460,6 +506,290 @@ class TestGradScaleMarks(unittest.TestCase):
                 self.assertTrue(self._disabled(p))
         for p in layers[4].parameters():
             self.assertFalse(self._disabled(p))
+
+
+# ---- encoder aux under calculate_per_token_loss ---------------------------- #
+def _per_token_enc_cfg():
+    cfg = _enc_cfg(shard=False)
+    cfg.hyperencoder_aux_by_lm_tokens = True
+    return cfg
+
+
+class TestEncoderAuxPerToken(unittest.TestCase):
+    """The encoder router aux stays a native pack mean; per-token training must
+    multiply it by the micro-batch's LM supervision token count (the trainer
+    then divides every grad once by the step's global count ``T_global``)."""
+
+    def test_aux_token_count_is_lm_label_count(self):
+        labels = paddle.to_tensor(
+            [[5, -100, 7, -100], [1, 2, -100, -100]], dtype="int64"
+        )
+        n_mb = _frontend(_per_token_enc_cfg())._lm_aux_token_count(
+            {"labels": labels}
+        )
+        self.assertEqual(float(n_mb), 4.0)
+        # This is exactly the decoder's per-shard ``pt_t_local`` summed over the
+        # CP group, i.e. the micro-batch's contribution to ``T_global``.
+        per_rank = sum(
+            int(
+                (
+                    _local_slice(labels, r, 4, "contiguous_allgather") != -100
+                ).sum()
+            )
+            for r in range(4)
+        )
+        self.assertEqual(float(n_mb), float(per_rank))
+
+    def test_aux_token_count_drops_mtp_lookahead_tail(self):
+        """MTP keeps K lookahead columns in ``labels``; the main head (and
+        ``pt_t_local``/``T_global``) drops them, so ``n_mb`` must drop them too.
+        """
+        labels = paddle.to_tensor(
+            [[1, 2, 3, 4], [5, -100, 7, 8]], dtype="int64"
+        )  # [B, S + K] = [2, 3 + 1] (last col = K=1 lookahead)
+        mask = paddle.zeros([1, 1, 3], dtype="int32")  # [B, K=1, S=3]
+        n_mb = _frontend(_per_token_enc_cfg())._lm_aux_token_count(
+            {"labels": labels, "mtp_hidden_inputs_mask_all": mask}
+        )
+        # main head = labels[:, :-1] = [[1, 2, 3], [5, -100, 7]] -> 3 + 2 = 5 non -100
+        # (the full width would be 4 + 3 = 7, so this proves the K tail is dropped)
+        self.assertEqual(float(n_mb), 5.0)
+
+    def test_aux_token_count_asserts_on_mtp_layout_mismatch(self):
+        # MTP mask must be [B, K, S] with S = labels width - K.
+        labels = paddle.to_tensor([[1, 2, 3]], dtype="int64")  # width 3
+        for bad_seq in (5, 3):  # 5+1 and 3+1 both != 3
+            with self.subTest(mask_seq=bad_seq):
+                bad_mask = paddle.zeros([1, 1, bad_seq], dtype="int32")
+                with self.assertRaises(AssertionError):
+                    _frontend(_per_token_enc_cfg())._lm_aux_token_count(
+                        {
+                            "labels": labels,
+                            "mtp_hidden_inputs_mask_all": bad_mask,
+                        }
+                    )
+
+    def test_aux_token_count_needs_marker_and_labels(self):
+        labels = paddle.to_tensor([[1, -100]], dtype="int64")
+        # Marker unset (per-token off): no scaling.
+        self.assertIsNone(
+            _frontend(_enc_cfg(shard=False))._lm_aux_token_count(
+                {"labels": labels}
+            )
+        )
+        # Marker set but no labels in this micro-batch.
+        self.assertIsNone(
+            _frontend(_per_token_enc_cfg())._lm_aux_token_count({})
+        )
+
+    def _mm_frontend(self):
+        """Frontend whose context builder is a zero [1, _H] stub."""
+        fe = _frontend(_per_token_enc_cfg())
+        object.__setattr__(
+            fe, "_embed_one_context", lambda *a, **k: paddle.zeros([1, _H])
+        )
+        return fe
+
+    @staticmethod
+    def _dec_args(**extra):
+        args = {
+            "input_ids": paddle.zeros([1, 8], dtype="int64"),
+            "labels": paddle.to_tensor([[1, 2, -100, 3]], dtype="int64"),
+            "attn_mask_startend_row_indices": None,
+            "position_ids": None,
+        }
+        args.update(extra)
+        return args
+
+    def test_multimodal_forward_stashes_token_count(self):
+        from paddlefleet.transformer.moe.moe_layer import (
+            get_hyperbody_encoder_aux_n_mb,
+        )
+
+        out = self._mm_frontend().forward(
+            self._dec_args(context_ids=paddle.zeros([1, 4], dtype="int64"))
+        )
+        self.assertNotIn("_hb_text_only", out)
+        self.assertEqual(float(get_hyperbody_encoder_aux_n_mb()), 3.0)
+
+    def test_text_only_forward_stashes_the_lm_token_count(self):
+        """The dummy path reports the batch's LM supervision count.
+
+        The dummy carries no LM tokens of its own, but reporting the batch's
+        count keeps its aux on the same caliber as the non-per-token baseline
+        (``pack_mean x n_mb / T_global``) instead of leaving it ``n_mb``x weak.
+        The alternative -- stashing ``0.0`` to suppress the term outright -- is
+        covered by ``test_zero_scale_suppresses_the_aux``.
+        """
+        from paddlefleet.transformer.moe.moe_layer import (
+            get_hyperbody_encoder_aux_n_mb,
+        )
+
+        out = self._mm_frontend().forward(self._dec_args())
+        self.assertTrue(out["_hb_text_only"])
+        scale = get_hyperbody_encoder_aux_n_mb()
+        self.assertIsNotNone(scale)
+        # _dec_args() labels = [[1, 2, -100, 3]] -> 3 supervised tokens.
+        self.assertEqual(float(scale), 3.0)
+
+    def test_zero_scale_suppresses_the_aux(self):
+        """A stash of ``0.0`` -> aux value 0 and router grad 0 (edge intact).
+
+        This is the "text-only must not train the encoder" option: the
+        ``AddAuxiliaryLoss`` edge stays in the graph, only the contribution is
+        zeroed.
+        """
+        from paddlefleet.transformer.moe.moe_layer import (
+            _hyperbody_encoder_aux_scale,
+            set_hyperbody_encoder_aux_n_mb,
+        )
+        from paddlefleet.transformer.moe.moe_utils import AddAuxiliaryLoss
+
+        cfg = types.SimpleNamespace(hyperencoder_aux_by_lm_tokens=True)
+        set_hyperbody_encoder_aux_n_mb(0.0)
+        try:
+            w = paddle.to_tensor([1.0], stop_gradient=False)
+            aux = _hyperbody_encoder_aux_scale((w * 2.0).sum(), cfg)
+            self.assertEqual(float(aux), 0.0)
+            out = AddAuxiliaryLoss.apply(paddle.zeros([2]) * w, aux)
+            out.sum().backward()
+            self.assertEqual(float(w.grad), 0.0)
+        finally:
+            set_hyperbody_encoder_aux_n_mb(None)
+
+    def test_aux_grad_scales_with_token_count(self):
+        """The stash scale reaches the router grads through ``AddAuxiliaryLoss``.
+
+        The PyLayer back-propagates the aux scalar only (forward is the
+        identity), so scaling the aux value scales exactly the aux gradient --
+        the router's LM gradient branch is untouched.
+        """
+        from paddlefleet.transformer.moe.moe_layer import (
+            _hyperbody_encoder_aux_scale,
+            set_hyperbody_encoder_aux_n_mb,
+        )
+        from paddlefleet.transformer.moe.moe_utils import AddAuxiliaryLoss
+
+        cfg = types.SimpleNamespace(hyperencoder_aux_by_lm_tokens=True)
+
+        def aux_grad(n):
+            set_hyperbody_encoder_aux_n_mb(n)
+            w = paddle.to_tensor([1.0], stop_gradient=False)
+            aux = _hyperbody_encoder_aux_scale((w * 2.0).sum(), cfg)
+            # ``AddAuxiliaryLoss`` needs a grad-carrying activation (forward is
+            # ``x.clone()``, backward returns ``grad_output`` for ``x``).
+            out = AddAuxiliaryLoss.apply(paddle.zeros([2]) * w, aux)
+            out.sum().backward()
+            return float(w.grad)
+
+        try:
+            base = aux_grad(None)
+            self.assertAlmostEqual(
+                aux_grad(paddle.to_tensor(100.0, dtype="float32")),
+                base * 100.0,
+                places=4,
+            )
+            # A python scalar behaves identically.
+            self.assertAlmostEqual(aux_grad(100.0), base * 100.0, places=4)
+            self.assertAlmostEqual(
+                aux_grad(paddle.to_tensor(0.0)), 0.0, places=6
+            )
+            # The text-only dummy path stashes the python scalar 0.0.
+            self.assertEqual(aux_grad(0.0), 0.0)
+        finally:
+            set_hyperbody_encoder_aux_n_mb(None)
+
+    def test_aux_scale_gated_on_encoder_marker(self):
+        """The stash scales only the encoder; the decoder/off marker is a no-op."""
+        from paddlefleet.transformer.moe.moe_layer import (
+            _hyperbody_encoder_aux_scale,
+            set_hyperbody_encoder_aux_n_mb,
+        )
+
+        try:
+            set_hyperbody_encoder_aux_n_mb(paddle.to_tensor(8.0))
+            aux = paddle.to_tensor(2.0)
+            # Marker absent (decoder view) -> identity even with the stash set.
+            dec = types.SimpleNamespace()
+            self.assertEqual(float(_hyperbody_encoder_aux_scale(aux, dec)), 2.0)
+            # Marker on the encoder -> scaled.
+            enc = types.SimpleNamespace(hyperencoder_aux_by_lm_tokens=True)
+            self.assertEqual(
+                float(_hyperbody_encoder_aux_scale(aux, enc)), 16.0
+            )
+            # Stash cleared -> identity.
+            set_hyperbody_encoder_aux_n_mb(None)
+            self.assertEqual(float(_hyperbody_encoder_aux_scale(aux, enc)), 2.0)
+        finally:
+            set_hyperbody_encoder_aux_n_mb(None)
+
+
+class TestAuxScalingAtAttachSite(unittest.TestCase):
+    """``MoELayer`` multiplies the aux by the stash at both attach sites."""
+
+    def _moe(self, marker):
+        from paddlefleet.transformer.moe.moe_layer import MoELayer
+
+        return _bare(
+            MoELayer,
+            config=types.SimpleNamespace(
+                hyperencoder_aux_by_lm_tokens=marker,
+            ),
+            router_aux_loss_coef=1.0,
+            training=True,
+        )
+
+    def _attach_grad(self, moe, n):
+        from paddlefleet.transformer.moe.moe_layer import (
+            set_hyperbody_encoder_aux_n_mb,
+        )
+        from paddlefleet.transformer.moe.moe_utils import AddAuxiliaryLoss
+
+        set_hyperbody_encoder_aux_n_mb(n)
+        w = paddle.to_tensor([1.0], stop_gradient=False)
+        aux = (w * 2.0).sum()
+        aux = moe.router_aux_loss_coef * aux
+        from paddlefleet.transformer.moe.moe_layer import (
+            _hyperbody_encoder_aux_scale,
+        )
+
+        aux = _hyperbody_encoder_aux_scale(aux, moe.config)
+        out = AddAuxiliaryLoss.apply(paddle.zeros([2]) * w, aux)
+        out.sum().backward()
+        return float(w.grad)
+
+    def test_encoder_marker_scales_attach(self):
+        try:
+            moe = self._moe(marker=True)
+            base = self._attach_grad(moe, None)
+            self.assertAlmostEqual(
+                self._attach_grad(moe, paddle.to_tensor(50.0)),
+                base * 50.0,
+                places=4,
+            )
+        finally:
+            from paddlefleet.transformer.moe.moe_layer import (
+                set_hyperbody_encoder_aux_n_mb,
+            )
+
+            set_hyperbody_encoder_aux_n_mb(None)
+
+    def test_decoder_marker_ignores_stash(self):
+        from paddlefleet.transformer.moe.moe_layer import (
+            set_hyperbody_encoder_aux_n_mb,
+        )
+
+        try:
+            moe = self._moe(marker=False)
+            set_hyperbody_encoder_aux_n_mb(paddle.to_tensor(50.0))
+            # Even with the stash set, a non-encoder config must not scale.
+            self.assertAlmostEqual(
+                self._attach_grad(moe, paddle.to_tensor(50.0)),
+                self._attach_grad(moe, None),
+                places=6,
+            )
+        finally:
+            set_hyperbody_encoder_aux_n_mb(None)
 
 
 if __name__ == "__main__":

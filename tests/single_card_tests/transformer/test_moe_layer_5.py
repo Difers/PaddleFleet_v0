@@ -166,6 +166,11 @@ class TestAuxLossCompute(_MoEMethodTestBase):
             "shared_experts": None,
             "expert_model_parallel_size": 1,
             "sequence_parallel": False,
+            # ``aux_loss_compute`` reads ``self.config`` for the HyperBody encoder
+            # aux marker (absent here -> identity, i.e. the plain
+            # ``aux * router_aux_loss_coef`` path this file asserts on). A real
+            # ``MoELayer`` always has one (moe_layer.py:351).
+            "config": SimpleNamespace(),
         }
         cfg.update(overrides)
         return SimpleNamespace(**cfg)

@@ -430,7 +430,72 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "attn_mask_startend_row_indices", None
         )
         out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
+        # Stash this forward's LM supervision token count for the encoder MoE
+        # aux scale (see paddlefleet.transformer.moe.moe_layer). A per-forward
+        # module stash, not a dict kwarg: the encoder region is PP=1, so it is
+        # race-free (same rationale as LanguageLoss._cu_seqlens_q_stash), and it
+        # avoids threading a new arg through every TransformerLayer/MoE call site.
+        from paddlefleet.transformer.moe.moe_layer import (
+            set_hyperbody_encoder_aux_n_mb,
+        )
+
+        set_hyperbody_encoder_aux_n_mb(self._lm_aux_token_count(dict_args))
         return _export_decoder_passthrough(out, dict_args)
+
+    def _lm_aux_token_count(self, dict_args):
+        """This micro-batch's LM supervision token count, or ``None``.
+
+        Only set under ``calculate_per_token_loss`` (marker:
+        ``hyperencoder_aux_by_lm_tokens``, see ``_configure_encoder_cp``). The
+        encoder router aux stays a native per-pack mean while the trainer
+        divides every grad once by the step's global supervision token count
+        ``T_global``; multiplying the aux by this micro-batch's share of that
+        count cancels the division and restores the pack mean -- Megatron's
+        ``main_tokens / pack_count``, per micro-batch.
+
+        Sourced from ``labels``, never from ``input_ids``/the encoder length:
+        the encoder's own token pool (context + learned query) is not the LM
+        supervision pool.
+        """
+        if not getattr(self.config, "hyperencoder_aux_by_lm_tokens", False):
+            return None
+        labels = dict_args.get("labels", None)
+        if labels is None:
+            return None
+        # MTP: the packed batch keeps the K lookahead columns in ``labels`` (see
+        # ernie5/src/utils/hyperbody_batch.py), and LanguageLoss's main head drops
+        # them (``labels[:, :-num_mtp]``), so ``pt_t_local`` / ``T_global`` count
+        # the main head only. Drop the same trailing K here so ``n_mb`` is the
+        # micro-batch's exact ``T_global`` contribution. ``mtp_hidden_inputs_mask_all``
+        # is [B, K, S] over the *base* positions when MTP is on (see
+        # multi_token_prediction.py: "mtp_hidden_inputs_mask_all [B, num_nextn, S]")
+        # and None when off, so its seq dim is ``labels width - K``, NOT the
+        # labels width.
+        _mtp_mask = dict_args.get("mtp_hidden_inputs_mask_all", None)
+        if _mtp_mask is not None:
+            assert _mtp_mask.dim() == 3 and labels.dim() == 2, (
+                "HyperBody encoder aux: expected mtp_hidden_inputs_mask_all "
+                f"[B, K, S] and labels [B, S + K], got "
+                f"{tuple(_mtp_mask.shape)} / {tuple(labels.shape)}"
+            )
+            num_nextn = int(_mtp_mask.shape[1])
+            assert int(_mtp_mask.shape[2]) + num_nextn == int(
+                labels.shape[-1]
+            ), (
+                "HyperBody encoder aux: MTP mask seq dim "
+                f"{int(_mtp_mask.shape[2])} + K {num_nextn} != labels width "
+                f"{int(labels.shape[-1])}; expected the [B, S + K] label layout "
+                "whose trailing K columns LanguageLoss drops for the main head"
+            )
+            assert 0 < num_nextn < int(labels.shape[-1]), (
+                f"HyperBody encoder aux: MTP K={num_nextn} leaves no main-head "
+                f"labels (labels width {int(labels.shape[-1])})"
+            )
+            labels = labels[:, :-num_nextn]
+        # -100 is LanguageLoss.ignored_index; under the scatter dataflow the
+        # labels are the global sequence, so this equals the sum of the CP
+        # ranks' per-shard main-head counts for this micro-batch.
+        return (labels != -100).sum().detach().astype("float32")
 
     def _forward_text_only(
         self, dict_args, build_dense_mask, prefix_lm_pad_len
@@ -465,6 +530,20 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "attn_mask_startend_row_indices", None
         )
         out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
+        # The trunk ran on a 1-token zero dummy: no LM supervision tokens map
+        # onto it, so the aux must contribute NOTHING. ``0.0``, not ``None``:
+        # ``None`` means "do not scale", which leaves the native pack mean
+        # unscaled and therefore ``n_mb``x weaker than a token-sum term once the
+        # trainer divides every grad by ``T_global`` -- i.e. the encoder keeps
+        # training on this data-free dummy (exactly the 1/n_mb shortfall seen in
+        # a text-only run). Multiplying by 0.0 makes the value and the gradient
+        # exactly zero while the ``AddAuxiliaryLoss`` edge (and the DeepEP
+        # dispatch/combine symmetry it exists for) stays in the graph.
+        from paddlefleet.transformer.moe.moe_layer import (
+            set_hyperbody_encoder_aux_n_mb,
+        )
+
+        set_hyperbody_encoder_aux_n_mb(self._lm_aux_token_count(dict_args))
         return _export_decoder_passthrough(out, dict_args)
 
     def _forward_dense(
@@ -1266,6 +1345,13 @@ def _configure_encoder_cp(view, config):
       ``flashmask_attention_cp`` on the global (LTS, UTE) row indices, the
       bridge gathers back. The pad is widened to a multiple of ``2*cp``.
 
+    Independent of the CP layout it also sets ``hyperencoder_aux_by_lm_tokens``
+    when the run uses ``calculate_per_token_loss``: the encoder router aux then
+    has to be un-meant by the LM supervision token count (the frontend stashes
+    it via ``set_hyperbody_encoder_aux_n_mb``, the MoE layer multiplies the aux
+    by it, gated on this marker). The flag itself is never forwarded into the
+    encoder view -- see below.
+
     Only the layouts whose CP math was checked against the replicated encoder
     are accepted; everything else fails here rather than training silently
     wrong.
@@ -1274,6 +1360,41 @@ def _configure_encoder_cp(view, config):
     shard = bool(config.encoder_config.hyperencoder_cp_shard) and cp > 1
     view.hyperencoder_cp_shard = shard
     view.cp_replicated_sequence = not shard
+    # ``calculate_per_token_loss`` is deliberately NOT forwarded into the
+    # encoder view: the encoder router must keep ``per_token=False`` (its aux is
+    # a native pack mean over a token pool -- context + learned query -- that is
+    # not the LM supervision pool, so a raw-sum path would normalize by the
+    # wrong count). The frontend instead scales the aux by this micro-batch's LM
+    # supervision token count, which cancels the trainer's global 1/T_global.
+    view.hyperencoder_aux_by_lm_tokens = bool(
+        getattr(config, "calculate_per_token_loss", False)
+    )
+    # The encoder aux scale is carried by a per-forward module stash
+    # (moe_layer._HYPERBODY_ENCODER_AUX_N_MB), which is only correct when
+    # micro-batches run forward->backward one at a time: under PP>1 / interleaved
+    # 1F1B all forwards precede the backwards, so a stale (last micro-batch) value
+    # would be read during an earlier micro-batch's recompute. Disallow it here.
+    if view.hyperencoder_aux_by_lm_tokens:
+        _pp = getattr(config, "pipeline_model_parallel_size", 1) or 1
+        assert _pp == 1, (
+            "HyperBody encoder aux per-token scaling uses a per-forward module "
+            "stash that is only correct with PP=1 (micro-batches run "
+            f"forward->backward one at a time); got PP={_pp}. "
+            "Use graph-threaded scaling if PP>1 is ever supported."
+        )
+    # Encoder z-loss under per-token would be silently 1/T_global too small
+    # (same defect as the aux, and it has no pack-mean reading to restore), so
+    # reject it outright. Check the view (what the encoder router actually
+    # reads) and the user-facing encoder sub-config.
+    _z_coef = getattr(view, "router_z_loss_coef", None) or getattr(
+        config.encoder_config, "router_z_loss_coef", None
+    )
+    if view.hyperencoder_aux_by_lm_tokens and _z_coef:
+        raise NotImplementedError(
+            "calculate_per_token_loss requires encoder "
+            "router_z_loss_coef == 0: the encoder z-loss is not corrected for "
+            f"per-token, got {_z_coef!r}."
+        )
     if not shard:
         return
     from paddlefleet.models.hyperencoder.attn_backend import use_packed_decoder

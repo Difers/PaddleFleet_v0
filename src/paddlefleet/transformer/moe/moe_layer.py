@@ -296,6 +296,66 @@ class MoESublayers:
     mlp_spec: LayerSpec | type = None  # Used by experts
 
 
+# Per-forward HyperBody-encoder aux scale: the LM supervision token count of the
+# current micro-batch, set by the encoder frontend (hyperbody/modeling.py) and
+# consumed at the MoE aux attach site. The encoder router runs a native per-pack
+# mean while the trainer divides every grad once by the step's global LM
+# supervision token count ``T_global``; scaling the aux by this micro-batch's own
+# count (its share of ``T_global``) cancels that division and restores the pack
+# mean -- Megatron's ``main_tokens / pack_count``, per micro-batch. Only
+# ``AddAuxiliaryLoss`` back-propagates the aux scalar, so this is a gradient-only
+# scale that leaves the logged aux value untouched.
+#
+# A module global is race-free here because the HyperBody encoder region is PP=1
+# only: a micro-batch's encoder forward (which sets it) and its backward/recompute
+# (which reads it) complete before the next micro-batch's frontend runs -- the same
+# rationale as ``LanguageLoss._cu_seqlens_q_stash``.
+_HYPERBODY_ENCODER_AUX_N_MB = None
+
+
+def set_hyperbody_encoder_aux_n_mb(value) -> None:
+    """Set this forward's HyperBody-encoder aux scale.
+
+    ``None``  -> do not scale (not an encoder aux, per-token off, or no labels);
+    ``0.0``   -> suppress the term entirely: value 0 and gradient 0. Used by the
+                 text-only dummy, which has no LM supervision tokens and must not
+                 train the encoder, while the attach edge (DeepEP symmetry)
+                 stays in the graph;
+    ``n > 0`` -> the micro-batch's LM supervision token count (pack mean ->
+                 token sum).
+    """
+    global _HYPERBODY_ENCODER_AUX_N_MB
+    _HYPERBODY_ENCODER_AUX_N_MB = value
+
+
+def get_hyperbody_encoder_aux_n_mb():
+    """Return this forward's HyperBody-encoder aux scale (``None`` = no scale)."""
+    return _HYPERBODY_ENCODER_AUX_N_MB
+
+
+def _hyperbody_encoder_aux_scale(aux_loss, config):
+    """Scale the aux for the HyperBody encoder under ``calculate_per_token_loss``.
+
+    Gated on ``config.hyperencoder_aux_by_lm_tokens`` (set only on the encoder
+    view in ``hyperbody/modeling.py::_configure_encoder_cp``), so the decoder --
+    which shares this MoE class and reads the same stash -- is never affected.
+    Returns ``aux_loss`` unchanged for every other region or when the stash is
+    ``None`` (non-per-token, or no labels). A stash of ``0.0`` (text-only dummy)
+    returns a zero aux: ``AddAuxiliaryLoss`` only back-propagates the aux scalar,
+    so ``aux * 0`` carries an exact zero gradient into the router while the
+    PyLayer edge -- and the collectives it must stay symmetric with -- remains.
+    """
+    if not getattr(config, "hyperencoder_aux_by_lm_tokens", False):
+        return aux_loss
+    n = _HYPERBODY_ENCODER_AUX_N_MB
+    if n is None:
+        return aux_loss
+    scale = (
+        n.astype(aux_loss.dtype) if isinstance(n, paddle.Tensor) else float(n)
+    )
+    return aux_loss * scale
+
+
 class MoELayer(nn.Layer):
     def __init__(
         self,
@@ -1887,6 +1947,7 @@ class MoELayer(nn.Layer):
 
         if self.training and self.router_aux_loss_coef and aux_loss is not None:
             aux_loss = aux_loss * float(self.router_aux_loss_coef)
+            aux_loss = _hyperbody_encoder_aux_scale(aux_loss, self.config)
             output = AddAuxiliaryLoss.apply(hidden_states, aux_loss)
         else:
             output = hidden_states
@@ -2174,6 +2235,7 @@ class MoELayer(nn.Layer):
 
         if self.training and self.router_aux_loss_coef and aux_loss is not None:
             aux_loss = aux_loss * float(self.router_aux_loss_coef)
+            aux_loss = _hyperbody_encoder_aux_scale(aux_loss, self.config)
             output = AddAuxiliaryLoss.apply(output, aux_loss)
 
         if self.training and z_loss is not None:

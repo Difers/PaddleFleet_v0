@@ -280,6 +280,9 @@ class TestFrontEndTextOnlyDummy(unittest.TestCase):
 
         frontend = _bare(
             HyperBodyEncoderFrontEnd,
+            # ``_forward_text_only`` reads the aux-scale marker off the encoder
+            # view too; absent here -> ``getattr(..., False)`` -> no scaling.
+            config=_bare(paddle.nn.Layer),
             packed=packed,
             query=_bare(
                 paddle.nn.Layer, weight=paddle.zeros([1, hidden], dtype=dtype)
