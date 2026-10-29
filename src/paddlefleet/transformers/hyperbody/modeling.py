@@ -59,6 +59,7 @@ from paddle.distributed.fleet.meta_parallel import (
     SharedLayerDesc,
     build_spec_layer,
 )
+from paddle.distributed.flex_checkpoint.aoa.generation import resolve_names
 
 from paddlefleet.context_parallel_utils import (
     ContextParallelGatherOp,
@@ -71,10 +72,24 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
     get_gpt_spec,
 )
 from paddlefleet.models.hyperbody import (
+    MlpProjector,
     get_hyperbody_decoder_layer_specs,
     get_hyperbody_encoder_layer_specs,
 )
+from paddlefleet.tensor_parallel.layers import (
+    gen_linear_aoa_statements,
+    gen_linear_inv_aoa_statements,
+)
+from paddlefleet.transformer.hyper_connection import (
+    HyperConnectionContractLayer,
+    HyperConnectionModule,
+)
 from paddlefleet.transformer.layer import FleetLayer
+from paddlefleet.transformer.moe.moe_layer import MoELayer
+from paddlefleet.transformer.moe.moe_router import TopKRouter
+from paddlefleet.transformer.multi_token_prediction import (
+    MultiTokenPredictionLayer,
+)
 
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ..model_utils import PretrainedModel
@@ -169,7 +184,6 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         from paddlefleet.models.hyperbody import (
             AudioEncoderConv,
             ImageEncoderConv,
-            MlpProjector,
         )
         from paddlefleet.models.hyperencoder.attn_backend import (
             use_packed_decoder,
@@ -191,7 +205,9 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             out_chans=256,
         )
         self.audio_encoder = AudioEncoderConv(num_mel_bins=128, embed_dim=768)
-        self.projector = MlpProjector(
+        # HyperBodyMlpProjector, not the base MlpProjector: the archive stores
+        # this leaf transposed (see the subclass).
+        self.projector = HyperBodyMlpProjector(
             {
                 "projector_type": "linear",
                 "input_dim": 768,
@@ -736,6 +752,55 @@ class HyperBodyEncoderBridge(FleetLayer):
             outs.append(self._project(latents))
         return paddle.concat(outs, axis=0)  # [ΣQ_i, H_dec]
 
+    # AOA: a stage-one warm start trains ``out_projector`` from its own init,
+    # so its archive has no projector to read -- ``projector_cold_start`` says
+    # so. Export always states it; ``final_norm`` goes via the base recursion.
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        statements = self.final_norm.gen_aoa_statements(
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}final_norm.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        )
+        projector_statements = gen_linear_aoa_statements(
+            self.out_projector,
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}out_projector.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        )
+        # ``getattr`` default covers a view not forwarding this global knob.
+        if not getattr(ctx.config, "projector_cold_start", False):
+            return statements + projector_statements
+        # Naming no source leaves every projector tensor at its init.
+        return statements + [
+            f"_ -> {statement.rsplit(' -> ', 1)[1]}"
+            for statement in projector_statements
+        ]
+
+    def gen_inv_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        return self.final_norm.gen_inv_aoa_statements(
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}final_norm.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        ) + gen_linear_inv_aoa_statements(
+            self.out_projector,
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}out_projector.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        )
+
 
 # ======================================================================= #
 # Unified PipelineLayer (mirrors GPTModel's get_layer_desc_list mechanics)  #
@@ -928,10 +993,10 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
     # Logical <-> pipeline key mapping (for weight save / flex_ckpt load) #
     # ------------------------------------------------------------------ #
     # ``PipelineLayer`` names its params ``{layer_idx}.rest`` (a bare integer
-    # per sequential slot). ``_gen_aoa_config`` and ``save_pretrained`` speak
-    # LOGICAL names (``encoder.image_encoder.*`` / ``model.layers.i.*`` / ...),
-    # so ``state_dict`` / ``sharded_state_dict`` must remap numeric<->logical
-    # exactly like ``GPTModel`` / ``PipelinePretrainedModel``.
+    # per sequential slot). The modular AOA generation and ``save_pretrained``
+    # speak LOGICAL names (``encoder.image_encoder.*`` / ``model.layers.i.*`` /
+    # ...), so ``state_dict`` / ``sharded_state_dict`` must remap
+    # numeric<->logical exactly like ``GPTModel`` / ``PipelinePretrainedModel``.
     # PP=VPP=1, so an ``{idx}.rest`` key reduces to prefixing with
     # ``get_sequential_name_prefixes()[idx]``. MTP weight sharing registers its
     # pivot under ``shared_layers.{key}.rest`` instead of an integer slot; such a
@@ -1140,10 +1205,10 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         # HyperEncoderProvider dataclass defaults, which diverge from the global
         # HyperBodyConfig values:
         #   * moe_expert_fusion / moe_deep_gemm: the encoder MoE kernel path MUST
-        #     match the decoder. ``_gen_aoa_config`` also keys its encoder branch
-        #     off ``config.moe_expert_fusion`` (same global), so the checkpoint
-        #     weight layout (fused grouped_gemm vs per-expert) stays consistent
-        #     between the two pools.
+        #     match the decoder. The modular AOA generation also keys its encoder
+        #     branch off ``config.moe_expert_fusion`` (same global), so the
+        #     checkpoint weight layout (fused grouped_gemm vs per-expert) stays
+        #     consistent between the two pools.
         #   * router_aux_loss_coef: NOT shared -- the decoder runs noaux_tc at
         #     0.0 while the encoder's softmax/greedy router needs a real aux
         #     loss, so it comes from ``encoder_config`` (default 0.001). Not
@@ -1300,6 +1365,352 @@ def _mark_encoder_region(model, encoder_view):
                 mark_context_parallel_parameter_disable_scale_grad(p)
 
 
+# AOA component overrides: one minimal subclass per divergence between
+# HyperBody's checkpoint layout and what the shared components produce.
+
+# These are held in FP32 while another stack may have written them in its own
+# dtype, and the engine forbids an implicit dtype change.
+_MHC_HEAD_PARAMS = ("hc_head_fn", "hc_head_base", "hc_head_scale")
+
+# Only the encoder region's archive stores the gate as BF16; Fleet keeps it
+# FP32 (``_keep_in_fp32_modules``), and the decoder's archive does too.
+_ENCODER_GATE_CHECKPOINT_DTYPE = "bfloat16"
+
+
+def _dtype_attr(tensor):
+    return str(tensor.dtype).rsplit(".", 1)[-1]
+
+
+def _aoa_names(ctx, structured_name_prefix, local_name, *, drop_segment=None):
+    return resolve_names(
+        local_name,
+        ctx.checkpoint_name_prefix,
+        structured_name_prefix,
+        ctx.pp_to_single_mapping,
+        ctx.checkpoint_name_mapping,
+        model_name_prefix=ctx.model_name_prefix,
+        checkpoint_lookup_drop_segment=drop_segment,
+    )
+
+
+class HyperBodyHyperConnection(HyperConnectionModule):
+    """mHC module carrying HyperBody's checkpoint contract for its tensors.
+
+    Its tensors need the load-direction cast of :data:`_MHC_HEAD_PARAMS`. An
+    MTP block's archive keeps the inner ``transformer_layer`` segment for the
+    two mHC modules while dropping it for the rest of the layer, which no name
+    mapping can express (after the drop the lookup name collides with a plain
+    decoder layer's), so this subtree does not forward
+    ``checkpoint_lookup_drop_segment``; outside an MTP block it is ``None``
+    anyway. ``mapping_proj`` is emitted inline because the Linear family's
+    helper transposes unconditionally and this leaf is not transposed."""
+
+    def _aoa_name_pairs(self, ctx, structured_name_prefix):
+        return [
+            _aoa_names(ctx, structured_name_prefix, local_name)
+            for local_name in self.state_dict(structured_name_prefix="")
+        ]
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        """Checkpoint->model: a cast to the dtype these tensors are held in."""
+        dtype = _dtype_attr(self.alpha_pre)
+        return [
+            f"{checkpoint_name} -> {model_name}, dtype='{dtype}'"
+            for checkpoint_name, model_name in self._aoa_name_pairs(
+                ctx, structured_name_prefix
+            )
+        ]
+
+    def gen_inv_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        """Model->checkpoint, under the name the archive really uses."""
+        return [
+            f"{model_name} -> {checkpoint_name}"
+            for checkpoint_name, model_name in self._aoa_name_pairs(
+                ctx, structured_name_prefix
+            )
+            if checkpoint_name != model_name
+        ]
+
+
+def _gen_mhc_head_cast_statements(layer, ctx, structured_name_prefix):
+    """Load-direction casts for the mHC head parameters ``layer`` owns, the
+    names matching the archive so the base recursion omits them."""
+    statements = []
+    own_tensors = layer.state_dict(
+        structured_name_prefix="", include_sublayers=False
+    )
+    for local_name in own_tensors:
+        if local_name not in _MHC_HEAD_PARAMS:
+            continue
+        checkpoint_name, model_name = _aoa_names(
+            ctx, structured_name_prefix, local_name
+        )
+        dtype = _dtype_attr(getattr(layer, local_name))
+        statements.append(f"{checkpoint_name} -> {model_name}, dtype='{dtype}'")
+    return statements
+
+
+class HyperBodyMhcContract(HyperConnectionContractLayer):
+    """Contract layer whose mHC head carries the load-direction cast. Export
+    needs no override: names and dtype already match the archive."""
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        return super().gen_aoa_statements(
+            ctx,
+            structured_name_prefix=structured_name_prefix,
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        ) + _gen_mhc_head_cast_statements(self, ctx, structured_name_prefix)
+
+
+class HyperBodyMTPLayer(MultiTokenPredictionLayer):
+    """MTP block whose own mHC head carries the load-direction cast; its inner
+    layer's mHC modules are installed separately, by the builder below."""
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        return super().gen_aoa_statements(
+            ctx,
+            structured_name_prefix=structured_name_prefix,
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        ) + _gen_mhc_head_cast_statements(self, ctx, structured_name_prefix)
+
+
+class HyperBodyGateRouter(TopKRouter):
+    """MoE router carrying the archive's contract for the tensors it owns.
+
+    ``multimodal_e_score_correction_bias`` (decoder region only) is read from
+    an archive carrying it and left at its zero init -- naming no source --
+    for one that does not; ``multimodal_bias_cold_start`` says which, and
+    export needs no case, the archive keeping it beside the router. ``weight``
+    is cross-dtype only in the encoder region."""
+
+    _AOA_MULTIMODAL_BIAS = "multimodal_e_score_correction_bias"
+    # The archive's dtype for ``weight``; None means it matches the model's.
+    _AOA_GATE_CHECKPOINT_DTYPE = None
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        statements = []
+        own_tensors = self.state_dict(
+            structured_name_prefix="", include_sublayers=False
+        )
+        for local_name in own_tensors:
+            checkpoint_name, model_name = _aoa_names(
+                ctx,
+                structured_name_prefix,
+                local_name,
+                drop_segment=checkpoint_lookup_drop_segment,
+            )
+            if local_name == "weight" and self._AOA_GATE_CHECKPOINT_DTYPE:
+                statements.append(
+                    f"{checkpoint_name} -> {model_name}, "
+                    f"src_dtype='{self._AOA_GATE_CHECKPOINT_DTYPE}',"
+                    f"dst_dtype='{_dtype_attr(self.weight)}'"
+                )
+            elif local_name == self._AOA_MULTIMODAL_BIAS and getattr(
+                ctx.config, "multimodal_bias_cold_start", False
+            ):
+                statements.append(f"_ -> {model_name}")
+            elif checkpoint_name != model_name:
+                statements.append(f"{checkpoint_name} -> {model_name}")
+        return statements
+
+    def gen_inv_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        statements = []
+        own_tensors = self.state_dict(
+            structured_name_prefix="", include_sublayers=False
+        )
+        for local_name in own_tensors:
+            checkpoint_name, model_name = _aoa_names(
+                ctx,
+                structured_name_prefix,
+                local_name,
+                drop_segment=checkpoint_lookup_drop_segment,
+            )
+            if local_name == "weight" and self._AOA_GATE_CHECKPOINT_DTYPE:
+                statements.append(
+                    f"{model_name} -> {checkpoint_name}, "
+                    f"src_dtype='{_dtype_attr(self.weight)}',"
+                    f"dst_dtype='{self._AOA_GATE_CHECKPOINT_DTYPE}'"
+                )
+            elif checkpoint_name != model_name:
+                statements.append(f"{model_name} -> {checkpoint_name}")
+        return statements
+
+
+class HyperBodyEncoderGateRouter(HyperBodyGateRouter):
+    """Encoder MoE router: FP32 gate weight against a BF16 archive, a pair
+    both directions must declare, the archive side not being derivable."""
+
+    _AOA_GATE_CHECKPOINT_DTYPE = _ENCODER_GATE_CHECKPOINT_DTYPE
+
+
+class HyperBodyMoELayer(MoELayer):
+    """MoE layer whose router carries HyperBody's archive facts.
+
+    Swapping the gate after ``super().__init__`` is the pattern
+    ``Gemma4MoELayer`` already uses, the base building its own ``TopKRouter``
+    unconditionally. Building it twice runs ``config.init_method`` an extra
+    time, shifting the from-scratch init of every parameter built after the
+    first swapped layer; loading overwrites those, so only a never-loaded
+    tensor keeps the shift -- which is why the installer swaps only where a
+    region needs an override."""
+
+    _AOA_ROUTER_CLASS = HyperBodyGateRouter
+
+    def __init__(self, config, sublayers=None, pg_collection=None):
+        super().__init__(config, sublayers, pg_collection)
+        self.gate = self._AOA_ROUTER_CLASS(
+            config=config, pg_collection=pg_collection
+        )
+
+
+class HyperBodyEncoderMoELayer(HyperBodyMoELayer):
+    """Encoder MoE layer: same swap, but the router that casts the gate."""
+
+    _AOA_ROUTER_CLASS = HyperBodyEncoderGateRouter
+
+
+class HyperBodyMlpProjector(MlpProjector):
+    """Modality projector whose ``layers`` leaf is transposed in the archive.
+    ``MlpProjector`` holds a bare ``paddle.nn.Linear``, which has no AOA
+    override of its own, so the base recursion would emit it untransposed."""
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        if not isinstance(self.layers, paddle.nn.Linear):
+            return super().gen_aoa_statements(
+                ctx,
+                structured_name_prefix=structured_name_prefix,
+                checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+            )
+        return gen_linear_aoa_statements(
+            self.layers,
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}layers.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        )
+
+    def gen_inv_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        if not isinstance(self.layers, paddle.nn.Linear):
+            return super().gen_inv_aoa_statements(
+                ctx,
+                structured_name_prefix=structured_name_prefix,
+                checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+            )
+        return gen_linear_inv_aoa_statements(
+            self.layers,
+            ctx,
+            structured_name_prefix=f"{structured_name_prefix}layers.",
+            checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+        )
+
+
+def _install_mhc_aoa_override(transformer_layer_spec):
+    """A layer with hyper-connections off carries ``IdentityOp``, so skip it."""
+    sublayers_spec = transformer_layer_spec.sublayers_spec
+    for field_name in (
+        "self_attention_hyper_connection",
+        "mlp_hyper_connection",
+    ):
+        sub_spec = getattr(sublayers_spec, field_name, None)
+        if (
+            isinstance(sub_spec, LayerSpec)
+            and sub_spec.layer is HyperConnectionModule
+        ):
+            sub_spec.layer = HyperBodyHyperConnection
+
+
+def _install_moe_gate_override(transformer_layer_spec, layer_class):
+    """A dense layer carries a plain MLP spec, so skip it."""
+    mlp_spec = getattr(transformer_layer_spec.sublayers_spec, "mlp", None)
+    if isinstance(mlp_spec, LayerSpec) and mlp_spec.layer is MoELayer:
+        mlp_spec.layer = layer_class
+
+
+def _install_aoa_component_overrides(
+    *,
+    decoder_layer_specs,
+    mtp_layer_specs,
+    encoder_layer_specs,
+    mhc_contract_spec,
+    multimodal_router_bias=False,
+):
+    """Install every AOA component override into the already-built specs.
+
+    ``get_gpt_mtp_layers_spec`` builds the MTP block's inner transformer layer
+    itself rather than reusing a decoder layer, so that one is patched
+    separately. The decoder region needs its router swapped only when the
+    multimodal router bias exists, that buffer being the region's only
+    divergence from the identity rule -- which also keeps the extra
+    ``init_method`` call out of runs not needing it."""
+    for layer_spec in decoder_layer_specs:
+        _install_mhc_aoa_override(layer_spec)
+        if multimodal_router_bias:
+            _install_moe_gate_override(layer_spec, HyperBodyMoELayer)
+    for mtp_spec in mtp_layer_specs or ():
+        # ``mtp_load_weight_only`` selects a block class with no mHC head.
+        if mtp_spec.layer is MultiTokenPredictionLayer:
+            mtp_spec.layer = HyperBodyMTPLayer
+        inner_spec = getattr(mtp_spec.sublayers_spec, "transformer_layer", None)
+        if isinstance(inner_spec, LayerSpec):
+            _install_mhc_aoa_override(inner_spec)
+            if multimodal_router_bias:
+                _install_moe_gate_override(inner_spec, HyperBodyMoELayer)
+    for layer_spec in encoder_layer_specs:
+        _install_moe_gate_override(layer_spec, HyperBodyEncoderMoELayer)
+    if (
+        isinstance(mhc_contract_spec, LayerSpec)
+        and mhc_contract_spec.layer is HyperConnectionContractLayer
+    ):
+        mhc_contract_spec.layer = HyperBodyMhcContract
+
+
 def build_hyperbody_unified_model(
     config: HyperBodyConfig, *, num_stages=1, loss_fn=None
 ):
@@ -1383,6 +1794,19 @@ def build_hyperbody_unified_model(
         HyperBodyEncoderBridge, extra_kwargs={"config": encoder_view}
     )
 
+    # Every spec exists by now, so the AOA overrides go in here, before the
+    # root spec takes them. Read off ``dec_sub``, ``get_gpt_spec`` being what
+    # finally decides those fields.
+    _install_aoa_component_overrides(
+        decoder_layer_specs=dec_sub.transformer_layers,
+        mtp_layer_specs=dec_sub.mtp,
+        encoder_layer_specs=enc_layer_specs,
+        mhc_contract_spec=dec_sub.mhc_contract,
+        multimodal_router_bias=bool(
+            getattr(config, "moe_multimodal_router_bias", False)
+        ),
+    )
+
     sublayers_spec = HyperBodySublayersSpec(
         encoder_frontend=frontend_spec,
         encoder_layers=enc_layer_specs,
@@ -1419,8 +1843,9 @@ class HyperBodyPretrainedModel(PretrainedModel):
     base_model_prefix = "hyperbody"
     input_modalities = ["image", "audio", "text"]
     # The router gate is fp32 on the fleet side (PaddleFleet forces fp32 while
-    # use_accuracy_compatible=False); both encoder- and decoder-region archives
-    # store it as bf16, so every gate statement carries a src/dst dtype pair.
+    # use_accuracy_compatible=False). The encoder-region archive stores it as
+    # bf16, so those gate statements carry a src/dst dtype pair; the
+    # decoder-region archive stores fp32 and needs none.
     _keep_in_fp32_modules = ["mlp.gate.weight"]
 
 
@@ -1459,8 +1884,9 @@ class HyperBodyForConditionalGeneration(HyperBodyPretrainedModel):
     # names (not HF names). is_fleet=True makes from_pretrained SKIP the identity
     # dtype append (model_utils.py:3421) -- that block would otherwise emit bogus
     # `<pipe.-prefixed key> -> <same>, dtype=...` statements whose LHS has no
-    # source in the HF safetensors. _gen_aoa_config already carries every needed
-    # dtype spec (e.g. gate.weight bf16->fp32). Matches the *Pipe entries.
+    # source in the HF safetensors. The modular AOA generation already carries
+    # every needed dtype spec (e.g. gate.weight bf16->fp32). Matches the *Pipe
+    # entries.
     is_fleet = True
 
     def __init__(self, config: HyperBodyConfig):
@@ -1474,9 +1900,9 @@ class HyperBodyForConditionalGeneration(HyperBodyPretrainedModel):
     # numeric<->logical remap looks up ``pipe.0.embed_tokens.weight`` in a table
     # built from UN-prefixed names and raises KeyError (R38). Delegating here (no
     # prefix) makes the wrapper expose the pipe's LOGICAL names verbatim, which is
-    # exactly what ``_gen_aoa_config`` RHS + flex_checkpoint expect (and identical
-    # to what the bare *Pipe entry produces). This unblocks both flex_checkpoint
-    # LOAD (from_pretrained) and SAVE through the wrapper.
+    # exactly what the modular AOA generation's RHS + flex_checkpoint expect (and
+    # identical to what the bare *Pipe entry produces). This unblocks both
+    # flex_checkpoint LOAD (from_pretrained) and SAVE through the wrapper.
     def state_dict(self, *args, **kwargs):
         return self.pipe.state_dict(*args, **kwargs)
 

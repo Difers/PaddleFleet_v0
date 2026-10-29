@@ -495,6 +495,14 @@ class HyperBodyConfig(PretrainedConfig):
         cross_entropy_loss_fusion: bool = False,
         use_cpu_initialization: bool = False,
         pp_seg_method: str = "layer:TransformerLayer|EmptyLayer",
+        # The two-stage ERNIE-5.5-Omni-Flash cold-start switches, set by the
+        # erniebot trainer; False = read the tensor from the archive as usual.
+        # Stage one trains ``encoder.bridge.out_projector`` from its own init,
+        # so its warm-start archive carries no ``model.projector.*`` to read.
+        projector_cold_start: bool = False,
+        # Keeps the decoder routers' ``multimodal_e_score_correction_bias`` at
+        # its zero init; also set for an archive predating that buffer.
+        multimodal_bias_cold_start: bool = False,
         # ===================== GLOBAL: routed llm_meta (via super) =====================
         # architecture switches (both regions; encoder provider re-pins its own)
         multi_latent_attention: bool = False,
@@ -562,6 +570,8 @@ class HyperBodyConfig(PretrainedConfig):
         self.cross_entropy_loss_fusion = cross_entropy_loss_fusion
         self.use_cpu_initialization = use_cpu_initialization
         self.pp_seg_method = pp_seg_method
+        self.projector_cold_start = projector_cold_start
+        self.multimodal_bias_cold_start = multimodal_bias_cold_start
 
         # WARNING: llm_meta fields must go through kwargs so set_expected_keys does
         # not reset them to LlmMetaConfig defaults. This list is IDENTICAL to the
