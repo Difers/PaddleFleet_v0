@@ -1325,6 +1325,7 @@ class Trainer:
         callback = zcc_callback_class(
             self.args, self.zcc_manager, self.runtime_timer, self.sharding_io
         )
+        callback.extra_states_fn = self._extra_checkpoint_states
         self.add_callback(callback)
 
     def _handle_checkpoint_resume(self, resume_from_checkpoint):
@@ -6483,6 +6484,17 @@ class Trainer:
             with open(signal_path, mode="w+") as f:
                 f.write("1")
 
+    def _extra_checkpoint_states(self):
+        """Per-rank objects to save in every checkpoint directory, as ``{file_name: obj}``.
+
+        Each object is written with ``paddle.save`` next to ``rng_state_{rank}.pth`` and
+        before ``saved_signal_{rank}``, by both the regular save and zero cost checkpoint
+        (flash device and persistent directories alike). Subclasses override this for
+        state the framework does not own, e.g. a dataloader position, and read it back
+        from ``resume_from_checkpoint``. Names must be unique per rank.
+        """
+        return {}
+
     def _save_checkpoint(self, model, metrics=None):
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
         if self.args.enable_zero_cost_checkpoint:
@@ -6612,6 +6624,11 @@ class Trainer:
                             output_dir, f"rng_state_{self.args.world_size}.pth"
                         ),
                     )
+
+        # Written before the optimizer save below, which writes saved_signal_{rank}.
+        for name, obj in self._extra_checkpoint_states().items():
+            os.makedirs(output_dir, exist_ok=True)
+            paddle.save(obj, os.path.join(output_dir, name))
 
         if not self.args.enable_auto_parallel:
             # only save model state dict, ignore optimizer and scheduler

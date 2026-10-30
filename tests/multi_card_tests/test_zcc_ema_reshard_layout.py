@@ -445,6 +445,7 @@ class TestZCCEMAReshardLayout(unittest.TestCase):
                             None,
                             SimpleNamespace(global_step=1, loss=1.0e9),
                             None,
+                            None,
                         ),
                     ),
                 )

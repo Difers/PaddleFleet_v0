@@ -1200,6 +1200,10 @@ class ZeroCostCheckpointCallback(TrainerCallback):
     still reading over CUDA IPC.
     """
 
+    # Returns the per-rank ``{file_name: obj}`` dumped with each checkpoint;
+    # Trainer._setup_zcc_callback sets it to Trainer._extra_checkpoint_states.
+    extra_states_fn = dict
+
     def __init__(self, args, zcc_manager, timer, sharding_io):
         self.args = args
         self.manager = zcc_manager
@@ -1252,7 +1256,7 @@ class ZeroCostCheckpointCallback(TrainerCallback):
                 # actually being offloaded instead of a permanently frozen value.
                 self.manager.global_step = state.global_step
                 self.manager.get_idle_worker_for_saving(
-                    ((None, None), (None, state, None))
+                    ((None, None), (None, state, None, None))
                 )  # prepare for dumping
         else:
             self.runtime_timer.start("checkpoint saving time")
@@ -1268,6 +1272,7 @@ class ZeroCostCheckpointCallback(TrainerCallback):
                 lr_scheduler.state_dict(),
                 state,
                 self.get_rng_states(args),
+                self.extra_states_fn(),
             )
             self.manager.get_idle_worker_for_saving(
                 (save_infos, non_cached_objects)
@@ -1885,6 +1890,7 @@ class ZeroCostCheckpointWorker:
         self.lr_scheduler = None
         self.trainer_state = None
         self.rng_state = None
+        self.extra_states = None
 
         # for dumping
         self.flash_device_save_dir = None
@@ -1926,9 +1932,12 @@ class ZeroCostCheckpointWorker:
             return
         save_infos, non_cached_objects = prepares
         self.flash_device_save_dir, self.persistent_save_dir = save_infos
-        self.lr_scheduler, self.trainer_state, self.rng_state = (
-            non_cached_objects
-        )
+        (
+            self.lr_scheduler,
+            self.trainer_state,
+            self.rng_state,
+            self.extra_states,
+        ) = non_cached_objects
 
     def process_offload_task(self, dump, global_step):
         """
@@ -2218,6 +2227,10 @@ class ZeroCostCheckpointWorker:
                 output_dir, f"rng_state_{dist.get_rank()}.pth"
             )
             paddle.save(self.rng_state, rng_state_name_path)
+
+        # Step2.6: save Trainer._extra_checkpoint_states (per rank)
+        for name, obj in (self.extra_states or {}).items():
+            paddle.save(obj, os.path.join(output_dir, name))
 
     def process_dump_task_impl(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
