@@ -1218,12 +1218,12 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
         return towers
 
     def _reject_unsupported_aoa_branches(self):
-        """Fail loudly on the configurations the modular path cannot express:
-        each needs the hand-written generator's "create this target from
-        nothing" statements. Checked here rather than in the constructor so a
-        model built for the hand-written path is unaffected.
+        """Fail loudly on the configurations the modular path cannot express.
+        Checked here rather than in the constructor so a model built for the
+        hand-written path is unaffected.
         """
         config = self.config
+        # Each of these needs a "create this target from nothing" statement.
         for field, bad_value, what in (
             ("indexer_init_from_scratch", True, "a from-scratch DSA indexer"),
             ("topk_method", "quantile_balancing", "quantile-balancing bins"),
@@ -1243,13 +1243,10 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
         # identity fallback and produce keys this archive does not have. Both
         # mappings are an erniebot archive convention, not a Fleet one, so the
         # erniebot bridge declares them.
-        variant = getattr(config, "experimental_attention_variant", None)
-        if variant == "dsv4_hybrid" and not getattr(
-            config, "aoa_checkpoint_name_mapping", None
-        ):
+        if not getattr(config, "aoa_checkpoint_name_mapping", None):
             raise RuntimeError(
-                "modular AOA for the dsv4_hybrid decoder needs "
-                "aoa_checkpoint_name_mapping on the decoder view."
+                "modular AOA needs aoa_checkpoint_name_mapping on the decoder "
+                "view."
             )
         if not getattr(self._encoder_view, "aoa_checkpoint_name_mapping", None):
             raise RuntimeError(
@@ -1678,9 +1675,10 @@ def _mark_encoder_region(model, encoder_view):
 # dtype, and the engine forbids an implicit dtype change.
 _MHC_HEAD_PARAMS = ("hc_head_fn", "hc_head_base", "hc_head_scale")
 
-# Only the encoder region's archive stores the gate as BF16; Fleet keeps it
-# FP32 (``_keep_in_fp32_modules``), and the decoder's archive does too.
-_ENCODER_GATE_CHECKPOINT_DTYPE = "bfloat16"
+# The encoder's and the standard decoder's archives store the MoE gate as BF16
+# while Fleet keeps it FP32 (``_keep_in_fp32_modules``); the dsv4_hybrid
+# decoder's archive keeps it FP32 as well.
+_BF16_GATE_CHECKPOINT_DTYPE = "bfloat16"
 
 
 def _dtype_attr(tensor):
@@ -1811,7 +1809,8 @@ class HyperBodyGateRouter(TopKRouter):
     an archive carrying it and left at its zero init -- naming no source --
     for one that does not; ``multimodal_bias_cold_start`` says which, and
     export needs no case, the archive keeping it beside the router. ``weight``
-    is cross-dtype only in the encoder region."""
+    matches the archive's dtype here; :class:`HyperBodyBf16GateRouter` is the
+    variant for an archive that stores it as BF16."""
 
     _AOA_MULTIMODAL_BIAS = "multimodal_e_score_correction_bias"
     # The archive's dtype for ``weight``; None means it matches the model's.
@@ -1878,37 +1877,34 @@ class HyperBodyGateRouter(TopKRouter):
         return statements
 
 
-class HyperBodyEncoderGateRouter(HyperBodyGateRouter):
-    """Encoder MoE router: FP32 gate weight against a BF16 archive, a pair
-    both directions must declare, the archive side not being derivable."""
+class HyperBodyBf16GateRouter(HyperBodyGateRouter):
+    """MoE router for an archive storing the gate as BF16 (the encoder's, the
+    standard decoder's): an FP32 model weight against it is a pair both
+    directions must declare, the archive side not being derivable."""
 
-    _AOA_GATE_CHECKPOINT_DTYPE = _ENCODER_GATE_CHECKPOINT_DTYPE
+    _AOA_GATE_CHECKPOINT_DTYPE = _BF16_GATE_CHECKPOINT_DTYPE
 
 
 class HyperBodyMoELayer(MoELayer):
     """MoE layer whose router carries HyperBody's archive facts.
 
-    Swapping the gate after ``super().__init__`` is the pattern
-    ``Gemma4MoELayer`` already uses, the base building its own ``TopKRouter``
-    unconditionally. Building it twice runs ``config.init_method`` an extra
-    time, shifting the from-scratch init of every parameter built after the
-    first swapped layer; loading overwrites those, so only a never-loaded
-    tensor keeps the shift -- which is why the installer swaps only where a
-    region needs an override."""
+    The base builds a plain ``TopKRouter`` unconditionally. Building a second
+    router in its place would run ``config.init_method`` again and shift the
+    random init of every parameter built after it, so the one already built is
+    retyped instead: same object, same tensors, no further draw. That needs
+    the router subclasses to add methods only -- no ``__init__``, no state."""
 
     _AOA_ROUTER_CLASS = HyperBodyGateRouter
 
     def __init__(self, config, sublayers=None, pg_collection=None):
         super().__init__(config, sublayers, pg_collection)
-        self.gate = self._AOA_ROUTER_CLASS(
-            config=config, pg_collection=pg_collection
-        )
+        self.gate.__class__ = self._AOA_ROUTER_CLASS
 
 
-class HyperBodyEncoderMoELayer(HyperBodyMoELayer):
-    """Encoder MoE layer: same swap, but the router that casts the gate."""
+class HyperBodyBf16GateMoELayer(HyperBodyMoELayer):
+    """MoE layer whose router casts a BF16-archived gate."""
 
-    _AOA_ROUTER_CLASS = HyperBodyEncoderGateRouter
+    _AOA_ROUTER_CLASS = HyperBodyBf16GateRouter
 
 
 class HyperBodyMlpProjector(MlpProjector):
@@ -1986,19 +1982,26 @@ def _install_aoa_component_overrides(
     encoder_layer_specs,
     mhc_contract_spec,
     multimodal_router_bias=False,
+    attention_variant=None,
 ):
     """Install every AOA component override into the already-built specs.
 
     ``get_gpt_mtp_layers_spec`` builds the MTP block's inner transformer layer
     itself rather than reusing a decoder layer, so that one is patched
-    separately. The decoder region needs its router swapped only when the
-    multimodal router bias exists, that buffer being the region's only
-    divergence from the identity rule -- which also keeps the extra
-    ``init_method`` call out of runs not needing it."""
+    separately. The decoder region's router needs an override when its archive
+    stores the gate as BF16 (every decoder but dsv4_hybrid) or when the
+    multimodal router bias exists; otherwise the plain router already follows
+    the identity rule and is left alone."""
+    if attention_variant != "dsv4_hybrid":
+        decoder_moe_layer = HyperBodyBf16GateMoELayer
+    elif multimodal_router_bias:
+        decoder_moe_layer = HyperBodyMoELayer
+    else:
+        decoder_moe_layer = None
     for layer_spec in decoder_layer_specs:
         _install_mhc_aoa_override(layer_spec)
-        if multimodal_router_bias:
-            _install_moe_gate_override(layer_spec, HyperBodyMoELayer)
+        if decoder_moe_layer is not None:
+            _install_moe_gate_override(layer_spec, decoder_moe_layer)
     for mtp_spec in mtp_layer_specs or ():
         # ``mtp_load_weight_only`` selects a block class with no mHC head.
         if mtp_spec.layer is MultiTokenPredictionLayer:
@@ -2006,10 +2009,10 @@ def _install_aoa_component_overrides(
         inner_spec = getattr(mtp_spec.sublayers_spec, "transformer_layer", None)
         if isinstance(inner_spec, LayerSpec):
             _install_mhc_aoa_override(inner_spec)
-            if multimodal_router_bias:
-                _install_moe_gate_override(inner_spec, HyperBodyMoELayer)
+            if decoder_moe_layer is not None:
+                _install_moe_gate_override(inner_spec, decoder_moe_layer)
     for layer_spec in encoder_layer_specs:
-        _install_moe_gate_override(layer_spec, HyperBodyEncoderMoELayer)
+        _install_moe_gate_override(layer_spec, HyperBodyBf16GateMoELayer)
     if (
         isinstance(mhc_contract_spec, LayerSpec)
         and mhc_contract_spec.layer is HyperConnectionContractLayer
@@ -2111,6 +2114,7 @@ def build_hyperbody_unified_model(
         multimodal_router_bias=bool(
             getattr(config, "moe_multimodal_router_bias", False)
         ),
+        attention_variant=decoder_view.experimental_attention_variant,
     )
 
     sublayers_spec = HyperBodySublayersSpec(
@@ -2155,9 +2159,9 @@ class HyperBodyPretrainedModel(PretrainedModel):
     base_model_prefix = "hyperbody"
     input_modalities = ["image", "audio", "text"]
     # The router gate is fp32 on the fleet side (PaddleFleet forces fp32 while
-    # use_accuracy_compatible=False). The encoder-region archive stores it as
-    # bf16, so those gate statements carry a src/dst dtype pair; the
-    # decoder-region archive stores fp32 and needs none.
+    # use_accuracy_compatible=False). The encoder's and the standard decoder's
+    # archives store it as bf16, so those gate statements carry a src/dst dtype
+    # pair; only the dsv4_hybrid decoder's archive stores fp32 and needs none.
     _keep_in_fp32_modules = ["mlp.gate.weight"]
 
 

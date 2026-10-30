@@ -267,15 +267,20 @@ class TestRejectedBranches(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             model._reject_unsupported_aoa_branches()
 
-    def test_a_plain_decoder_needs_no_mapping(self):
-        """Its layout matches what the components already produce."""
+    def test_a_standard_decoder_is_accepted_with_its_mapping(self):
+        """Its archive's renames come from the mapping, required as for any
+        decoder; its BF16 gate is cast by the installed router."""
+        _model(
+            config=_decoder_view(experimental_attention_variant=None)
+        )._reject_unsupported_aoa_branches()
         model = _model(
             config=_decoder_view(
                 experimental_attention_variant=None,
                 aoa_checkpoint_name_mapping=None,
             )
         )
-        model._reject_unsupported_aoa_branches()
+        with self.assertRaises(RuntimeError):
+            model._reject_unsupported_aoa_branches()
 
     def test_missing_encoder_mapping_is_rejected(self):
         model = _model(

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import paddle
 from paddle.distributed.fleet.meta_parallel import LayerSpec
@@ -35,6 +36,7 @@ from paddlefleet.transformer.hyper_connection import (
     HyperConnectionModule,
 )
 from paddlefleet.transformer.moe.moe_layer import MoELayer
+from paddlefleet.transformer.moe.moe_router import TopKRouter
 from paddlefleet.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
 )
@@ -312,30 +314,36 @@ class TestMTPBlock(unittest.TestCase):
 
 
 class TestGateRouter(unittest.TestCase):
-    """Encoder gate casts; bias has two modes; the rest is identity."""
+    """BF16-archived gates cast; bias has two modes; the rest is identity."""
 
-    def test_only_the_encoder_subclass_declares_an_archive_dtype(self):
+    def test_only_the_bf16_subclass_declares_an_archive_dtype(self):
         self.assertIsNone(hb.HyperBodyGateRouter._AOA_GATE_CHECKPOINT_DTYPE)
         self.assertEqual(
-            hb.HyperBodyEncoderGateRouter._AOA_GATE_CHECKPOINT_DTYPE,
+            hb.HyperBodyBf16GateRouter._AOA_GATE_CHECKPOINT_DTYPE,
             "bfloat16",
         )
 
-    def test_encoder_gate_weight_declares_the_dtype_pair(self):
-        router = _gate_router(hb.HyperBodyEncoderGateRouter)
-        self.assertIn(
-            f"{_GATE_CK}weight -> {_GATE}weight, "
-            f"src_dtype='bfloat16',dst_dtype='float32'",
-            _fwd(router, _GATE, _ENCODER_CTX),
-        )
-        self.assertIn(
-            f"{_GATE}weight -> {_GATE_CK}weight, "
-            f"src_dtype='float32',dst_dtype='bfloat16'",
-            _inv(router, _GATE, _ENCODER_CTX),
-        )
+    def test_bf16_gate_weight_declares_the_dtype_pair(self):
+        """The encoder's archive and the standard decoder's alike."""
+        for prefix, ctx, checkpoint_prefix in (
+            (_GATE, _ENCODER_CTX, _GATE_CK),
+            (_DEC_GATE, _decoder_gate_ctx(), _DEC_GATE),
+        ):
+            with self.subTest(prefix=prefix):
+                router = _gate_router(hb.HyperBodyBf16GateRouter)
+                self.assertIn(
+                    f"{checkpoint_prefix}weight -> {prefix}weight, "
+                    f"src_dtype='bfloat16',dst_dtype='float32'",
+                    _fwd(router, prefix, ctx),
+                )
+                self.assertIn(
+                    f"{prefix}weight -> {checkpoint_prefix}weight, "
+                    f"src_dtype='float32',dst_dtype='bfloat16'",
+                    _inv(router, prefix, ctx),
+                )
 
-    def test_decoder_gate_declares_no_dtype(self):
-        """The decoder archive holds the gate in the model's dtype, so the
+    def test_dsv4_decoder_gate_declares_no_dtype(self):
+        """The dsv4_hybrid archive holds the gate in the model's dtype, so the
         identity rule applies: a declared pair would cast the export."""
         router = _gate_router()
         ctx = _decoder_gate_ctx()
@@ -359,31 +367,73 @@ class TestGateRouter(unittest.TestCase):
         primitive names no source and keeps the registered zeros. Export
         always states it, the archive name not being the model name."""
         export = [f"{_DEC_GATE}{_MM_BIAS} -> {_DEC_MM_BIAS_CK}"]
-        for ctx, expected in (
-            (
-                _decoder_gate_ctx(),
-                f"{_DEC_MM_BIAS_CK} -> {_DEC_GATE}{_MM_BIAS}",
-            ),
-            (
-                _decoder_gate_ctx(multimodal_bias_cold_start=True),
-                f"_ -> {_DEC_GATE}{_MM_BIAS}",
-            ),
+        for router_class in (
+            hb.HyperBodyGateRouter,
+            hb.HyperBodyBf16GateRouter,
         ):
-            with self.subTest(statement=expected):
-                router = _gate_router(multimodal_bias=True)
-                self.assertEqual(_fwd(router, _DEC_GATE, ctx), [expected])
-                self.assertEqual(_inv(router, _DEC_GATE, ctx), export)
+            for ctx, expected in (
+                (
+                    _decoder_gate_ctx(),
+                    f"{_DEC_MM_BIAS_CK} -> {_DEC_GATE}{_MM_BIAS}",
+                ),
+                (
+                    _decoder_gate_ctx(multimodal_bias_cold_start=True),
+                    f"_ -> {_DEC_GATE}{_MM_BIAS}",
+                ),
+            ):
+                with self.subTest(router=router_class.__name__, s=expected):
+                    router = _gate_router(router_class, multimodal_bias=True)
+                    self.assertEqual(
+                        _bias_statements(_fwd(router, _DEC_GATE, ctx)),
+                        [expected],
+                    )
+                    self.assertEqual(
+                        _bias_statements(_inv(router, _DEC_GATE, ctx)), export
+                    )
 
     def test_moe_layer_subclasses_only_swap_the_gate(self):
         """``MoELayer.gen_aoa_statements`` delegates to ``self.gate``."""
         for layer_class, router_class in (
             (hb.HyperBodyMoELayer, hb.HyperBodyGateRouter),
-            (hb.HyperBodyEncoderMoELayer, hb.HyperBodyEncoderGateRouter),
+            (hb.HyperBodyBf16GateMoELayer, hb.HyperBodyBf16GateRouter),
         ):
             self.assertTrue(issubclass(layer_class, MoELayer))
             self.assertIs(layer_class._AOA_ROUTER_CLASS, router_class)
             for name in ("gen_aoa_statements", "gen_inv_aoa_statements"):
                 self.assertNotIn(name, layer_class.__dict__)
+
+    def test_router_subclasses_add_no_state(self):
+        """Retyping the built router is sound only while they add methods."""
+        for router_class in (
+            hb.HyperBodyGateRouter,
+            hb.HyperBodyBf16GateRouter,
+        ):
+            self.assertTrue(issubclass(router_class, TopKRouter))
+            for name in ("__init__", "__slots__"):
+                self.assertNotIn(name, router_class.__dict__)
+
+    def test_moe_layer_retypes_the_router_the_base_built(self):
+        """Same object and tensors, so no second ``init_method`` draw."""
+
+        def base_init(layer, config, sublayers=None, pg_collection=None):
+            paddle.nn.Layer.__init__(layer)
+            layer.gate = built
+
+        for layer_class in (hb.HyperBodyMoELayer, hb.HyperBodyBf16GateMoELayer):
+            with self.subTest(layer=layer_class.__name__):
+                built = TopKRouter.__new__(TopKRouter)
+                paddle.nn.Layer.__init__(built)
+                built.weight = built.create_parameter(shape=[2, 2])
+                weight = built.weight
+                with mock.patch.object(MoELayer, "__init__", base_init):
+                    layer = layer_class(config=None)
+                self.assertIs(layer.gate, built)
+                self.assertIs(type(built), layer_class._AOA_ROUTER_CLASS)
+                self.assertIs(layer.gate.weight, weight)
+
+
+def _bias_statements(statements):
+    return [s for s in statements if _MM_BIAS in s]
 
 
 class TestMlpProjector(unittest.TestCase):
@@ -466,7 +516,9 @@ def _moe_layer_spec():
 class TestInstaller(unittest.TestCase):
     """Every substitution is keyed off the original class."""
 
-    def _install(self, *, multimodal_router_bias=False):
+    def _install(
+        self, *, multimodal_router_bias=False, attention_variant="dsv4_hybrid"
+    ):
         """One MoE layer per region plus an MTP block holding its own inner
         layer, which ``get_gpt_mtp_layers_spec`` builds itself."""
         decoder, encoder, inner = (_moe_layer_spec() for _ in range(3))
@@ -481,6 +533,7 @@ class TestInstaller(unittest.TestCase):
             encoder_layer_specs=[encoder],
             mhc_contract_spec=contract,
             multimodal_router_bias=multimodal_router_bias,
+            attention_variant=attention_variant,
         )
         self.assertIs(mtp.layer, hb.HyperBodyMTPLayer)
         self.assertIs(contract.layer, hb.HyperBodyMhcContract)
@@ -495,21 +548,24 @@ class TestInstaller(unittest.TestCase):
                     hb.HyperBodyHyperConnection,
                 )
 
-    def test_moe_router_swap_follows_the_region_and_the_switch(self):
-        """Only the encoder archive holds the gate in another dtype, so that
-        region is swapped unconditionally; the decoder's one divergence is the
-        multimodal buffer, so there the swap follows the switch creating it."""
-        for bias, decoder_class in (
-            (False, MoELayer),
-            (True, hb.HyperBodyMoELayer),
+    def test_moe_router_swap_follows_the_archive_and_the_switch(self):
+        """The encoder's and the standard decoder's archives hold the gate as
+        BF16, so those swap unconditionally; the dsv4_hybrid decoder's one
+        divergence is the multimodal buffer, so there the swap follows the
+        switch creating it."""
+        for variant, bias, decoder_class in (
+            ("dsv4_hybrid", False, MoELayer),
+            ("dsv4_hybrid", True, hb.HyperBodyMoELayer),
+            (None, False, hb.HyperBodyBf16GateMoELayer),
+            (None, True, hb.HyperBodyBf16GateMoELayer),
         ):
-            with self.subTest(multimodal_router_bias=bias):
+            with self.subTest(variant=variant, multimodal_router_bias=bias):
                 decoder, encoder, inner = self._install(
-                    multimodal_router_bias=bias
+                    multimodal_router_bias=bias, attention_variant=variant
                 )
                 self.assertIs(
                     encoder.sublayers_spec.mlp.layer,
-                    hb.HyperBodyEncoderMoELayer,
+                    hb.HyperBodyBf16GateMoELayer,
                 )
                 self.assertIs(decoder.sublayers_spec.mlp.layer, decoder_class)
                 self.assertIs(inner.sublayers_spec.mlp.layer, decoder_class)
