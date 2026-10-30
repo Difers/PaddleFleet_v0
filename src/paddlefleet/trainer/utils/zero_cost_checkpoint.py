@@ -936,20 +936,17 @@ class ZeroCostCheckpointEMAProcessor:
             if tensor_meta["buffer_index"] not in self.ema_buffer_model_params:
                 continue  # non fp32 has no `self.ema_buffer_model_params`
             if tensor_meta["buffer_index"].startswith("unshard_"):
-                # unshard_ type tensors use the entire buffer directly
+                # unshard_ type tensors use the entire buffer directly, and the
+                # buffer keeps the parameter's original shape, which may be 0-D
+                # (QB router's gate.qb_bin_min / gate.qb_bin_max) or N-D (MoE
+                # gate.weight). Reshape to the buffer shape before assigning:
+                # a bare paddle.assign would resize the buffer to the source
+                # shape instead of copying values into it.
                 if k in state_dict:
                     dst = self.ema_buffer_model_params[
                         tensor_meta["buffer_index"]
                     ]
-                    if dst.ndim == 0:
-                        # 0-D scalar buffers (e.g. QB router's
-                        # gate.qb_bin_min / gate.qb_bin_max) cannot be sliced
-                        # with [:] -- that raises "Too many indices (1) for
-                        # tensor of dimension 0". Write the scalar value in
-                        # place instead.
-                        paddle.assign(state_dict[k].reshape(dst.shape), dst)
-                    else:
-                        dst[:] = state_dict[k].flatten()
+                    paddle.assign(state_dict[k].reshape(dst.shape), dst)
                 continue
             start = tensor_meta["start"]
             end = tensor_meta["end"]
