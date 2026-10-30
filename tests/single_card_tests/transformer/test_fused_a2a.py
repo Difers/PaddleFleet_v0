@@ -188,11 +188,6 @@ class TestBarrierEp(unittest.TestCase):
             fused_a2a._ep_fence_tensors.update(saved_fence)
 
         self.addCleanup(_restore_fence)
-        orig_pending = fused_a2a._ep_async_comm_pending
-        self.addCleanup(
-            setattr, fused_a2a, "_ep_async_comm_pending", orig_pending
-        )
-        fused_a2a._ep_async_comm_pending = False
         configure_ep_barrier(value)
 
     def test_module_default_matches_config_default(self):
@@ -224,103 +219,6 @@ class TestBarrierEp(unittest.TestCase):
         # and the reduction targets this group (not some default world group).
         self.assertIs(args[0], _ep_fence_tensor(group))
         self.assertIs(kwargs["group"], group)
-
-    def test_pending_async_op_falls_back_to_device_barrier_once(self):
-        # After an async_finish=True op the comm stream may still use the
-        # shared buffer, which the calc-stream fence cannot order: the next
-        # barrier must be the device barrier, then the fence resumes.
-        self._reset_switch(True)
-        fused_a2a._mark_ep_async_comm(True)
-        group = SimpleNamespace(id=91003)
-        with (
-            patch.object(paddle.distributed, "barrier") as barrier,
-            patch.object(paddle.distributed, "all_reduce") as all_reduce,
-        ):
-            barrier_ep(group)
-            barrier.assert_called_once_with(group)
-            all_reduce.assert_not_called()
-            self.assertFalse(fused_a2a._ep_async_comm_pending)
-
-            barrier_ep(group)
-            barrier.assert_called_once_with(group)
-            all_reduce.assert_called_once()
-
-    def test_sync_op_does_not_mark_pending(self):
-        self._reset_switch(True)
-        fused_a2a._mark_ep_async_comm(False)
-        self.assertFalse(fused_a2a._ep_async_comm_pending)
-
-
-@unittest.skipUnless(_IMPORT_ERROR is None, _SKIP_REASON)
-class TestDeepEPFuncsMarkAsyncComm(unittest.TestCase):
-    """Each DeepEP dispatch/combine func flags async_finish=True ops."""
-
-    def setUp(self):
-        orig = fused_a2a._ep_async_comm_pending
-        self.addCleanup(setattr, fused_a2a, "_ep_async_comm_pending", orig)
-        self.buffer = SimpleNamespace(
-            get_dispatch_layout=lambda *a, **k: (None, None, None, None, None),
-            dispatch=lambda *a, **k: (None, None, None, [], "handle", None),
-            combine=lambda *a, **k: (None, None, None),
-        )
-        patcher = patch.object(
-            fused_a2a, "get_buffer", return_value=self.buffer
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.x = paddle.zeros([2, 8], "bfloat16")
-        self.probs = paddle.zeros([2, 1], "float32")
-
-    def _calls(self):
-        return {
-            "dispatch_fwd": lambda a: fused_a2a.fused_dispatch_forward_func(
-                self.x,
-                None,
-                self.probs,
-                2,
-                None,
-                async_finish=a,
-                moe_ep_barrier=False,
-            ),
-            "dispatch_bwd": lambda a: fused_a2a.fused_dispatch_backward_func(
-                self.x,
-                self.probs,
-                None,
-                "handle",
-                async_finish=a,
-                moe_ep_barrier=False,
-            ),
-            "combine_fwd": lambda a: fused_a2a.fused_combine_forward_func(
-                self.x,
-                None,
-                {"handle": "handle"},
-                async_finish=a,
-                moe_ep_barrier=False,
-            ),
-            "combine_bwd": lambda a: fused_a2a.fused_combine_backward_func(
-                self.x,
-                None,
-                "handle",
-                async_finish=a,
-                moe_ep_barrier=False,
-            ),
-            "combine_bwd_fp8": lambda a: fused_a2a.fused_combine_backward_func(
-                (self.x, self.probs),
-                None,
-                "handle",
-                async_finish=a,
-                moe_ep_barrier=False,
-            ),
-        }
-
-    def test_async_finish_marks_pending_sync_does_not(self):
-        for name, call in self._calls().items():
-            with self.subTest(func=name):
-                fused_a2a._ep_async_comm_pending = False
-                call(False)
-                self.assertFalse(fused_a2a._ep_async_comm_pending)
-                call(True)
-                self.assertTrue(fused_a2a._ep_async_comm_pending)
 
 
 @unittest.skipUnless(_IMPORT_ERROR is None, _SKIP_REASON)

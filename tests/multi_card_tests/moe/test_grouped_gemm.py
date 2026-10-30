@@ -146,7 +146,6 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
 
     def _reset_fence_state(self):
         fused_a2a.configure_ep_barrier(True)
-        fused_a2a._ep_async_comm_pending = False
         fused_a2a._ep_fence_tensors.clear()
 
     def test_fence_tensor_is_cached_per_group(self):
@@ -186,7 +185,7 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             after.numpy(), np.full([4], expected, dtype="float32")
         )
 
-    def _run_deepep_rounds(self, async_barrier, async_finish=False):
+    def _run_deepep_rounds(self, async_barrier):
         ep_rank = paddle.distributed.get_rank(self.ep_group)
         num_experts = self.ep_group.nranks * 2
         num_tokens, hidden_size, topk = 64, 128, 2
@@ -220,13 +219,7 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
                 token_probs,
                 num_experts,
                 self.ep_group,
-                async_finish=async_finish,
             )
-            if async_finish:
-                # Overlap-scheduler style: the dispatch is still on the comm
-                # stream here; the next barrier_ep must not be the fence.
-                self.assertTrue(fused_a2a._ep_async_comm_pending)
-                fused_a2a.wait_for_deepep(self.ep_group.id)
             if round_id == 0 and ep_rank == self.ep_group.nranks - 1:
                 time.sleep(0.5)
             outputs.append(
@@ -260,31 +253,6 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         self.assertEqual(
             int(completed_rounds.numpy()[0]), 2 * self.ep_group.nranks
         )
-
-    @unittest.skipUnless(
-        fused_a2a.HAVE_DEEP_EP, "DeepEP is required for stream-order testing"
-    )
-    def test_async_finish_dispatch_matches_sync_barrier(self):
-        """async_finish=True ops under the fence mode must match the device
-        barrier baseline (barrier_ep falls back after async ops)."""
-        baseline = self._run_deepep_rounds(async_barrier=False)
-        paddle.distributed.barrier(self.ep_group)
-        with patch.object(
-            paddle.distributed, "barrier", wraps=paddle.distributed.barrier
-        ) as device_barrier:
-            actual = self._run_deepep_rounds(
-                async_barrier=True, async_finish=True
-            )
-        # One fallback per round: the combine right after each async dispatch.
-        self.assertEqual(device_barrier.call_count, 2)
-        self.assertFalse(fused_a2a._ep_async_comm_pending)
-
-        for round_id, (expected, result) in enumerate(zip(baseline, actual)):
-            np.testing.assert_array_equal(
-                expected.float().numpy(),
-                result.float().numpy(),
-                err_msg=f"DeepEP output differs in round {round_id}",
-            )
 
     def test_barrier_ep_uses_device_barrier_when_disabled(self):
         fused_a2a.configure_ep_barrier(False)

@@ -1333,10 +1333,8 @@ class TransformerConfig(ModelParallelConfig):
 
     - True (default): a 1-element ``all_reduce`` on the calc stream
       (stream-ordered fence). Keeps the cross-rank ordering that protects the
-      shared DeepEP buffer without the host-side device sync. The fence only
-      orders calc-stream work, so after any DeepEP op issued with
-      ``async_finish=True`` (e.g. the fwd/bwd overlap scheduler) the next
-      barrier automatically falls back to the device barrier. Default matches
+      shared DeepEP buffer without the host-side device sync. Only valid while
+      DeepEP dispatch/combine run with ``async_finish=False``. Default matches
       the former ``FLEET_MOE_EP_BARRIER_ASYNC=1`` used in production launches.
     - False: ``paddle.distributed.barrier``, which blocks the host in
       ``cudaDeviceSynchronize`` before every dispatch/combine.
