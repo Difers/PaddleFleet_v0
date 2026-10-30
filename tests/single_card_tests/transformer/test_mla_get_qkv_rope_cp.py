@@ -254,7 +254,6 @@ class TestMLAGetQKVRopeContextParallel(unittest.TestCase):
         layer.get_query_key_value_tensors = types.MethodType(
             MLASelfAttention.get_query_key_value_tensors, layer
         )
-        layer._down_proj = types.MethodType(MLASelfAttention._down_proj, layer)
         layer._is_cudagraph_active = types.MethodType(
             MLASelfAttention._is_cudagraph_active, layer
         )
@@ -302,10 +301,6 @@ class TestMLAGetQKVRopeContextParallel(unittest.TestCase):
         # Set in MLASelfAttention.__init__; the absorbed-MQA branch of
         # get_query_key_value_tensors reads it.
         layer.mqa_latent = False
-        # Set in MultiLatentAttention.__init__; the _FixedOrderDownProj
-        # dispatch in get_query_key_value_tensors reads them.
-        layer.gated_attention = False
-        layer.gated_attn_use_q_lora = False
         return layer
 
     def _hidden(self, batch=2, seq=32, hidden=16):
@@ -1021,7 +1016,6 @@ class TestLatentMQARopeFusion(unittest.TestCase):
         layer.get_query_key_value_tensors = types.MethodType(
             MLASelfAttention.get_query_key_value_tensors, layer
         )
-        layer._down_proj = types.MethodType(MLASelfAttention._down_proj, layer)
         layer._is_cudagraph_active = types.MethodType(
             MLASelfAttention._is_cudagraph_active, layer
         )
@@ -1069,8 +1063,6 @@ class TestLatentMQARopeFusion(unittest.TestCase):
         layer.training = True
         layer.recompute_qkv_up_porj_and_rope = False
         layer.mqa_latent = True
-        layer.gated_attention = False
-        layer.gated_attn_use_q_lora = False
         return layer
 
     def _hidden(self, batch=2, seq=16):
