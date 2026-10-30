@@ -1,0 +1,99 @@
+# Config of ci/code_health_check.py: scan scope, rule filters and diff scoring.
+# The copy on the PR's base branch is used, so changes here take effect after
+# they are merged. Only this file is taken from base: the script and the
+# workflow run from the PR itself.
+# Scoring follows the "框架静态扫描代码质量指标" doc, section 9 (diff scan).
+
+[scope]
+# Business code that is scanned and scored; tests are not counted.
+sources = ["src", "packages", "auto_configurator"]
+exclude = [
+  "**/third_party/**",
+  "**/build/**",
+  "**/dist/**",
+  "**/__pycache__/**",
+  "auto_configurator/tests/**",
+]
+
+[sonar]
+# Every rule stays active on the server and every issue is still reported.
+# Issues matching an entry below are excluded when scoring: they count toward
+# no metric or verdict and are listed apart under "已剔除" in the report.
+# `paths` (globs) limits an entry to those paths; without it, all paths.
+# `code` (regex) limits it to issues whose flagged code matches.
+# Choices follow the scoring doc, section 7.2.
+# A single false positive in code is silenced with `# NOSONAR(S3862) reason`
+# (bare key, no colon after it: `NOSONAR(python:S3862)` and
+# `NOSONAR(S3862): reason` are flagged by S7632 and suppress nothing).
+exclude = [
+  # float == against a bare whole-number literal (`wd != 0.0`, `scale == 1.0`):
+  # exact in binary and meant exactly. `== 0.1` or `!= 1.0 / sqrt(d)` is scored.
+  { rule = "python:S1244", code = '[=!]=\s*-?\d+\.0(?![\w.]|\s*[-+*/%@(\[])' },
+  { rule = "python:S4790" }, # md5 for cache keys / lock names
+  { rule = "python:S6546" }, # Union vs `|`, style only
+  { rule = "python:S7498" }, # dict() vs {}, style only
+  { rule = "python:S7504" }, # list() snapshot is often required
+  { rule = "python:S1135" }, # TODO markers
+  { rule = "python:S3776" }, # cognitive complexity, scored by Radon CC
+  { rule = "docker:S6471" }, # images need root for GPU / RDMA
+  { rule = "docker:S7020" }, # long RUN keeps layers few
+  # random / http to localhost / /tmp in benchmark and example code only.
+  { rule = "python:S2245", paths = ["**/benchmarks/**", "**/examples/**"] },
+  { rule = "python:S5332", paths = ["**/benchmarks/**", "**/examples/**"] },
+  { rule = "python:S5443", paths = ["**/benchmarks/**", "**/examples/**"] },
+  # Test-style rules in test files that live in the source tree.
+  { rule = "python:S5778", paths = ["**/test_*.py", "**/testing/**"] },
+  { rule = "python:S9073", paths = ["**/test_*.py", "**/testing/**"] },
+  { rule = "python:S5899", paths = ["**/test_*.py", "**/testing/**"] },
+]
+# Naming rules also accept this pattern (Triton BLOCK_M / D_ptr, Ernie4_5Config).
+naming_rules = [
+  "python:S117",
+  "python:S1542",
+  "python:S116",
+  "python:S101",
+  "python:S100",
+]
+naming_extra = '^_?[A-Z][A-Za-z0-9_]*$'
+
+[radon]
+# A function is complex when its cyclomatic complexity exceeds this.
+cc_max = 10
+
+[score]
+# Item score = 100 * (1 - ln(1 + k*x) / ln(1 + k)), x = min(value / zero, 1).
+curve_k = 30
+# Per-1k-line rates use at least this many added lines as denominator.
+min_lines = 200
+
+# value <= block: 可合入; > block: 不予合入.
+[score.bug] # new Sonar Bug + Vulnerability per 1k added lines
+zero = 100
+weight = 0.30
+block = 2.07
+block_severities = ["BLOCKER", "CRITICAL"] # any new one blocks
+
+[score.smell] # new Sonar code smells per 1k added lines
+zero = 1000
+weight = 0.30
+block = 28.5
+
+[score.dup] # share of added lines inside Sonar duplicated blocks
+zero = 1.0
+weight = 0.10
+block = 0.160
+
+[score.cc] # share of changed functions this diff made complex
+zero = 1.0
+weight = 0.20
+block = 0.128
+
+[score.cycle] # share of changed packages in a new import cycle
+zero = 1.0
+weight = 0.10
+# Verdict is by event: a new package-level cycle is mergeable; a new
+# module-level `from m import name` on a cycle of module-level imports
+# (ImportError under some import order) blocks.
+
+[score.total] # total >= block: 可合入; < block: 不予合入
+block = 70

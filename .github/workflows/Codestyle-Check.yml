@@ -72,3 +72,180 @@ jobs:
           echo "::error::    pip install pre-commit==2.17.0"
           echo "::error::    pre-commit run --all-files"
           exit 1
+
+  code-health-check:
+    name: Code Health Check
+    if: github.repository == 'PaddlePaddle/PaddleFleet'
+    runs-on:
+      group: APPROVAL
+    timeout-minutes: 90
+    env:
+      PR_ID: ${{ github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # SonarQube runs inside this job: a throwaway server (default "Sonar way"
+      # profile, embedded H2 database), so no external server or secrets.
+      SONARQUBE_VERSION: 26.9.0.129388
+      SONAR_SCANNER_VERSION: 8.1.0.6389
+      JDK_VERSION: 21.0.13+9
+      # Package dir shared by all runners on the host: the first job to need a
+      # package downloads it here, every later job just unpacks it. Runner users
+      # have no sudo; /var/tmp is writable by all and survives reboots.
+      SA_PKG_DIR: /var/tmp/code-health-check
+
+    steps:
+      - name: Cleanup
+        run: |
+          rm -rf * .[^.]*
+
+      - name: Checkout base repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 1000
+
+      - name: Merge PR to test branch
+        run: |
+          git fetch origin pull/${PR_ID}/merge
+          git checkout -b test FETCH_HEAD
+
+      - name: Set up tools
+        # Packages are downloaded once per host into $SA_PKG_DIR (checked by
+        # sha256) and unpacked once per runner into its tool cache.
+        run: |
+          c=$RUNNER_TOOL_CACHE
+          # The runner's own python3 (3.12); a venv keeps pip off the system.
+          v=$c/code-health-check-venv
+          if [ ! -f "$v/.ok" ]; then
+            echo "setup $v"
+            rm -rf "$v"
+            python3 -m venv "$v"
+            "$v/bin/pip" install -q radon==6.0.1 import-linter==2.15
+            touch "$v/.ok"
+          fi
+          echo "$v/bin" >> "$GITHUB_PATH"
+          # Unzip keeping the exec bits (zipfile alone drops them).
+          unzip_to() {
+            python3 - "$1" "$2" <<'EOF'
+          import os, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              for i in z.infolist():
+                  p = z.extract(i, sys.argv[2])
+                  if i.external_attr >> 16:
+                      os.chmod(p, i.external_attr >> 16)
+          EOF
+          }
+          mkdir -p "$SA_PKG_DIR"
+          # Every runner user may add packages, none may replace another's
+          # (sticky bit); failing means another user owns the dir.
+          chmod 1777 "$SA_PKG_DIR" 2>/dev/null || true
+          fetch() {  # fetch PACKAGE SHA256 URL...: download into $SA_PKG_DIR once
+            f=$SA_PKG_DIR/$1
+            # The dir is shared: check a package found there before using it.
+            [ -f "$f" ] && echo "$2  $f" | sha256sum -c --status - && return
+            echo "fetch $1"
+            exec 9<"$SA_PKG_DIR"
+            # Runners on this host may fetch the same package at once; a holder
+            # stuck past 30 min is broken, fail instead of hanging the job.
+            flock -w 1800 9 || { echo "lock on $SA_PKG_DIR held for 30 min"; exit 1; }
+            if ! { [ -f "$f" ] && echo "$2  $f" | sha256sum -c --status -; }; then
+              # A bad copy of another user's can't be removed (sticky bit).
+              rm -f "$f" || exit 1
+              # Per user: the sticky bit keeps others from replacing a .part.
+              p=$f.part.$(id -un)
+              for u in "${@:3}"; do
+                # A .part left by a killed job is resumed; a stalled transfer
+                # (< 100 KB/s for 60 s) is aborted and resumed.
+                for i in $(seq 10); do
+                  curl -sSfL --http1.1 --speed-limit 102400 --speed-time 60 -C - -o "$p" "$u" && break
+                  sleep 5
+                done
+                echo "$2  $p" | sha256sum -c --quiet - 2>/dev/null && break
+                rm -f "$p"  # broken from this URL: start over on the next one
+              done
+              echo "$2  $p" | sha256sum -c - || exit 1
+              chmod a+r "$p" && mv "$p" "$f"
+            fi
+            flock -u 9
+          }
+          get() {  # get NAME PACKAGE SHA256 URL...: unpack PACKAGE into $c/NAME once
+            [ -f "$c/$1/.ok" ] && return
+            fetch "${@:2}"
+            echo "unpack $2"
+            rm -rf "$c/$1"
+            case "$2" in
+              *.zip) unzip_to "$SA_PKG_DIR/$2" "$c" ;;  # the zip holds a top dir NAME
+              *) mkdir -p "$c/$1" && tar xzf "$SA_PKG_DIR/$2" -C "$c/$1" --strip-components=1 ;;
+            esac
+            touch "$c/$1/.ok"
+          }
+          d=https://binaries.sonarsource.com/Distribution
+          sq=sonarqube-$SONARQUBE_VERSION.zip
+          ss=sonar-scanner-cli-$SONAR_SCANNER_VERSION-linux-x64.zip
+          get sonarqube-$SONARQUBE_VERSION $sq \
+            b7306f5ecfa6806753bc0eb0dc4ea11fe0ddd2c5a346592718814d6ec35b88cb $d/sonarqube/$sq
+          get sonar-scanner-$SONAR_SCANNER_VERSION-linux-x64 $ss \
+            bb8f709f9cb73352f8d1260a3b3c506c0f41146754bc630762c126d795499d0b $d/sonar-scanner-cli/$ss
+          # Full JDK for the server: its Elasticsearch needs jdk.jlink, a JRE fails.
+          # The TUNA mirror is fast but keeps only the latest build; GitHub keeps all.
+          j=OpenJDK21U-jdk_x64_linux_hotspot_$(echo "$JDK_VERSION" | tr + _).tar.gz
+          get jdk-$JDK_VERSION jdk-$JDK_VERSION.tar.gz \
+            d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c \
+            https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/linux/$j \
+            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_VERSION/+/%2B}/$j"
+          echo "SONARQUBE_HOME=$c/sonarqube-$SONARQUBE_VERSION" >> "$GITHUB_ENV"
+          echo "SONAR_SCANNER=$c/sonar-scanner-$SONAR_SCANNER_VERSION-linux-x64/bin/sonar-scanner" >> "$GITHUB_ENV"
+          echo "SONAR_JAVA_PATH=$c/jdk-$JDK_VERSION/bin/java" >> "$GITHUB_ENV"
+
+      - name: Start SonarQube
+        run: |
+          free_port() {
+            python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+          }
+          # Random ports: other runners on this host may run the same job.
+          port=$(free_port)
+          export SONAR_EMBEDDEDDATABASE_PORT=$(free_port)
+          export SONAR_WEB_HOST=127.0.0.1 SONAR_WEB_PORT=$port SONAR_SEARCH_PORT=0
+          export SONAR_PATH_DATA="$RUNNER_TEMP/sq/data" SONAR_PATH_TEMP="$RUNNER_TEMP/sq/temp"
+          export SONAR_PATH_LOGS="$RUNNER_TEMP/sq/logs" PIDDIR="$RUNNER_TEMP/sq"
+          # No vm.max_map_count tuning needed on the host.
+          export SONAR_SEARCH_JAVAADDITIONALOPTS=-Dnode.store.allow_mmap=false
+          export SONAR_CE_JAVAOPTS=-Xmx4G
+          export SONAR_TELEMETRY_ENABLE=false
+          rm -rf "$RUNNER_TEMP/sq" && mkdir -p "$RUNNER_TEMP/sq"
+          "$SONARQUBE_HOME/bin/linux-x86-64/sonar.sh" start
+          url=http://127.0.0.1:$port
+          for _ in $(seq 120); do
+            s=$(curl -s --noproxy '*' "$url/api/system/status" || true)
+            case "$s" in *'"UP"'*) break ;; esac
+            [ -d "/proc/$(cat "$PIDDIR/SonarQube.pid")" ] || break  # server died
+            sleep 5
+          done
+          case "$s" in *'"UP"'*) ;; *)
+            tail -n 30 "$SONARQUBE_HOME/logs/nohup.log" "$SONAR_PATH_LOGS"/*.log || true
+            exit 1
+            ;;
+          esac
+          pw="Ci-$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          echo "::add-mask::$pw"
+          curl -sSf --noproxy '*' -u admin:admin -X POST "$url/api/users/change_password" \
+            -d login=admin -d previousPassword=admin --data-urlencode "password=$pw"
+          tok=$(curl -sSf --noproxy '*' -u "admin:$pw" -X POST "$url/api/user_tokens/generate" \
+            -d name=ci | python -c 'import json, sys; print(json.load(sys.stdin)["token"])')
+          echo "::add-mask::$tok"
+          { echo "SONAR_HOST_URL=$url"; echo "SONAR_TOKEN=$tok"; } >> "$GITHUB_ENV"
+          echo "no_proxy=127.0.0.1,localhost,${no_proxy}" >> "$GITHUB_ENV"
+          echo "NO_PROXY=127.0.0.1,localhost,${NO_PROXY}" >> "$GITHUB_ENV"
+
+      - name: Scan base and head, report new issues
+        # HEAD is the PR merge commit, HEAD^1 the base branch it merges into.
+        run: |
+          python ci/code_health_check.py --selftest
+          python ci/code_health_check.py HEAD^1
+
+      - name: Stop SonarQube
+        if: always()
+        run: |
+          [ -n "$SONARQUBE_HOME" ] || exit 0
+          # sonar.sh waits forever if the launcher is left a zombie (no reaper).
+          PIDDIR="$RUNNER_TEMP/sq" timeout 120 "$SONARQUBE_HOME/bin/linux-x86-64/sonar.sh" stop || true
+          rm -rf "$RUNNER_TEMP/sq"
