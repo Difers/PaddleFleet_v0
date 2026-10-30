@@ -49,14 +49,12 @@ class LossProfile:
     dpace_alpha: float = 0.6  # only used when weight_type == "dpace"
     probability_chunk_tokens: int = 1024  # memory-tiling, not a recipe choice
     subbatch_sequence_length: int = 1024  # memory-tiling, <=0 disables tiling
-    # The selector_* / use_fused_distill_loss fields below are inert unless the
-    # candidate_selector refiner / Triton fused kernel are enabled (both off by
-    # default; the default refiner is MarkovHead).
+    # The selector_* fields below are inert unless the candidate_selector
+    # refiner is enabled (off by default; the default refiner is MarkovHead).
     selector_loss_alpha: float = 0.0
     selector_stop_gradient: bool = False
     selector_warmup_ratio: float = 0.0
     selector_ramp_ratio: float = 0.0
-    use_fused_distill_loss: bool = False
 
     def validate(self) -> LossProfile:
         """Validate fields and return self."""
@@ -84,8 +82,6 @@ class LossProfile:
             )
         if not isinstance(self.selector_stop_gradient, bool):
             raise ValueError("selector_stop_gradient must be a boolean")
-        if not isinstance(self.use_fused_distill_loss, bool):
-            raise ValueError("use_fused_distill_loss must be a boolean")
         if not 0.0 <= float(self.selector_warmup_ratio) <= 1.0:
             raise ValueError("selector_warmup_ratio must be in [0, 1]")
         if not 0.0 <= float(self.selector_ramp_ratio) <= 1.0:
@@ -242,23 +238,6 @@ def _validate_streamed_output(output: DrafterOutput) -> None:
         )
 
 
-def _fused_distill_available(reference_tensor: Any) -> bool:
-    """True when the Triton fused CE/L1 kernel can run for this tensor.
-
-    Requires Triton importable, a CUDA-compiled Paddle, and the operand living
-    on a GPU place. Any miss falls back to the eager streamed path so CPU, no
-    Triton, and XPU runs keep working unchanged.
-    """
-    try:
-        import triton  # noqa: F401
-    except Exception:
-        return False
-    if not paddle.device.is_compiled_with_cuda():
-        return False
-    place = getattr(reference_tensor, "place", None)
-    return place is not None and bool(reference_tensor.place.is_gpu_place())
-
-
 def _streamed_token_losses(
     output: DrafterOutput,
     target_ids: Any,
@@ -268,7 +247,6 @@ def _streamed_token_losses(
     needs_teacher: bool,
     selector_enabled: bool = False,
     selector_stop_gradient: bool = False,
-    use_fused: bool = False,
 ) -> tuple[Any, Any | None, Any, Any, Any]:
     """Project and recompute token chunks without retaining full-vocab logits."""
     _validate_streamed_output(output)
@@ -306,13 +284,17 @@ def _streamed_token_losses(
     transform_logits = getattr(
         output.logits_projection, "transform_logits", None
     )
+    transform_target_logits = getattr(
+        output.logits_projection, "transform_target_logits", transform_logits
+    )
     # Custom bound transforms can capture live target parameters. Only the
     # functional read-only protocol is accepted; never freeze a target module.
     if transform_logits is not None and not getattr(
         output.logits_projection, "dspark_readonly", False
     ):
         raise ValueError(
-            "custom transforms require ReadOnlyProjection (including detached bias/Multimax)"
+            "custom transforms require ReadOnlyProjection "
+            "(detached bias; SegLU on the teacher side only)"
         )
     expected_hidden = int(projection_weight.shape[1 if transpose_y else 0])
     if (
@@ -394,9 +376,14 @@ def _streamed_token_losses(
         if markov_enabled:
             previous_embeddings = paddle.nn.functional.embedding(previous, w1)
             draft_logits = draft_logits + paddle.matmul(previous_embeddings, w2)
+        # Asymmetric head transform: the draft head adds only the bias at
+        # inference, while the teacher logits must match the main model's real
+        # output, which also applies SegLU. So draft gets bias-only and target
+        # gets bias+SegLU.
         if transform_logits is not None:
             draft_logits = transform_logits(draft_logits)
-            target_logits = transform_logits(target_logits)
+        if transform_target_logits is not None:
+            target_logits = transform_target_logits(target_logits)
         draft_logits = draft_logits.astype("float32")
         ce_per_token = paddle.nn.functional.cross_entropy(
             draft_logits, ids, reduction="none"
@@ -415,9 +402,9 @@ def _streamed_token_losses(
         selector_correct = paddle.zeros_like(ce_per_token)
         if selector_enabled:
             # Candidate selector is mutually exclusive with the Markov head,
-            # so its unary scores are exactly the already transformed draft
-            # logits.  Reuse them instead of running the projection transform
-            # a second time in every streamed chunk.
+            # so its unary scores are exactly the draft logits that already had
+            # the head bias added above. Reuse them instead of re-adding the
+            # bias a second time in every streamed chunk.
             selector_unary = (
                 draft_logits if not markov_enabled else unary_logits
             )
@@ -610,39 +597,6 @@ def _streamed_token_losses(
         selector_successor.stop_gradient = True
         selector_projection.stop_gradient = True
 
-    # Opt-in Triton fast path: fuse projection + SegLU + 2x softmax + CE + L1
-    # into two streaming kernels (per-token ce/l1 only, closed-form backward).
-    # Only valid without the selector objective (the kernel emits zeros for it),
-    # with an identity/SegLU ReadOnlyProjection and no head bias; otherwise the
-    # eager _ChunkedTokenLoss below runs and the numerics are unchanged.
-    fused_layer = None
-    if use_fused and not selector_enabled:
-        projection = output.logits_projection
-        # Read the detached transform parameters directly from the projection
-        # descriptor.  ReadOnlyProjection applies the same shared SegLU in the
-        # eager path; the fused kernel receives its detached parameters here.
-        multimax_ranges = getattr(projection, "multimax_ranges", None)
-        multimax_ts = getattr(projection, "multimax_ts", None)
-        projection_bias = getattr(projection, "bias", None)
-        transform_is_fusable = getattr(projection, "dspark_readonly", False)
-        if (
-            transform_is_fusable
-            and projection_bias is None
-            and _fused_distill_available(draft_hidden)
-        ):
-            from .dspark_fused_distill_loss import (
-                make_fused_ce_l1,
-            )
-
-            fused_layer = make_fused_ce_l1(
-                needs_teacher=needs_teacher,
-                markov_enabled=markov_enabled,
-                use_seglu=multimax_ranges is not None,
-                seglu_r=multimax_ranges,
-                seglu_t=multimax_ts,
-                transpose_y=transpose_y,
-            )
-
     ce_subbatches = []
     l1_subbatches = []
     selector_subbatches = []
@@ -673,41 +627,24 @@ def _streamed_token_losses(
             0, int(ids_part.shape[0]), max(1, int(chunk_tokens))
         ):
             end = min(start + max(1, int(chunk_tokens)), int(ids_part.shape[0]))
-            if fused_layer is not None:
-                (
-                    ce_chunk,
-                    l1_chunk,
-                    selector_chunk,
-                    selector_covered_chunk,
-                    selector_correct_chunk,
-                ) = fused_layer.apply(
-                    draft_part[start:end],
-                    target_part[start:end],
-                    ids_part[start:end],
-                    previous_part[start:end],
-                    projection_weight,
-                    markov_w1,
-                    markov_w2,
-                )
-            else:
-                (
-                    ce_chunk,
-                    l1_chunk,
-                    selector_chunk,
-                    selector_covered_chunk,
-                    selector_correct_chunk,
-                ) = _ChunkedTokenLoss.apply(
-                    draft_part[start:end],
-                    target_part[start:end],
-                    ids_part[start:end],
-                    previous_part[start:end],
-                    projection_weight,
-                    markov_w1,
-                    markov_w2,
-                    selector_predecessor,
-                    selector_successor,
-                    selector_projection,
-                )
+            (
+                ce_chunk,
+                l1_chunk,
+                selector_chunk,
+                selector_covered_chunk,
+                selector_correct_chunk,
+            ) = _ChunkedTokenLoss.apply(
+                draft_part[start:end],
+                target_part[start:end],
+                ids_part[start:end],
+                previous_part[start:end],
+                projection_weight,
+                markov_w1,
+                markov_w2,
+                selector_predecessor,
+                selector_successor,
+                selector_projection,
+            )
             ce_chunks.append(ce_chunk)
             if needs_teacher:
                 l1_chunks.append(l1_chunk)
@@ -957,7 +894,6 @@ def compute_dspark_loss(
             needs_teacher=needs_teacher,
             selector_enabled=selector_enabled,
             selector_stop_gradient=profile.selector_stop_gradient,
-            use_fused=profile.use_fused_distill_loss,
         )
     else:
         ce_per_token, l1_per_token = _materialized_token_losses(

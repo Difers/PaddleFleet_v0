@@ -36,7 +36,6 @@ projection must agree.  That pins both implementations to one definition, so a
 later edit to either one cannot drift unnoticed.
 """
 
-import sys
 import types
 import unittest
 
@@ -205,7 +204,6 @@ class TestLossProfileValidation(unittest.TestCase):
             "confidence_alpha_negative": {"confidence_alpha": -0.5},
             "selector_alpha_negative": {"selector_loss_alpha": -1.0},
             "stop_gradient_not_bool": {"selector_stop_gradient": 1},
-            "fused_not_bool": {"use_fused_distill_loss": "yes"},
             "warmup_out_of_range": {"selector_warmup_ratio": 1.5},
             "ramp_out_of_range": {"selector_ramp_ratio": -0.1},
             "decay_gamma_zero": {"decay_gamma": 0.0},
@@ -435,6 +433,171 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 delta=_ATOL,
                 msg=f"{name} differs between the streamed and materialized paths",
             )
+
+    def test_streamed_projection_adds_the_head_bias(self):
+        # A biased ReadOnlyProjection must fold its (detached) bias into the
+        # draft/teacher logits -- the same bias inference adds -- so CE/L1 match
+        # a reference that bakes the bias into the materialized logits. Guards
+        # against dropping the bias when SegLU was removed from the projection.
+        seed = 13
+        paddle.seed(seed)
+        hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        teacher_hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        weight = paddle.randn([_V, _H], dtype="float32")
+        bias = paddle.randn([_V], dtype="float32")
+        previous = paddle.randint(0, _V, [_B, _A, _K], dtype="int64")
+        fields = _fields(seed, drop_last=True)
+        profile = LossProfile(
+            probability_chunk_tokens=7, subbatch_sequence_length=3
+        )
+
+        streamed = compute_dspark_loss(
+            _streamed_output(
+                seed,
+                fields=fields,
+                draft_hidden_states=hidden,
+                target_hidden_states=teacher_hidden,
+                previous_token_ids=previous,
+                projection=ReadOnlyProjection(
+                    weight=weight, transpose_y=True, bias=bias
+                ),
+            ),
+            profile,
+            return_terms=True,
+        )
+        materialized = compute_dspark_loss(
+            _materialized_output(
+                seed,
+                fields=fields,
+                draft_logits=paddle.matmul(hidden, weight, transpose_y=True)
+                + bias,
+                teacher_logits=paddle.matmul(
+                    teacher_hidden, weight, transpose_y=True
+                )
+                + bias,
+            ),
+            profile,
+            return_terms=True,
+        )
+        for name in ("ce_loss", "l1_loss", "loss"):
+            self.assertAlmostEqual(
+                float(streamed.terms[name]),
+                float(materialized.terms[name]),
+                delta=_ATOL,
+                msg=f"{name} ignores the projection bias in the streamed path",
+            )
+
+    def test_streamed_target_gets_seglu_but_draft_stays_raw(self):
+        # Draft stays raw (the draft head skips SegLU at inference); the distill
+        # teacher is the main model output, which applies SegLU. Verify the
+        # forward AND the _ChunkedTokenLoss backward recompute, via loss values
+        # and hidden.grad, with a discriminating draft-also-SegLU reference.
+        from paddlefleet.models.gpt.lm_head import SegLU
+
+        seed = 17
+        paddle.seed(seed)
+        base_hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        teacher_hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        teacher_hidden.stop_gradient = True
+        weight = paddle.randn([_V, _H], dtype="float32")
+        ranges = paddle.to_tensor([-1.0, 1.0, -2.0, 2.0], dtype="float32")
+        ts = paddle.to_tensor([0.1, 0.2, 0.3, 0.4], dtype="float32")
+        previous = paddle.randint(0, _V, [_B, _A, _K], dtype="int64")
+        fields = _fields(seed, drop_last=True)
+        profile = LossProfile(
+            probability_chunk_tokens=7, subbatch_sequence_length=3
+        )
+
+        def _leaf():
+            h = base_hidden.detach()
+            h.stop_gradient = False
+            return h
+
+        def _teacher_seglu():
+            return SegLU(
+                paddle.matmul(teacher_hidden, weight, transpose_y=True),
+                ranges,
+                ts,
+            )
+
+        hidden_s = _leaf()
+        streamed = compute_dspark_loss(
+            _streamed_output(
+                seed,
+                fields=fields,
+                draft_hidden_states=hidden_s,
+                target_hidden_states=teacher_hidden,
+                previous_token_ids=previous,
+                projection=ReadOnlyProjection(
+                    weight=weight,
+                    transpose_y=True,
+                    target_multimax_ranges=ranges,
+                    target_multimax_ts=ts,
+                ),
+            ),
+            profile,
+            return_terms=True,
+        )
+        streamed.loss.backward()
+        hidden_m = _leaf()
+        materialized = compute_dspark_loss(
+            _materialized_output(
+                seed,
+                fields=fields,
+                draft_logits=paddle.matmul(hidden_m, weight, transpose_y=True),
+                teacher_logits=_teacher_seglu(),
+            ),
+            profile,
+            return_terms=True,
+        )
+        materialized.loss.backward()
+
+        for name in ("ce_loss", "l1_loss", "loss"):
+            self.assertAlmostEqual(
+                float(streamed.terms[name]),
+                float(materialized.terms[name]),
+                delta=_ATOL,
+                msg=f"{name}: target SegLU / draft-raw asymmetry not honored",
+            )
+        # Backward recompute must keep the draft raw too: hidden grads match.
+        self.assertIsNotNone(hidden_s.grad)
+        self.assertIsNotNone(hidden_m.grad)
+        self.assertGreater(float(paddle.abs(hidden_s.grad).max()), 0.0)
+        np.testing.assert_allclose(
+            hidden_s.grad.numpy(),
+            hidden_m.grad.numpy(),
+            atol=_ATOL,
+            rtol=_RTOL,
+            err_msg="draft-raw grad mismatch vs materialized reference",
+        )
+        # Discriminating check: a draft-also-SegLU reference must give a
+        # DIFFERENT hidden grad, otherwise the match above proves nothing about
+        # the draft skipping SegLU in the backward recompute.
+        hidden_wrong = _leaf()
+        wrong = compute_dspark_loss(
+            _materialized_output(
+                seed,
+                fields=fields,
+                draft_logits=SegLU(
+                    paddle.matmul(hidden_wrong, weight, transpose_y=True),
+                    ranges,
+                    ts,
+                ),
+                teacher_logits=_teacher_seglu(),
+            ),
+            profile,
+            return_terms=True,
+        )
+        wrong.loss.backward()
+        self.assertFalse(
+            np.allclose(
+                hidden_s.grad.numpy(),
+                hidden_wrong.grad.numpy(),
+                atol=_ATOL,
+                rtol=_RTOL,
+            ),
+            "draft-raw and draft-SegLU grads coincide; test lacks power",
+        )
 
 
 class TestSelectorObjective(unittest.TestCase):
@@ -932,36 +1095,6 @@ class TestComputeDsparkLossGuards(unittest.TestCase):
                     confidence_pred=paddle.randn([_B, _A, _K + 1]),
                 )
             )
-
-
-class TestFusedAvailability(unittest.TestCase):
-    """The fused kernel is opt-in and must degrade to eager, never crash."""
-
-    def test_falls_back_without_triton(self):
-        saved = sys.modules.get("triton", None)
-        sys.modules["triton"] = None  # makes ``import triton`` raise
-        try:
-            self.assertFalse(dl._fused_distill_available(paddle.zeros([2])))
-        finally:
-            if saved is None:
-                sys.modules.pop("triton", None)
-            else:
-                sys.modules["triton"] = saved
-
-    def test_falls_back_without_a_cuda_build(self):
-        original = paddle.device.is_compiled_with_cuda
-        paddle.device.is_compiled_with_cuda = lambda: False
-        try:
-            self.assertFalse(dl._fused_distill_available(paddle.zeros([2])))
-        finally:
-            paddle.device.is_compiled_with_cuda = original
-
-    def test_falls_back_off_a_gpu_place(self):
-        if not paddle.device.is_compiled_with_cuda():
-            self.skipTest("CUDA build required to reach the place check")
-        with paddle.device.device_guard("cpu"):
-            on_cpu = paddle.zeros([2])
-        self.assertFalse(dl._fused_distill_available(on_cpu))
 
 
 class TestNormalizationGroup(unittest.TestCase):

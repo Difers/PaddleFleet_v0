@@ -103,31 +103,6 @@ class TestReadOnlyProjection(unittest.TestCase):
             )
         self.assertIn("bias must have shape", str(caught.exception))
 
-    def test_multimax_needs_both_halves(self):
-        with self.assertRaises(ValueError) as caught:
-            ReadOnlyProjection(
-                weight=paddle.randn([_V, _H]),
-                transpose_y=True,
-                multimax_ranges=paddle.randn([4]),
-            )
-        self.assertIn("Multimax requires both", str(caught.exception))
-
-    def test_multimax_halves_must_be_length_four(self):
-        for name in ("multimax_ranges", "multimax_ts"):
-            extra = {
-                "multimax_ranges": paddle.randn([4]),
-                "multimax_ts": paddle.randn([4]),
-            }
-            extra[name] = paddle.randn([3])
-            with self.subTest(field=name):
-                with self.assertRaises(ValueError) as caught:
-                    ReadOnlyProjection(
-                        weight=paddle.randn([_V, _H]), transpose_y=True, **extra
-                    )
-                self.assertIn(
-                    f"{name} must have shape [4]", str(caught.exception)
-                )
-
     def test_bias_is_added_in_the_logits_dtype(self):
         weight = paddle.randn([_H, _V])
         bias = paddle.randn([_V]).astype("float32")
@@ -136,28 +111,39 @@ class TestReadOnlyProjection(unittest.TestCase):
         logits = head.transform_logits(paddle.randn([_B, _V]).astype("float16"))
         self.assertEqual(logits.dtype, paddle.float16)
 
-    def test_call_projects_with_the_declared_direction(self):
-        weight = paddle.randn([_H, _V])
-        head = ReadOnlyProjection(weight=weight, transpose_y=False)
-        hidden = paddle.randn([_B, _H])
-        expected = paddle.matmul(hidden, weight)
-        np.testing.assert_allclose(
-            head(hidden).numpy(), expected.numpy(), atol=1e-5
-        )
+    def test_target_seglu_needs_both_halves(self):
+        with self.assertRaises(ValueError) as caught:
+            ReadOnlyProjection(
+                weight=paddle.randn([_V, _H]),
+                transpose_y=True,
+                target_multimax_ranges=paddle.randn([4]),
+            )
+        self.assertIn("target SegLU requires both", str(caught.exception))
 
-    def test_multimax_path_routes_through_seglu(self):
-        ranges = paddle.to_tensor([0.0, 0.1, 0.2, 0.3])
-        ts = paddle.to_tensor([1.0, 2.0, 3.0, 4.0])
+    def test_target_transform_applies_seglu_but_draft_stays_raw(self):
+        # transform_target_logits adds bias then SegLU (teacher side); plain
+        # transform_logits / __call__ stay bias-only (draft side).
+        from paddlefleet.models.gpt.lm_head import SegLU
+
+        weight = paddle.randn([_H, _V])
+        ranges = paddle.to_tensor([-1.0, 1.0, -2.0, 2.0])
+        ts = paddle.to_tensor([0.1, 0.2, 0.3, 0.4])
         head = ReadOnlyProjection(
-            weight=paddle.randn([_H, _V]),
+            weight=weight,
             transpose_y=False,
-            multimax_ranges=ranges,
-            multimax_ts=ts,
+            target_multimax_ranges=ranges,
+            target_multimax_ts=ts,
         )
-        plain = ReadOnlyProjection(weight=head.weight, transpose_y=False)
-        hidden = paddle.randn([_B, _H])
-        self.assertFalse(
-            np.allclose(head(hidden).numpy(), plain(hidden).numpy())
+        logits = paddle.randn([_B, _V])
+        # Draft side: unchanged (no bias, no SegLU).
+        np.testing.assert_allclose(
+            head.transform_logits(logits).numpy(), logits.numpy(), atol=1e-5
+        )
+        # Teacher side: matches an explicit SegLU of the same logits.
+        np.testing.assert_allclose(
+            head.transform_target_logits(logits).numpy(),
+            SegLU(logits, ranges, ts).numpy(),
+            atol=1e-5,
         )
 
 

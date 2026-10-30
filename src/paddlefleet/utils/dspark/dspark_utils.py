@@ -50,11 +50,22 @@ def readonly_embedding(token_ids, weight):
 
 @dataclass(frozen=True)
 class ReadOnlyProjection:
-    """Full-vocabulary projection, including optional bias and Multimax.
+    """Full-vocabulary projection of the frozen target LM head.
 
-    ``transpose_y`` is explicit even for square heads: True means [V, H],
-    False means [H, V]. Detached views preserve the hidden-state gradient.
-    Mutating the underlying target weights before backward is unsupported.
+    Carries the head ``weight`` with an explicit ``transpose_y`` (True means
+    [V, H], False [H, V]; never inferred from shape, which is ambiguous for a
+    square head) and an optional ``bias``. ``weight`` / ``bias`` are detached so
+    the draft branch reads the frozen head without allocating a weight/bias
+    gradient or leaking gradient into the target; ``dspark_readonly`` marks that
+    guarantee for the loss engine.
+
+    SegLU is asymmetric. The dspark draft head does NOT apply SegLU at inference,
+    so draft logits stay un-SegLU'd (``transform_logits`` = bias only). The
+    distillation teacher, however, is the MAIN model output, which DOES apply
+    SegLU; so ``target_multimax_ranges`` / ``target_multimax_ts`` carry the main
+    head's (detached) SegLU params and ``transform_target_logits`` re-applies
+    SegLU on the teacher side only. Mutating the underlying target weights before
+    backward is unsupported.
     """
 
     dspark_readonly = True
@@ -62,8 +73,8 @@ class ReadOnlyProjection:
     weight: Any
     transpose_y: bool
     bias: Any = None
-    multimax_ranges: Any = None
-    multimax_ts: Any = None
+    target_multimax_ranges: Any = None
+    target_multimax_ts: Any = None
 
     def __post_init__(self):
         if self.weight.ndim != 2 or not isinstance(self.transpose_y, bool):
@@ -73,43 +84,48 @@ class ReadOnlyProjection:
         vocab = self.weight.shape[0 if self.transpose_y else 1]
         if self.bias is not None and list(self.bias.shape) != [vocab]:
             raise ValueError("bias must have shape [vocab]")
-        if (self.multimax_ranges is None) != (self.multimax_ts is None):
-            raise ValueError("Multimax requires both ranges and ts")
-        for name in ("multimax_ranges", "multimax_ts"):
+        ranges, ts = self.target_multimax_ranges, self.target_multimax_ts
+        if (ranges is None) != (ts is None):
+            raise ValueError("target SegLU requires both ranges and ts")
+        for name in ("target_multimax_ranges", "target_multimax_ts"):
             value = getattr(self, name)
             if value is not None and list(value.shape) != [4]:
                 raise ValueError(f"{name} must have shape [4]")
-        for name in ("weight", "bias", "multimax_ranges", "multimax_ts"):
+        for name in (
+            "weight",
+            "bias",
+            "target_multimax_ranges",
+            "target_multimax_ts",
+        ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, value.detach())
 
     def transform_logits(self, logits):
-        """Apply the detached target-head bias and shared SegLU transform."""
+        """Draft-side transform: the detached head bias only (no SegLU)."""
         if self.bias is not None:
             # Match linear's autocast bias dtype, including streamed callers
             # that project first and call transform_logits directly.
             logits = logits + self.bias.astype(logits.dtype)
-        if self.multimax_ranges is None:
+        return logits
+
+    def transform_target_logits(self, logits):
+        """Teacher-side transform: head bias, then the main model's SegLU.
+
+        Matches what the main model actually emits (``SegLU(x @ W + bias)``), so
+        the distill L1 target is the real teacher distribution.
+        """
+        logits = self.transform_logits(logits)
+        if self.target_multimax_ranges is None:
             return logits
         # Local import (NOT module-top): paddlefleet.models.gpt.lm_head sits
-        # downstream of dspark_utils in the import graph (gpt_model ->
-        # parallel_multi_token_prediction -> dspark_utils), so a module-top
-        # import here would close a cycle.
+        # downstream of dspark_utils in the import graph, so a module-top import
+        # would close a cycle.
         from paddlefleet.models.gpt.lm_head import SegLU
 
-        # Match the native LM-head AMP path: target SegLU parameters are often
-        # fp32 while the projected logits are bf16/fp16.
-        r = self.multimax_ranges.astype(logits.dtype)
-        t = self.multimax_ts.astype(logits.dtype)
+        r = self.target_multimax_ranges.astype(logits.dtype)
+        t = self.target_multimax_ts.astype(logits.dtype)
         return SegLU(logits, r, t)
-
-    def __call__(self, hidden_states):
-        return self.transform_logits(
-            paddle.matmul(
-                hidden_states, self.weight, transpose_y=self.transpose_y
-            )
-        )
 
 
 # Tensor contracts
