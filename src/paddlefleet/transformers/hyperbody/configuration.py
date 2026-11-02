@@ -307,6 +307,9 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         # Shard the packed encoder trunk over CP (flashmask only). Off: every CP
         # rank runs the whole encoder sequence (cp_replicated_sequence).
         hyperencoder_cp_shard: bool = False,
+        # Support RR dispatch and combine in Encoder.
+        hyperencoder_recompute_dispatch: bool = False,
+        hyperencoder_recompute_combine: bool = False,
         # Encoder-only MoE aux loss, independent of the global coef (the decoder
         # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
         # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
@@ -375,6 +378,12 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         self.hyperencoder_attn_backend = hyperencoder_attn_backend
         self.hyperencoder_packed_decoder = hyperencoder_packed_decoder
         self.hyperencoder_cp_shard = bool(hyperencoder_cp_shard)
+        self.hyperencoder_recompute_dispatch = bool(
+            hyperencoder_recompute_dispatch
+        )
+        self.hyperencoder_recompute_combine = bool(
+            hyperencoder_recompute_combine
+        )
         if self.hyperencoder_cp_shard and not bool(hyperencoder_packed_decoder):
             raise ValueError(
                 "encoder_config.hyperencoder_cp_shard=True requires the packed "

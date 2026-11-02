@@ -1376,20 +1376,23 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         use_flashmask_encoder_attn,
     )
 
-    # Recompute: the encoder trunk supports a single degree of freedom --
-    # ``recompute_granularity in (None, "full")`` (HyperEncoderProvider.__post_init__
-    # pins method="uniform"/num_layers=1). Mirror the decoder's *intent*: if the
-    # run recomputes at all (flat granularity is truthy, e.g. "full"/"selective"),
-    # the encoder also does full recompute -- its only mode -- otherwise None.
-    # We deliberately forward only the mapped granularity, NOT method/num_layers:
-    # forwarding a non-"uniform"/non-1 method or num_layers would trip the
-    # provider's strict guard, and the provider derives them itself when on.
-    # Recompute is numerically transparent, so mapping "selective" -> "full" here
-    # only changes memory/speed, never results.
-    _flat_recompute = getattr(config, "recompute_granularity", None)
-    enc_recompute_granularity = "full" if _flat_recompute else None
-
+    # Encoder recompute is full-only, optionally + RR moe_dispatch/moe_combine;
     enc = config.encoder_config
+    # Appended in a fixed order so the module list is deterministic.
+    _enc_rr = []
+    if getattr(enc, "hyperencoder_recompute_dispatch", False):
+        _enc_rr.append("moe_dispatch")
+    if getattr(enc, "hyperencoder_recompute_combine", False):
+        _enc_rr.append("moe_combine")
+    if _enc_rr:
+        enc_recompute_granularity = "full"
+        enc_recompute_modules = _enc_rr
+    else:
+        enc_recompute_granularity = (
+            "full" if getattr(config, "recompute_granularity", None) else None
+        )
+        enc_recompute_modules = None
+
     enc_cfg = HyperEncoderConfig(
         vocab_size=enc.vocab_size,
         hidden_size=enc.hidden_size,
@@ -1461,6 +1464,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         moe_router_force_load_balancing=getattr(
             config, "moe_router_force_load_balancing", False
         ),
+        moe_subbatch_diag=getattr(config, "moe_subbatch_diag", False),
         apply_rope_fusion=False,
         # Mirror the decoder's routed-scaling learnability: when the flat config
         # turns it on, the decoder's moe_router allocates a learnable
@@ -1471,6 +1475,12 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         ),
         # Recompute intent, clamped to the encoder's only supported mode (see above).
         recompute_granularity=enc_recompute_granularity,
+        # Only set when an RR switch is on; the provider rejects a non-empty
+        # list under any other granularity. Not a declared
+        # ``HyperEncoderConfig`` kwarg: it is an llm_meta key, so it rides
+        # **kwargs -> super().__init__ -> set_expected_keys, exactly like
+        # ``recompute_granularity``.
+        recompute_modules=enc_recompute_modules,
     )
     view = HyperEncoderProvider.from_config(enc_cfg)
     view.language_hidden_size = decoder_hidden

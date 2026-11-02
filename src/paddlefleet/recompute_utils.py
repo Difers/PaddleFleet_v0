@@ -321,7 +321,9 @@ RECOMPUTE_ALL_LAYERS = "all"
 LAYER_AGNOSTIC_RECOMPUTE_MODULES = frozenset({"lm_head", "loss_fn"})
 """Single-instance modules: no layer number, so a layer list is rejected."""
 
-REFINED_RECOMPUTE_MODULES = frozenset({"flash_attn", "moe_combine"})
+REFINED_RECOMPUTE_MODULES = frozenset(
+    {"flash_attn", "moe_combine", "moe_dispatch"}
+)
 """RR modules: count-based selectors always use ``first_n``."""
 
 BLOCK_SCOPED_RECOMPUTE_MODULES = frozenset({"mhc_block"})

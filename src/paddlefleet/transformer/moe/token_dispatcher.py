@@ -36,6 +36,7 @@ from .fp8_utils import FP8_ALIGN, _w4a8_quant_pack_for_hybridep_dispatch
 from .fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
     DeepEPCombineAsyncRefinedRecompute,
+    DeepEPDispatchRefinedRecompute,
     fused_combine,
     fused_dispatch,
     get_hybrid_ep_buffer,
@@ -168,6 +169,7 @@ class _DispatchManager(ABC):
         hidden_states: paddle.Tensor,
         fp8_dispatch: bool,
         async_finish: bool,
+        use_rr_deepep_dispatch: bool = False,
     ) -> paddle.Tensor:
         """Dispatch the hidden_states according to the routing_map."""
         pass
@@ -519,7 +521,9 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
     ) -> paddle.Tensor:
+        del use_rr_deepep_dispatch
         return self.dispatch_overlap(
             hidden_states,
             self.token_indices,
@@ -739,12 +743,13 @@ class _MoonEPManager(_DispatchManager):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
     ):
         if fp8_dispatch or use_ue8m0 or using_sonic_moe:
             raise NotImplementedError(
                 "MoonEP currently supports BF16 dispatch."
             )
-        del async_finish
+        del async_finish, use_rr_deepep_dispatch
         self._ensure_buffer(hidden_states)
         state = {}
         (
@@ -892,6 +897,7 @@ class _DeepEPManager(_DispatchManager):
                 "DeepEP is not supported in your paddlepaddle whl package."
             )
         self._rr_fusedcombined = None
+        self._rr_fuseddispatch = None
 
     def setup_metadata(
         self,
@@ -949,20 +955,52 @@ class _DeepEPManager(_DispatchManager):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
     ) -> paddle.Tensor:
-        hidden_states, dispatched_probs, states, scale = fused_dispatch(
-            hidden_states,
-            self.token_indices,
-            self.token_probs,
-            self.num_experts,
-            self.group,
-            fp8_dispatch=fp8_dispatch,
-            async_finish=async_finish,
-            moe_ep_barrier=self.moe_ep_barrier,
-            use_ue8m0=use_ue8m0,
-            using_sonic_moe=using_sonic_moe,
-            use_w4a8=self._use_w4a8,
-        )
+        if use_rr_deepep_dispatch:
+            if self._rr_fuseddispatch is None:
+                self._rr_fuseddispatch = DeepEPDispatchRefinedRecompute()
+            elif not isinstance(
+                self._rr_fuseddispatch, DeepEPDispatchRefinedRecompute
+            ):
+                raise RuntimeError(
+                    f"_rr_fuseddispatch type mismatch: expected DeepEPDispatchRefinedRecompute, "
+                    f"got {type(self._rr_fuseddispatch).__name__}."
+                )
+            # The RR path owns the whole dispatch call, so the fp8 knobs cannot
+            # be honoured here; MoELayer.rr_recompute_update already rejected
+            # them, this only guards a direct manager call.
+            if fp8_dispatch or using_sonic_moe or self._use_w4a8:
+                raise ValueError(
+                    "use_rr_deepep_dispatch requires a bf16 dispatch, got "
+                    f"fp8_dispatch={fp8_dispatch}, "
+                    f"using_sonic_moe={using_sonic_moe}, "
+                    f"use_w4a8={self._use_w4a8}."
+                )
+            hidden_states, dispatched_probs, states, scale = (
+                self._rr_fuseddispatch(
+                    hidden_states,
+                    self.token_indices,
+                    self.token_probs,
+                    self.num_experts,
+                    self.group,
+                    moe_ep_barrier=self.moe_ep_barrier,
+                )
+            )
+        else:
+            hidden_states, dispatched_probs, states, scale = fused_dispatch(
+                hidden_states,
+                self.token_indices,
+                self.token_probs,
+                self.num_experts,
+                self.group,
+                fp8_dispatch=fp8_dispatch,
+                async_finish=async_finish,
+                moe_ep_barrier=self.moe_ep_barrier,
+                use_ue8m0=use_ue8m0,
+                using_sonic_moe=using_sonic_moe,
+                use_w4a8=self._use_w4a8,
+            )
         self.handle = states["handle"]
         self.tokens_per_expert = states["tokens_per_expert"]
         self.dispatched_indices = states["dispatched_indices"]
@@ -1281,6 +1319,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
     ):
         return self._comm_manager.dispatch(
             hidden_states,
@@ -1288,6 +1327,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             async_finish,
             use_ue8m0=use_ue8m0,
             using_sonic_moe=using_sonic_moe,
+            use_rr_deepep_dispatch=use_rr_deepep_dispatch,
         )
 
     def dispatch_postprocess(
@@ -1494,7 +1534,11 @@ class AllToAllTokenDispatcher(nn.Layer):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
     ):
+        del (
+            use_rr_deepep_dispatch
+        )  # DeepEP-only; MoELayer never enables it here.
         # Second All-to-All: Exchange expert tokens across ranks. `gathered_tokens` are the tokens that will be processed by current rank
         global_input_tokens = _AllToAll.apply(
             self.output_shape_tokens,
@@ -2637,11 +2681,15 @@ class AllGatherTokenDispatcher(nn.Layer):
         async_finish: bool = False,
         use_ue8m0: bool = False,
         using_sonic_moe: bool = True,
+        use_rr_deepep_dispatch: bool = False,
     ):
         """No-op pass-through.  AllGather already happened in dispatch_preprocess,
         so every rank already holds the full global token list.  Returns
         (tokens, fp8_handle) where fp8_handle carries the dispatch scale if
         fp8_dispatch is active."""
+        del (
+            use_rr_deepep_dispatch
+        )  # DeepEP-only; MoELayer never enables it here.
         if not using_sonic_moe:
             raise ValueError(
                 "AllGatherTokenDispatcher requires using_sonic_moe=True; "

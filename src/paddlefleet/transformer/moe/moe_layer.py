@@ -959,6 +959,7 @@ class MoELayer(nn.Layer):
                         p.is_distributed = True
 
         self.use_rr_deepep_combine = False
+        self.use_rr_deepep_dispatch = False
 
     def _update_layer_aware_recompute(self):
         """(Re-)resolve the selective-recompute flags that depend on the layer id.
@@ -1003,6 +1004,7 @@ class MoELayer(nn.Layer):
             )
 
     def rr_recompute_update(self, in_full_recompute, in_mlp_recompute):
+        self._rr_dispatch_update(in_full_recompute, in_mlp_recompute)
         if (
             self.config.recompute_modules is not None
             and "moe_combine" in self.config.recompute_modules
@@ -1018,6 +1020,13 @@ class MoELayer(nn.Layer):
             if self.config.recompute_granularity is None:
                 raise ValueError(
                     "recompute_granularity must be set when moe_combine RR is enabled."
+                )
+            vpp = getattr(
+                self.config, "virtual_pipeline_model_parallel_size", None
+            )
+            if vpp is not None and vpp > 1:
+                raise ValueError(
+                    "moe_combine RR does not support virtual pipeline "
                 )
             if isinstance(self.config.recompute_modules, dict):
                 spec = self.config.recompute_modules["moe_combine"]
@@ -1048,6 +1057,79 @@ class MoELayer(nn.Layer):
             raise ValueError(
                 "Enabling rr for moe_combine is meaningless when neither full_recompute "
                 "nor mlp_recompute is active."
+            )
+
+    def _rr_dispatch_update(self, in_full_recompute, in_mlp_recompute):
+        """Resolve ``moe_dispatch`` RR: run the forward dispatch a2a once.
+
+        Unlike ``moe_combine`` RR this needs no shared-expert overlap -- the
+        dispatch has nothing to overlap with -- but it does need a bf16
+        dispatch, because the cache only handles the plain row tensor.
+        """
+        modules = self.config.recompute_modules
+        if modules is None or "moe_dispatch" not in modules:
+            return
+        # fp8 / W4A8 quantize before the a2a and return a (fp8, scale) pair
+        # (DeepEPDispatch.forward); the RR cache stores a single row tensor, so
+        # that shape would be silently wrong.
+        if self.fp8_dispatch or self.use_w4a8:
+            raise ValueError(
+                "recompute_modules contains 'moe_dispatch', which does not "
+                f"support fp8 dispatch (fp8={self.fp8!r}, "
+                f"use_w4a8={self.use_w4a8}). The RR cache only handles the "
+                "bf16 dispatch return shape. Note 'moe_dispatch' is meant for "
+                "the bf16 HyperBody encoder MoE (see the encoder-scoped "
+                "switch); the fp8 decoder cannot use it, so drop it from the "
+                "top-level recompute_modules."
+            )
+        if self.moe_token_dispatcher_type != "deepep":
+            raise ValueError(
+                "moe_dispatch RR is only supported in DeepEP mode, got "
+                f"moe_token_dispatcher_type={self.moe_token_dispatcher_type!r}."
+            )
+        if self.config.recompute_granularity is None:
+            raise ValueError(
+                "recompute_granularity must be set when moe_dispatch RR is enabled."
+            )
+        vpp = getattr(self.config, "virtual_pipeline_model_parallel_size", None)
+        if vpp is not None and vpp > 1:
+            raise ValueError(
+                "moe_dispatch RR does not support virtual pipeline "
+                f"(virtual_pipeline_model_parallel_size={vpp}): VPP replays a "
+                "chunk's recompute out of order against the first forward, so "
+                "the RR queue would hand a layer's cached dispatch to a "
+                "different chunk's replay -- wrong results, no error."
+            )
+        if isinstance(modules, dict):
+            spec = modules["moe_dispatch"]
+            # A layer count still means first_n only; a layer list carries its
+            # own layers and needs no method.
+            if isinstance(spec, int) and not isinstance(spec, bool):
+                if spec >= 0 and self.config.recompute_method != "first_n":
+                    raise ValueError(
+                        "recompute_modules dict mode for moe_dispatch RR requires "
+                        f"recompute_method='first_n', got '{self.config.recompute_method}'."
+                    )
+            if not hasattr(self, "layer_number"):
+                raise ValueError(
+                    "layer_number must be set before rr_recompute_update is called in dict mode. "
+                    "Ensure set_layer_number() is called first."
+                )
+        self.use_rr_deepep_dispatch = module_needs_refined_recompute(
+            "moe_dispatch",
+            getattr(self, "layer_number", None),
+            self.config,
+            is_mtp_layer=getattr(self, "is_mtp_layer", False),
+        )
+        if (
+            (not in_full_recompute)
+            and (not in_mlp_recompute)
+            and self.use_rr_deepep_dispatch
+        ):
+            raise ValueError(
+                "Enabling rr for moe_dispatch is meaningless when neither "
+                "full_recompute nor mlp_recompute is active: the first forward "
+                "would cache a frame that no recompute pass ever consumes."
             )
 
     def _init_expert_parallel(self):
@@ -1211,6 +1293,7 @@ class MoELayer(nn.Layer):
                 async_finish=async_finish,
                 use_ue8m0=self.use_ue8m0,
                 using_sonic_moe=self.using_sonic_moe,
+                use_rr_deepep_dispatch=self.use_rr_deepep_dispatch,
             )
         )
         return hidden_states, fp8_dispatched_handle

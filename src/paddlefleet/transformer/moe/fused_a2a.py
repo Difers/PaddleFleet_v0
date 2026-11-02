@@ -892,6 +892,158 @@ class DeepEPCombineAsyncRefinedRecompute:
         return self.forward(*args, **kwargs)
 
 
+class DeepEPDispatchFunctor(PyLayer):
+    """Recompute-pass stand-in for ``DeepEPDispatch``: replay the cached rows
+    and skip the forward a2a; backward still runs the reverse a2a with it.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hold_tensors,
+        x,
+        token_indices,
+        token_probs,
+        group,
+        moe_ep_barrier: bool = True,
+    ):
+        """Return the cached dispatch outputs, skipping the forward a2a."""
+        ctx.group = group
+        # Reuse the first pass's handle
+        ctx.handle = hold_tensors["states"]["handle"]
+        ctx.moe_ep_barrier = moe_ep_barrier
+        # Mirrors DeepEPDispatch.forward: backward gets grad_output as-is (not cast to
+        # recv_x's dtype); grad_x is produced by the reverse a2a, not tied to x's dtype.
+        ctx.set_grad_in_dtype_consistent(False)
+        return hold_tensors["recv_x"], hold_tensors["recv_token_probs"]
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_token_probs):
+        """Backward pass of fused dispatch."""
+        return fused_dispatch_backward_func(
+            grad_output,
+            grad_token_probs,
+            ctx.group,
+            ctx.handle,
+            None,  # previous_event
+            False,  # async_finish
+            False,  # allocate_on_comm_stream
+            moe_ep_barrier=ctx.moe_ep_barrier,
+        )
+
+
+class DeepEPDispatchRefinedRecompute:
+    """RefinedRecompute for deepep fused_dispatch: cache the first pass's rows
+    and DeepEP states and replay them on recompute, so the forward a2a runs once
+    per micro-batch. Cost: the dispatched row buffer stays alive until backward,
+    so the consumer must honour ``rr_holds_dispatched``. BF16 only -- fp8/W4A8
+    dispatch returns a ``(fp8, scale)`` pair and is rejected by
+    ``rr_recompute_update``.
+    """
+
+    def __init__(self):
+        """__init__"""
+        self._hold_tensors_queue = queue.Queue()
+        global_rr_queue_log.update(self._hold_tensors_queue, "DeepEPDispatch")
+
+    @property
+    def pending(self):
+        """Cached frames waiting for their recompute pass."""
+        return self._hold_tensors_queue.qsize()
+
+    def forward(
+        self,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        moe_ep_barrier: bool = True,
+    ):
+        """forward"""
+        tracer = framework._dygraph_tracer()
+        if not tracer._has_grad:
+            return self._first_fwd(
+                x,
+                token_indices,
+                token_probs,
+                num_experts,
+                group,
+                moe_ep_barrier,
+            )
+        if self._hold_tensors_queue.empty():
+            raise RuntimeError(
+                "[DeepEPDispatchRefinedRecompute] Queue is empty during the "
+                "second forward (recompute) pass. This usually indicates a "
+                "first-forward / recompute-forward call count mismatch."
+            )
+        hold_tensors = self._hold_tensors_queue.get()
+        return self._second_fwd(
+            hold_tensors, x, token_indices, token_probs, group, moe_ep_barrier
+        )
+
+    @paddle.no_grad()
+    def _first_fwd(
+        self, x, token_indices, token_probs, num_experts, group, moe_ep_barrier
+    ):
+        """_first_fwd"""
+        recv_x, recv_token_probs, states, _event = fused_dispatch_forward_func(
+            x,
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            moe_ep_barrier=moe_ep_barrier,
+        )
+        if isinstance(recv_x, tuple):
+            raise RuntimeError(
+                "[DeepEPDispatchRefinedRecompute] fp8 dispatch returns "
+                "(fp8, scale) and is not supported; "
+                "MoELayer.rr_recompute_update should have rejected it."
+            )
+        # Wait for the a2a to land before snapshotting (same as combine RR).
+        wait_for_deepep(group.id)
+        # First pass frees these: clone the small metadata, alias the big rows
+        # and keep them alive via MlpNode's `rr_holds_dispatched` (too big to copy).
+        cached_states = dict(states)
+        cached_states["dispatched_indices"] = states[
+            "dispatched_indices"
+        ].clone()
+        tokens_per_expert = states["tokens_per_expert"]
+        if isinstance(tokens_per_expert, paddle.Tensor):
+            cached_states["tokens_per_expert"] = tokens_per_expert.clone()
+        self._hold_tensors_queue.put(
+            {
+                "recv_x": recv_x.detach(),
+                "recv_token_probs": recv_token_probs.detach().clone(),
+                "states": cached_states,
+            }
+        )
+        # The first pass gets the originals: it is allowed to consume them.
+        return recv_x, recv_token_probs, states, None
+
+    def _second_fwd(
+        self, hold_tensors, x, token_indices, token_probs, group, moe_ep_barrier
+    ):
+        """_second_fwd"""
+        recv_x, recv_token_probs = DeepEPDispatchFunctor.apply(
+            hold_tensors,
+            x,
+            token_indices,
+            token_probs,
+            group,
+            moe_ep_barrier,
+        )
+        # The cached states carry the first pass's handle / dispatched_indices /
+        # tokens_per_expert; the caller writes them onto the comm manager, so
+        # permute and combine see the layout the cached rows belong to.
+        return recv_x, recv_token_probs, hold_tensors["states"], None
+
+    def __call__(self, *args, **kwargs):
+        """__call__"""
+        return self.forward(*args, **kwargs)
+
+
 if HAVE_DEEP_EP:
 
     def fused_dispatch(
