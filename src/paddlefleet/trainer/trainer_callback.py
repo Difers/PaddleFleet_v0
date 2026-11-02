@@ -1048,6 +1048,16 @@ class FP8QuantWeightCallback(TrainerCallback):
     Callback for FP8 weight quantization during training
     """
 
+    def on_init_end(self, args, state, control, **kwargs):
+        """
+        fsdp: mark expert weights for fp8 param gather; runs before fully_shard.
+        """
+        if args.using_sonic_moe or not _fsdp_owns_param_storage(args):
+            return
+        from paddlefleet.transformer.moe.fp8_utils import mark_fsdp_fp8_params
+
+        mark_fsdp_fp8_params(args, kwargs["model"])
+
     def on_step_begin(self, args, state, control, **kwargs):
         """
         Quantize expert weights to FP8 before each training step
@@ -1073,7 +1083,11 @@ class FP8QuantWeightCallback(TrainerCallback):
                 # fsdp: weights are storage-less shells here and the plain
                 # optimizer has no clear_param_storage; gather layer by layer
                 # to quantize, and leave the bf16 shards to fsdp.
-                _fsdp_fp8_quant_weight(model, True, quant_transpose=False)
+                if not any(
+                    getattr(p, "_fsdp_fp8_quantizer", None) is not None
+                    for p in model.parameters()
+                ):
+                    _fsdp_fp8_quant_weight(model, True, quant_transpose=False)
                 moe_weights_name = _fsdp_expert_master_weight_names()
             else:
                 model.fp8_quant_weight(True, quant_transpose=False)

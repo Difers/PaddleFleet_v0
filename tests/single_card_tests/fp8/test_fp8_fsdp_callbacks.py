@@ -31,6 +31,7 @@ Run with:
 from __future__ import annotations
 
 import contextlib
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -43,10 +44,12 @@ from paddlefleet.trainer.trainer_callback import (
     SonicMoELayoutSwitchCallback,
 )
 from paddlefleet.trainer.trainer_utils import ShardingOption
+from paddlefleet.transformer.moe import fp8_utils, moe_expert
 from paddlefleet.transformer.moe.moe_layer import MoELayer
 from paddlefleet.transformer.transformer_layer import TransformerLayer
 
 _GET_FSDP_CONTEXT = "paddle.distributed.fsdp._fsdp_context.get_fsdp_context"
+_PADDLE_FP8 = "paddle.distributed.fsdp._fp8_utils"
 _TRANSFORMER_LAYER = (
     "paddlefleet.transformer.transformer_layer.TransformerLayer"
 )
@@ -152,6 +155,9 @@ class _FSDPModel(_ExplodingModel):
         # A non-transformer sublayer must be skipped, not unsharded.
         return [self, object(), *self._layers]
 
+    def parameters(self):
+        return [p for layer in self._layers for p in layer.expert_params]
+
 
 class _WrappedOptimizer:
     """Mimics MixPrecisionOptimizer: master weights live on ``_inner_opt``."""
@@ -241,6 +247,14 @@ class TestFP8QuantWeightCallbackUnderFSDP(unittest.TestCase):
         self.assertIsNone(self.ctx.unsharded)
         self.assertEqual(self.layers[1].quant_calls, [])
         self.assertEqual(self.offloaded, [])
+
+    def test_marked_experts_skip_pre_quant(self):
+        """fsdp builds the fp8 caches of marked experts when gathering."""
+        self.layers[0].expert_params[0]._fsdp_fp8_quantizer = object()
+        self._step(_args([ShardingOption.FSDP], offload_master=False))
+        self.assertEqual(self.ctx.unshard_log, [])
+        for layer in self.layers:
+            self.assertEqual(layer.quant_calls, [])
 
     def test_offloads_and_reloads_expert_master_weights_only(self):
         self._step(_args([ShardingOption.FSDP]))
@@ -363,6 +377,83 @@ class TestFSDPExpertMasterWeightNames(unittest.TestCase):
                 trainer_callback._fsdp_expert_master_weight_names(),
                 ["fuse_params_expert_0", "e.w1", "e.w2"],
             )
+
+
+class TestMarkFSDPFP8Params(unittest.TestCase):
+    """``on_init_end`` marks grouped experts for fsdp fp8 param gather."""
+
+    class _Grouped:
+        def __init__(self, prefix):
+            self.weight1 = _FakeParam(f"{prefix}.w1")
+            self.weight2 = _FakeParam(f"{prefix}.w2")
+
+    class _Sonic(_Grouped):
+        pass
+
+    class _Weights(list):
+        shape = (2,)
+
+    def setUp(self):
+        for name, new in (
+            ("GroupedMLPExpert", self._Grouped),
+            ("SonicMoEExpert", self._Sonic),
+        ):
+            patcher = mock.patch.object(moe_expert, name, new)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Pretend paddle supports fsdp fp8 gather.
+        patcher = mock.patch.dict(sys.modules, {_PADDLE_FP8: SimpleNamespace()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.grouped = self._Grouped("grouped")
+        self.sonic = self._Sonic("sonic")
+        self.subs = [object(), self.grouped, self.sonic]
+        self.model = SimpleNamespace(sublayers=lambda: list(self.subs))
+
+    @staticmethod
+    def _args(offline=True, **kwargs):
+        return SimpleNamespace(offline_quant_expert_weight=offline, **kwargs)
+
+    def test_on_init_end_marks_only_under_fsdp(self):
+        callback = FP8QuantWeightCallback()
+        with mock.patch.object(fp8_utils, "mark_fsdp_fp8_params") as mark:
+            for args in (
+                _args([ShardingOption.FSDP], using_sonic_moe=True),
+                _args([ShardingOption.SHARD_OP]),
+            ):
+                callback.on_init_end(args, None, None, model=self.model)
+            mark.assert_not_called()
+            args = _args([ShardingOption.FSDP])
+            callback.on_init_end(args, None, None, model=self.model)
+        mark.assert_called_once_with(args, self.model)
+
+    def test_marks_nothing_when_off_or_unsupported(self):
+        mark = fp8_utils.mark_fsdp_fp8_params
+        mark(self._args(offline=False), self.model)
+        with mock.patch.dict(sys.modules, {_PADDLE_FP8: None}):
+            mark(self._args(), self.model)
+        self.assertFalse(hasattr(self.grouped.weight1, "_fsdp_fp8_quantizer"))
+        self.subs.append(SimpleNamespace(use_ue8m0=True))
+        with self.assertRaises(NotImplementedError):
+            mark(self._args(), self.model)
+
+    def test_marks_grouped_experts_not_sonic(self):
+        fp8_utils.mark_fsdp_fp8_params(self._args(), self.model)
+        quantizer = self.grouped.weight1._fsdp_fp8_quantizer
+        self.assertFalse(hasattr(self.sonic.weight1, "_fsdp_fp8_quantizer"))
+        self.assertEqual(
+            [transpose for _, _, transpose in quantizer.attrs], [False, True]
+        )
+        with mock.patch.object(
+            fp8_utils, "fused_stack_quant_without_cache"
+        ) as quant:
+            quantizer(self._Weights(["e0", "e1"]), True)
+        quant.assert_called_once_with(["e0", "e1"], transpose=True)
+
+        args = self._args(using_cache_weight_quant_transpose=False)
+        fp8_utils.mark_fsdp_fp8_params(args, self.model)
+        attrs = self.grouped.weight1._fsdp_fp8_quantizer.attrs
+        self.assertEqual([transpose for _, _, transpose in attrs], [False])
 
 
 class TestSonicMoECallbackUnderFSDP(unittest.TestCase):

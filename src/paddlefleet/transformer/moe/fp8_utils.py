@@ -236,6 +236,42 @@ def fused_stack_quant_without_cache(
     return w, scale
 
 
+def mark_fsdp_fp8_params(args, model):
+    """Let fsdp gather grouped fp8 weights."""
+    if not getattr(args, "offline_quant_expert_weight", False):
+        return
+    try:
+        import paddle.distributed.fsdp._fp8_utils  # noqa: F401
+    except ImportError:
+        return  # paddle without fsdp fp8 gather: keep per-step pre-quant
+    if any(getattr(m, "use_ue8m0", False) for m in model.sublayers()):
+        raise NotImplementedError("fsdp fp8 param gather: no ue8m0 support.")
+    from paddlefleet.transformer.moe.moe_expert import (
+        GroupedMLPExpert,
+        SonicMoEExpert,
+    )
+
+    # fsdp quantizes each shard to fp8 and gathers it into these caches.
+    def quantizer(weights, transpose):
+        return fused_stack_quant_without_cache(
+            [weights[i] for i in range(weights.shape[0])], transpose=transpose
+        )
+
+    quantizer.block = 128
+    # (data attr, scale attr, transpose): forward reads the transposed copy.
+    keep_transpose = getattr(args, "using_cache_weight_quant_transpose", True)
+    quantizer.attrs = (
+        ("fp8_weight_stacked", "fp8_scale_stacked", False),
+        ("fp8_weight_stacked_transpose", "fp8_scale_stacked_transpose", True),
+    )[: 2 if keep_transpose else 1]
+    for layer in model.sublayers():
+        if isinstance(layer, GroupedMLPExpert) and not isinstance(
+            layer, SonicMoEExpert
+        ):
+            layer.weight1._fsdp_fp8_quantizer = quantizer
+            layer.weight2._fsdp_fp8_quantizer = quantizer
+
+
 def fused_stack_quant(
     expert_weight_list, transpose=False, use_ue8m0=False, num_expert=None
 ):
