@@ -1007,6 +1007,10 @@ class DSv4HybridAttention(Attention):
 
         # Get Q, K, V tensors
         # In CP mode, pass position_offset so RoPE uses correct global positions.
+        # ``pg_collection.cp`` follows the dynamic context parallel selection
+        # (ProcessGroupCollection.cp), so cp_size here is the current
+        # microbatch's size and ``docmask_seqlen = sq * cp_size`` below matches
+        # the row width it was packed with.
         cp_pg = getattr(self, "pg_collection", None)
         cp_pg = cp_pg.cp if cp_pg is not None else None
         cp_size = getattr(cp_pg, "nranks", 1) if cp_pg is not None else 1

@@ -19,7 +19,6 @@ import queue
 import paddle
 from paddle import _C_ops, framework
 from paddle.autograd import PyLayer
-from paddle.distributed import fleet
 from paddle.nn.functional.flash_attention import flashmask_attention
 from paddlefleet_ops import is_flash_mask_available
 from paddlefleet_ops.flash_mask_facade import (
@@ -36,6 +35,7 @@ from paddlefleet.context_parallel_utils import (
     cp_flashmask_allgatherkv_balance_forward,
     cp_flashmask_swa_p2p_backward,
     cp_flashmask_swa_p2p_forward,
+    get_current_cp_group,
 )
 from paddlefleet.refined_recompute.queue_check import global_rr_queue_log
 
@@ -1464,8 +1464,7 @@ class RefinedRcomputeFlashMaskCpAttention:
             raise NotImplementedError("Fixed seed offset is not supported yet.")
 
         # Get communication group
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
 
         if mode == "dualchunk_allgather":
             assert query_states.shape[1] % 2 == 0, (

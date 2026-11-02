@@ -107,6 +107,7 @@ from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
 from paddlefleet.context_parallel_utils import (
     ContextParallelGatherOp,
     preprocess_index,
+    refresh_cp_state,
 )
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.transformer.cp_utils import (
@@ -761,7 +762,11 @@ class MQALatentAttention(FleetLayer):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
 
-        # CP state, same derivation as csa_attention.py:2079-2090.
+        # CP state, same derivation as csa_attention.py. Under dynamic context
+        # parallel these four fields are re-pointed at the current microbatch's
+        # group by refresh_cp_state() at the top of forward; the layout check
+        # below stays keyed on the build-time (static) degree, which is what it
+        # has always been.
         cp_pg = pg_collection.cp if pg_collection is not None else None
         if cp_pg is not None and getattr(cp_pg, "nranks", 1) > 1:
             self.cp_group = cp_pg
@@ -913,7 +918,10 @@ class MQALatentAttention(FleetLayer):
         )
         # Row layout the indexer forward runs on; see ``mqa_indexer_cp_mode`` in
         # ``transformer_config`` and ``_indexer_topk_dualchunk``. Gated on a real
-        # CP group: with ``cp_size == 1`` there is nothing to rebalance.
+        # CP group: with ``cp_size == 1`` there is nothing to rebalance. Read
+        # here in __init__ on purpose: this selects a layout for the whole run,
+        # so it must stay on the static degree even when DCP later re-points
+        # self.cp_* at a smaller per-microbatch group.
         self.indexer_dualchunk = (
             getattr(config, "mqa_indexer_cp_mode", None) == "dualchunk_p2p"
             and self.cp_enabled
@@ -1170,6 +1178,10 @@ class MQALatentAttention(FleetLayer):
         Returns:
             ``[b, s, h * v_head_dim]`` (this rank's query slice under CP)
         """
+        # Dynamic context parallel: this microbatch may run on a smaller CP group
+        # than the one captured in __init__. No-op (and bitwise unchanged) when
+        # DCP is off; every helper below reads self.cp_* after this point.
+        refresh_cp_state(self)
         if packed_seq_params is not None:
             raise NotImplementedError(
                 "latent MQA does not support packed_seq_params; "

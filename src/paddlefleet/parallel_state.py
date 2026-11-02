@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import paddle
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
 import warnings
 
 from .utils._fleet_utils import GlobalMemoryBuffer
+
+logger = logging.getLogger(__name__)
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -76,8 +79,25 @@ _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 
-# Context parallel group that the current rank belongs to
+# Context parallel group that the current rank belongs to.
+# NOTE(dcp): this stays the *static* (global) CP group built by fleet. The group
+# actually used by CP collectives is resolved by get_context_parallel_group(),
+# which prefers the dynamic group selected for the current microbatch.
 _CONTEXT_PARALLEL_GROUP = None
+
+### Dynamic context parallel (DCP) states
+# Pre-built CP groups of every allowed size, only the one this rank belongs to
+# is kept: {group_size: comm_group}. Size 1 maps to None, which means "no CP
+# collective needed" and matches the existing `group is None -> world size 1`
+# convention below.
+_DYNAMIC_CONTEXT_PARALLEL_GROUPS = {}
+# Size of the CP group selected for the current microbatch. None means DCP is
+# not driving the group choice, so the static group is used.
+_CURRENT_CONTEXT_PARALLEL_SIZE = None
+# Effective value of max_dynamic_context_parallel_size (defaults to the pool
+# size, i.e. sharding_degree).
+_MAX_DYNAMIC_CONTEXT_PARALLEL_SIZE = None
+### End of dynamic context parallel states
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -93,6 +113,8 @@ _GLOBAL_MEMORY_BUFFER = None
 def initialize_model_parallel(
     hcg: topo.EPHybridCommunicateGroup | topo.HybridCommunicateGroup,
     virtual_pipeline_model_parallel_size: int | None = None,
+    enable_dynamic_context_parallel: bool = False,
+    max_dynamic_context_parallel_size: int | None = None,
 ):
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
@@ -114,6 +136,11 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_CP
     _CONTEXT_PARALLEL_GROUP = getattr(hcg, "_cp_comm_group", None)
     _DATA_PARALLEL_GROUP_WITH_CP = getattr(hcg, "_cp_sharding_comm_group", None)
+
+    if enable_dynamic_context_parallel:
+        initialize_dynamic_context_parallel_groups(
+            hcg, max_dynamic_context_parallel_size
+        )
 
     if virtual_pipeline_model_parallel_size is not None:
         if not hcg._pp_comm_group.nranks > 1:
@@ -211,7 +238,13 @@ def get_expert_data_parallel_group(check_initialized=True):
 
 
 def get_context_parallel_group(check_initialized=False):
-    """Get the context-parallel group the caller rank belongs to."""
+    """Get the context-parallel group the caller rank belongs to.
+
+    When DCP has selected a size for the current microbatch, that dynamic group
+    is returned; otherwise the static group built by fleet is returned.
+    """
+    if _CURRENT_CONTEXT_PARALLEL_SIZE is not None:
+        return _DYNAMIC_CONTEXT_PARALLEL_GROUPS[_CURRENT_CONTEXT_PARALLEL_SIZE]
     if check_initialized:
         assert _CONTEXT_PARALLEL_GROUP is not None, (
             "context parallel group is not initialized"
@@ -220,11 +253,294 @@ def get_context_parallel_group(check_initialized=False):
 
 
 def get_context_parallel_world_size():
-    """Return world size for the tensor-model-parallel group."""
+    """Return world size of the CP group currently in effect."""
     if get_context_parallel_group() is None:
         return 1
     else:
         return get_context_parallel_group().world_size
+
+
+def get_global_context_parallel_group(check_initialized=False):
+    """Get the static (whole-run) context-parallel group.
+
+    Use this instead of get_context_parallel_group() whenever the answer must
+    not change from microbatch to microbatch under DCP -- e.g. parameter
+    sharding/placement decisions and anything baked into layer construction.
+    """
+    if check_initialized:
+        assert _CONTEXT_PARALLEL_GROUP is not None, (
+            "context parallel group is not initialized"
+        )
+    return _CONTEXT_PARALLEL_GROUP
+
+
+def get_global_context_parallel_world_size():
+    """Return world size of the static context-parallel group."""
+    if get_global_context_parallel_group() is None:
+        return 1
+    else:
+        return get_global_context_parallel_group().world_size
+
+
+### Dynamic context parallel (DCP) group management
+
+
+def _dynamic_context_parallel_pools(hcg):
+    """Return the rank pools DCP groups are carved out of, one per sharding group.
+
+    This mirrors exactly how fleet builds the static CP group, so DCP inherits
+    the same rank ordering instead of guessing a stride:
+    `split_context_comm_list` (paddle/distributed/fleet/base/topology.py)
+    takes `merge_inner_comm_list(topo, "moe_sharding", "dense_sharding")` -- one
+    list of `sharding_degree` ranks per sharding group -- and slices it into
+    contiguous blocks of `cp_degree`, i.e. inside a pool the layout is
+    `idx = cp_sharding_idx * cp_degree + cp_idx` with cp innermost.
+    DCP only relaxes the block length from a fixed `cp_degree` to any `s`.
+    """
+    return hcg.merge_inner_comm_list(
+        hcg._dense_topo, "moe_sharding", "dense_sharding"
+    )
+
+
+def initialize_dynamic_context_parallel_groups(
+    hcg, max_dynamic_context_parallel_size=None
+):
+    """Pre-build every CP group DCP may switch to at run time.
+
+    NCCL groups cannot be created per step, so all power-of-two group sizes up
+    to `max_dynamic_context_parallel_size` are created up front. The default is
+    the pool size (== sharding_degree), which allows a single long sample to be
+    spread over the whole sharding group.
+
+    Every rank walks `(size, pool, block)` in the same order, because
+    `paddle.distributed.new_group` is a collective call and a divergent order
+    hangs.
+    """
+    global _DYNAMIC_CONTEXT_PARALLEL_GROUPS
+    global _MAX_DYNAMIC_CONTEXT_PARALLEL_SIZE
+    global _CURRENT_CONTEXT_PARALLEL_SIZE
+
+    _DYNAMIC_CONTEXT_PARALLEL_GROUPS = {}
+    _CURRENT_CONTEXT_PARALLEL_SIZE = None
+
+    # Only EPHybridCommunicateGroup owns a `context` axis; on a plain
+    # HybridCommunicateGroup there is no CP at all.
+    if not hasattr(hcg, "_cp_topo"):
+        _MAX_DYNAMIC_CONTEXT_PARALLEL_SIZE = 1
+        _DYNAMIC_CONTEXT_PARALLEL_GROUPS = {1: None}
+        logger.info(
+            "[DCP] requested but this HybridCommunicateGroup has no `context` "
+            "axis (only EPHybridCommunicateGroup does), so DCP stays disabled "
+            "with a single size-1 group"
+        )
+        return _DYNAMIC_CONTEXT_PARALLEL_GROUPS
+
+    cp_degree = hcg._cp_degree
+    # NOTE(dcp): pp/mp are out of scope for now, and silently producing wrong
+    # groups is worse than refusing to start.
+    #   - mp > 1: the CP group is no longer a stride-1 block of the sharding
+    #     group (`model` sits inside `context` in the topology axis order), so
+    #     the size-aligned contiguous-block carving below would build groups
+    #     whose members are not actually CP peers.
+    #   - pp > 1: `merge_inner_comm_list` returns one pool per pipeline stage,
+    #     and the scheduler has no notion of per-stage pools yet -- every stage
+    #     must agree on the group table, which is untested.
+    if getattr(hcg, "_mp_degree", 1) != 1:
+        raise NotImplementedError(
+            f"dynamic context parallel does not support tensor model parallel "
+            f"yet (mp_degree={hcg._mp_degree}); the CP group would stop being a "
+            f"contiguous block of the sharding group"
+        )
+    if getattr(hcg, "_pp_degree", 1) != 1:
+        raise NotImplementedError(
+            f"dynamic context parallel does not support pipeline parallel yet "
+            f"(pp_degree={hcg._pp_degree}); the per-stage rank pools and the "
+            f"per-microbatch group switching have not been worked through"
+        )
+
+    pools = _dynamic_context_parallel_pools(hcg)
+    pool_size = len(pools[0])
+    assert pool_size == cp_degree * hcg._cp_sharding_degree, (
+        f"pool size {pool_size} != cp_degree {cp_degree} * "
+        f"cp_sharding_degree {hcg._cp_sharding_degree}"
+    )
+
+    # max_dynamic_context_parallel_size is the largest CP group DCP may use.
+    # Groups are size-aligned blocks of power-of-two length, so a legal cap is
+    # exactly "a power of two that divides the pool" -- then every power of two
+    # up to the cap also divides the pool (size | cap | pool_size), and the cap
+    # is literally the biggest group that can be built. Both properties are
+    # checked instead of silently rounded down, because rounding down would
+    # make the run use a smaller cap than configured without saying so.
+    if max_dynamic_context_parallel_size is None:
+        max_dynamic_context_parallel_size = 1
+        while max_dynamic_context_parallel_size * 2 <= pool_size and (
+            pool_size % (max_dynamic_context_parallel_size * 2) == 0
+        ):
+            max_dynamic_context_parallel_size *= 2
+    if not 1 <= max_dynamic_context_parallel_size <= pool_size:
+        raise ValueError(
+            f"max_dynamic_context_parallel_size "
+            f"{max_dynamic_context_parallel_size} must be in [1, {pool_size}]"
+        )
+    if pool_size % max_dynamic_context_parallel_size != 0:
+        raise ValueError(
+            f"max_dynamic_context_parallel_size "
+            f"{max_dynamic_context_parallel_size} must divide the rank pool "
+            f"(sharding_degree) {pool_size}"
+        )
+    if (
+        max_dynamic_context_parallel_size
+        & (max_dynamic_context_parallel_size - 1)
+    ) != 0:
+        raise ValueError(
+            f"max_dynamic_context_parallel_size "
+            f"{max_dynamic_context_parallel_size} must be a power of two; CP "
+            f"groups are power-of-two size-aligned blocks"
+        )
+    _MAX_DYNAMIC_CONTEXT_PARALLEL_SIZE = max_dynamic_context_parallel_size
+
+    sizes = []
+    size = 1
+    while size <= max_dynamic_context_parallel_size:
+        # size | cap | pool_size holds by the checks above, so every size here
+        # tiles the pool; no filtering needed.
+        sizes.append(size)
+        size *= 2
+
+    global_rank = hcg.global_rank
+    n_new_groups = 0
+    for size in sizes:
+        my_group = None
+        my_ranks = None
+        for pool in pools:
+            for start in range(0, pool_size, size):
+                ranks = pool[start : start + size]
+                if size == 1:
+                    # A one-rank CP group needs no communicator; None keeps the
+                    # existing "no group -> world size 1" convention.
+                    comm_group = None
+                elif size == cp_degree:
+                    # Reuse the static CP group instead of duplicating it.
+                    comm_group = (
+                        hcg._cp_comm_group if global_rank in ranks else None
+                    )
+                else:
+                    comm_group = paddle.distributed.new_group(ranks=ranks)
+                    n_new_groups += 1
+                if global_rank in ranks:
+                    my_group = comm_group
+                    my_ranks = ranks
+        assert my_ranks is not None, (
+            f"rank {global_rank} is in no CP group of size {size}"
+        )
+        if size == cp_degree:
+            # Self-check on the pool layout: our own carving must reproduce the
+            # group fleet built. If this fires, the cp-innermost assumption
+            # above no longer holds for this topology.
+            assert list(my_ranks) == list(hcg._cp_group), (
+                f"dcp group of size {cp_degree} is {my_ranks} but fleet's "
+                f"static cp group is {hcg._cp_group}"
+            )
+        _DYNAMIC_CONTEXT_PARALLEL_GROUPS[size] = my_group
+
+    # Warm every communicator up here, the way Megatron does right after building
+    # its dynamic dp-cp groups (Megatron's parallel_state). NCCL builds a
+    # communicator lazily on first use, so without this the first microbatch that
+    # happens to select a given size pays the setup cost mid-step. A plain barrier
+    # only rendezvouses the group; it does NOT exercise the two ops DCP actually
+    # runs (``all_gather`` for CP KV, ``alltoall_single`` for the reroute), and NCCL
+    # picks channels/algorithm/buffers per op-type on first real call. So warm both
+    # ops on each size group with tiny fake tensors (a barrier-only warmup still
+    # leaves a latency spike on the first real op). Safe as a collective: each
+    # rank owns exactly one group per size and walks sizes in the same order, so all
+    # members of a group reach each op together.
+    _warm = paddle.ones([8], dtype="int64")
+    for size in sizes:
+        group = _DYNAMIC_CONTEXT_PARALLEL_GROUPS[size]
+        if group is None:
+            continue
+        nranks = group.nranks
+        # CP attention path: all_gather, the op CP KV gathering runs.
+        gathered = []
+        paddle.distributed.all_gather(gathered, _warm, group=group)
+        # Reroute path: alltoall_single, called the way the external DCP driver
+        # calls it (out, in, send_splits, recv_splits, group -- equal 1-splits).
+        send = paddle.ones([nranks], dtype="int64")
+        recv = paddle.empty([nranks], dtype="int64")
+        paddle.distributed.alltoall_single(
+            recv, send, [1] * nranks, [1] * nranks, group=group
+        )
+    paddle.device.cuda.synchronize()
+
+    # Logged on every rank: the per-rank group table is what a DCP run has to be
+    # checked against, and it differs between ranks.
+    my_groups = ", ".join(
+        f"{size}: "
+        + (
+            "None(no comm)"
+            if _DYNAMIC_CONTEXT_PARALLEL_GROUPS[size] is None
+            else str(_DYNAMIC_CONTEXT_PARALLEL_GROUPS[size].ranks)
+        )
+        for size in sizes
+    )
+    logger.info(
+        f"[DCP] dynamic context parallel groups built: rank={global_rank} "
+        f"n_pools={len(pools)} pool_size(sharding_degree)={pool_size} "
+        f"cp_degree={cp_degree} cp_sharding_degree={hcg._cp_sharding_degree} "
+        f"max_dynamic_cp_size={max_dynamic_context_parallel_size} "
+        f"sizes={sizes} new_nccl_groups={n_new_groups} "
+        f"(size 1 needs none, size {cp_degree} reuses the static cp group) "
+        f"my_groups={{{my_groups}}}"
+    )
+
+    return _DYNAMIC_CONTEXT_PARALLEL_GROUPS
+
+
+def get_dynamic_context_parallel_sizes():
+    """Return the CP group sizes that were pre-built, ascending."""
+    return sorted(_DYNAMIC_CONTEXT_PARALLEL_GROUPS.keys())
+
+
+def get_max_dynamic_context_parallel_size():
+    """Return the effective max_dynamic_context_parallel_size."""
+    return _MAX_DYNAMIC_CONTEXT_PARALLEL_SIZE
+
+
+def get_dynamic_context_parallel_group(size):
+    """Return the pre-built CP group of the given size for this rank."""
+    assert size in _DYNAMIC_CONTEXT_PARALLEL_GROUPS, (
+        f"no pre-built CP group of size {size}; available sizes are "
+        f"{get_dynamic_context_parallel_sizes()}"
+    )
+    return _DYNAMIC_CONTEXT_PARALLEL_GROUPS[size]
+
+
+def set_current_context_parallel_size(size):
+    """Switch the CP group used by subsequent CP collectives.
+
+    Called once per microbatch with that microbatch's `local_cp_size`.
+    """
+    global _CURRENT_CONTEXT_PARALLEL_SIZE
+    assert size in _DYNAMIC_CONTEXT_PARALLEL_GROUPS, (
+        f"no pre-built CP group of size {size}; available sizes are "
+        f"{get_dynamic_context_parallel_sizes()}"
+    )
+    _CURRENT_CONTEXT_PARALLEL_SIZE = size
+
+
+def get_current_context_parallel_size():
+    """Return the CP size selected for the current microbatch, or None."""
+    return _CURRENT_CONTEXT_PARALLEL_SIZE
+
+
+def reset_current_context_parallel_size():
+    """Fall back to the static CP group."""
+    global _CURRENT_CONTEXT_PARALLEL_SIZE
+    _CURRENT_CONTEXT_PARALLEL_SIZE = None
+
+
+### End of dynamic context parallel group management
 
 
 def get_context_parallel_rank():

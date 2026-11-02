@@ -36,9 +36,11 @@ from paddlefleet_ops.flash_mask_facade import (
     needs_value_padding,
 )
 
+from paddlefleet import parallel_state
 from paddlefleet.accuracy_target import targets_hf
 from paddlefleet.context_parallel_utils import (
     flashmask_attention_cp,
+    refresh_context_parallel_size,
 )
 from paddlefleet.fusions.fused_softmax import FusedScaleMaskSoftmax
 from paddlefleet.parallel_state import get_context_parallel_world_size
@@ -301,6 +303,23 @@ class DotProductAttention(FleetLayer):
         # A CP-replicated region (e.g. the HyperBody encoder) already holds the
         # full sequence on every CP rank: gathering KV over CP would duplicate it
         # cp times, so attention there must run as if CP were off.
+        # Under dynamic context parallel this is re-read per microbatch by
+        # refresh_context_parallel_size() at the top of forward: the CP group --
+        # and therefore its size -- changes between microbatches, and a value
+        # frozen here would send some of them down the wrong branch below.
+        # That per-microbatch refresh ignores ``cp_replicated_sequence`` and would
+        # overwrite the 1 set below, so the two are rejected together for now.
+        if (
+            getattr(config, "cp_replicated_sequence", False)
+            and parallel_state.get_dynamic_context_parallel_sizes()
+        ):
+            raise ValueError(
+                "dynamic context parallel + cp_replicated_sequence is "
+                "unsupported: refresh_context_parallel_size() would reset the "
+                "CP-replicated attention to the current CP size. Got "
+                "cp_replicated_sequence=True with dynamic CP sizes "
+                f"{parallel_state.get_dynamic_context_parallel_sizes()}."
+            )
         self.context_parallel_size = (
             1
             if getattr(config, "cp_replicated_sequence", False)
@@ -542,6 +561,9 @@ class DotProductAttention(FleetLayer):
         v_b_proj_weight: paddle.Tensor = None,
     ):
         """Forward."""
+        # Dynamic context parallel: re-read the CP size for this microbatch.
+        # No-op (and bitwise unchanged) when DCP is off.
+        refresh_context_parallel_size(self)
 
         assert attention_bias is None, (
             "Attention bias is not supported for DotProductAttention."

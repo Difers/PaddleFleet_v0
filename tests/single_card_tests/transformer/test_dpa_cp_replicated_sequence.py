@@ -95,6 +95,18 @@ class TestCpReplicatedSequence(unittest.TestCase):
         self.assertEqual(got.shape, [1, _T, _H * _D])
         self.assertTrue(bool(paddle.equal_all(got, want)))
 
+    def test_rejected_under_dynamic_cp(self):
+        # The per-microbatch DCP refresh would undo the cp=1 above, so the
+        # combination fails at construction; non-replicated layers still build.
+        with mock.patch.object(
+            dpa_mod.parallel_state,
+            "get_dynamic_context_parallel_sizes",
+            return_value=[1, 2, 4],
+        ):
+            with self.assertRaisesRegex(ValueError, "cp_replicated_sequence"):
+                _build(True, 4)
+            self.assertEqual(_build(None, 4).context_parallel_size, 4)
+
 
 class TestStandaloneProviderIsCpReplicated(unittest.TestCase):
     """The standalone ``HyperEncoderModelFleet`` path never shards over CP

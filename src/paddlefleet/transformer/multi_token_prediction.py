@@ -796,7 +796,11 @@ class MultiTokenPredictionLayer(FleetLayer):
         self.tensor_parallel = config.tensor_model_parallel_size
         self.sublayers_spec = sublayers_spec
         self.layer_number = layer_number
-        self.cp_group = pg_collection.cp
+        # No cached CP group here: storing pg_collection.cp at build time would
+        # pin this layer to the static group while DCP switches groups per
+        # microbatch. Nothing in-tree read this attribute (checked by grep), so it
+        # is dropped; read pg_collection.cp at the point of use if it is ever
+        # needed (it follows the DCP selection).
 
         self_attention_spec = (
             self.sublayers_spec.transformer_layer.sublayers_spec.self_attn

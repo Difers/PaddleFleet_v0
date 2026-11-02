@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import os
 
 import paddle
 from paddle import distributed as dist
@@ -62,6 +63,119 @@ if is_flash_mask_available():
             "its cute kernels cannot be imported -- reinstall paddlefleet_ops "
             "so that paddlefleet_ops.flash_mask.cute matches it."
         ) from exc
+
+
+_DCP_PROBE_BUDGET = [int(os.environ.get("DCP_DEBUG_CP_LINES", "40"))]
+
+
+def _dcp_probe(tag, msg):
+    """One-off bring-up probe for dynamic context parallel (DCP_DEBUG_CP=1).
+
+    Prints at most ``DCP_DEBUG_CP_LINES`` lines per process so a 9-layer model
+    with 3 microbatches per step cannot flood the worker log.
+
+    Temporary: only for DCP multi-card bring-up, to check which CP group each
+    layer actually runs on. Off by default and only reads shapes and group
+    sizes, so it does not change numerics. Remove this probe,
+    ``_DCP_PROBE_BUDGET`` and its callers (``ContextParallelScatterOp.forward``,
+    ``csa_attention.py``) once DCP multi-card training has been validated on
+    the erniebot side.
+    """
+    if os.environ.get("DCP_DEBUG_CP", "0") in ("0", "", "false", "False"):
+        return
+    if _DCP_PROBE_BUDGET[0] <= 0:
+        return
+    _DCP_PROBE_BUDGET[0] -= 1
+    print(f"[DCP-PROBE {tag}] {msg}", flush=True)
+
+
+def get_current_cp_group():
+    """Resolve the CP group this collective should run on.
+
+    Under dynamic context parallel the group changes from microbatch to
+    microbatch, so every CP primitive must resolve its default group through
+    here instead of reading `hcg.get_context_parallel_group()` directly --
+    otherwise switching the group would never reach them.
+
+    Imported lazily to keep this module free of an import cycle with
+    parallel_state.
+    """
+    from paddlefleet import parallel_state
+
+    if parallel_state.get_current_context_parallel_size() is not None:
+        # None is a real answer here: a size-1 CP group needs no communicator.
+        return parallel_state.get_context_parallel_group()
+    group = parallel_state.get_global_context_parallel_group()
+    if group is None:
+        # parallel_state may not be initialized yet (e.g. standalone op tests).
+        # fleet.get_hybrid_communicate_group() asserts when fleet itself was never
+        # initialized, which is the normal state in the single-card tests: the
+        # code this replaced read pg_collection.cp / self.cp_group there and simply
+        # got None, so resolving through here has to stay equally non-fatal.
+        try:
+            group = fleet.get_hybrid_communicate_group().get_context_parallel_group()
+        except (AssertionError, AttributeError, RuntimeError):
+            group = None
+    return group
+
+
+def get_current_cp_world_size():
+    """World size of the CP group currently in effect (1 when CP is off)."""
+    group = get_current_cp_group()
+    return 1 if group is None else group.nranks
+
+
+def _layer_cp_group(layer):
+    """CP group a layer should run on right now.
+
+    ``pg_collection.cp`` already follows the DCP selection when it holds the
+    static group (``ProcessGroupCollection.cp``) and keeps a layer's own group
+    otherwise; layers without a collection fall back to the global resolution.
+    """
+    pg_collection = getattr(layer, "pg_collection", None)
+    if pg_collection is not None and hasattr(pg_collection, "cp"):
+        return pg_collection.cp
+    return get_current_cp_group()
+
+
+def refresh_cp_state(layer):
+    """Re-derive a layer's cached CP fields for the current microbatch.
+
+    Layers cache ``cp_group / cp_size / cp_rank / cp_enabled`` in ``__init__``.
+    Under dynamic context parallel the group changes between microbatches, so a
+    cp=2 microbatch would otherwise still be split by the static degree.
+
+    Call this once at the top of ``forward``; every helper below it then reads
+    the refreshed fields. With a size selected the fields follow that group;
+    with none selected (e.g. after ``reset_current_context_parallel_size()``)
+    they are re-derived from the static group, so a previous dynamic
+    microbatch cannot leak its size into the next static forward. **When DCP
+    was never enabled this returns immediately**, so the values stay exactly
+    what ``__init__`` stored and behaviour is unchanged.
+    """
+    from paddlefleet import parallel_state
+
+    if not parallel_state.get_dynamic_context_parallel_sizes():
+        return
+    group = _layer_cp_group(layer)
+    size = 1 if group is None else group.nranks
+    # Same derivation as the layers' __init__: a 1-rank group counts as
+    # disabled and is stored as None (it needs no communicator).
+    layer.cp_group = group if size > 1 else None
+    layer.cp_size = size
+    layer.cp_rank = group.rank if size > 1 else 0
+    layer.cp_enabled = size > 1
+
+
+def refresh_context_parallel_size(layer):
+    """``refresh_cp_state`` for layers that only cache ``context_parallel_size``."""
+    from paddlefleet import parallel_state
+
+    if not parallel_state.get_dynamic_context_parallel_sizes():
+        return
+    # get_current_cp_world_size() is the selected size, or the static one when
+    # no size is selected.
+    layer.context_parallel_size = max(get_current_cp_world_size(), 1)
 
 
 def mark_context_parallel_parameter_disable_scale_grad(param_or_layer):
@@ -283,8 +397,7 @@ def reduce_scatter_any_axis(input_tensor, axis, group=None):
         paddle.Tensor: Reduced and scattered tensor chunk
     """
     if group is None:
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
 
     parallelism = group.nranks
     if parallelism == 1:
@@ -356,8 +469,7 @@ def reduce_scatter_any_axis_balance(input_tensor, axis, group=None):
     )
 
     if group is None:
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
 
     parallelism = group.nranks
     if parallelism == 1:
@@ -424,8 +536,7 @@ def reduce_scatter_any_axis_balance(input_tensor, axis, group=None):
 def scatter_contiguous(input_tensor, group=None, axis=0):
     """Contiguous scatter: rank r gets slice [r*chunk, (r+1)*chunk] along axis."""
     if group is None:
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
     nranks = group.nranks
     if nranks == 1:
         return input_tensor.clone()
@@ -454,8 +565,7 @@ def scatter_contiguous(input_tensor, group=None, axis=0):
 def all_gather_contiguous(input_tensor, group=None, axis=0):
     """Contiguous all-gather: concatenate all ranks' local tensors in rank order."""
     if group is None:
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
     nranks = group.nranks
     if nranks == 1:
         return input_tensor.clone()
@@ -490,8 +600,7 @@ def all_gather_contiguous(input_tensor, group=None, axis=0):
 def reduce_scatter_contiguous(input_tensor, axis, group=None):
     """Reduce-scatter the gradient of a contiguous rank-order all_gather."""
     if group is None:
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
     nranks = group.nranks
     if nranks == 1:
         return input_tensor.clone()
@@ -543,15 +652,23 @@ class ContextParallelScatterOp(PyLayer):
     def forward(ctx, input_tensor, axis=0, mode="dualchunk_allgather"):
         ctx.axis = axis
         ctx.mode = mode
-        hcg = fleet.get_hybrid_communicate_group()
+        group = get_current_cp_group()
 
-        assert hcg.get_context_parallel_world_size() > 1, (
+        assert get_current_cp_world_size() > 1, (
             "ScatterOpCP must be used with context parallel, ",
-            f"context_parallel_world_size={hcg.get_context_parallel_world_size()}",
+            f"context_parallel_world_size={get_current_cp_world_size()}",
         )
 
-        group = hcg.get_context_parallel_group()
         ctx.group = group
+
+        # DCP bring-up probe: who actually splits the sequence, and into how
+        # many parts.
+        _dcp_probe(
+            "SCATTER",
+            f"in={list(input_tensor.shape)} axis={axis} mode={mode} "
+            f"group_nranks={getattr(group, 'nranks', None)} "
+            f"current_cp={get_current_cp_world_size()}",
+        )
 
         if mode.startswith("contiguous"):
             return scatter_contiguous(input_tensor, group=group, axis=axis)
@@ -581,14 +698,13 @@ class ContextParallelGatherOp(PyLayer):
     def forward(ctx, input_tensor, axis=0, mode="dualchunk_allgather"):
         ctx.axis = axis
         ctx.mode = mode
-        hcg = fleet.get_hybrid_communicate_group()
+        group = get_current_cp_group()
 
-        assert hcg.get_context_parallel_world_size() > 1, (
+        assert get_current_cp_world_size() > 1, (
             "GatherOpCP must be used with context parallel, ",
-            f"context_parallel_world_size={hcg.get_context_parallel_world_size()}",
+            f"context_parallel_world_size={get_current_cp_world_size()}",
         )
 
-        group = hcg.get_context_parallel_group()
         ctx.group = group
 
         if mode.startswith("contiguous"):
@@ -615,14 +731,13 @@ class ContextParallelAllGatherOp(PyLayer):
     def forward(ctx, input_tensor, axis, mode="dualchunk_allgather"):
         ctx.axis = axis
         ctx.mode = mode
-        hcg = fleet.get_hybrid_communicate_group()
+        group = get_current_cp_group()
 
-        assert hcg.get_context_parallel_world_size() > 1, (
+        assert get_current_cp_world_size() > 1, (
             "AllGatherOpCP must be used with context parallel, ",
-            f"context_parallel_world_size={hcg.get_context_parallel_world_size()}",
+            f"context_parallel_world_size={get_current_cp_world_size()}",
         )
 
-        group = hcg.get_context_parallel_group()
         ctx.group = group
 
         if mode.startswith("contiguous"):
@@ -1054,13 +1169,12 @@ class ContextParallelNormalScatter(PyLayer):
     def forward(ctx, input_tensor, num_pad, axis=0):
         """forward"""
         ctx.axis = axis
-        hcg = fleet.get_hybrid_communicate_group()
-        cp_degree = hcg.get_context_parallel_world_size()
+        cp_degree = get_current_cp_world_size()
 
         if cp_degree == 1:
             return input_tensor.clone()
 
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
         ctx.group = group
         ctx.num_pad = num_pad
         ctx.axis = axis
@@ -1085,9 +1199,8 @@ class ContextParallelNormalGather(PyLayer):
     def forward(ctx, input_tensor, num_pad, axis=0):
         """forward"""
         ctx.axis = axis
-        hcg = fleet.get_hybrid_communicate_group()
-        cp_degree = hcg.get_context_parallel_world_size()
-        group = hcg.get_context_parallel_group()
+        cp_degree = get_current_cp_world_size()
+        group = get_current_cp_group()
         ctx.group = group
         ctx.num_pad = num_pad
 
@@ -1166,8 +1279,7 @@ class FlashMaskContextParallel(PyLayer):
             raise NotImplementedError("Fixed seed offset is not supported yet.")
 
         # Get communication group
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
 
         # Validate query sequence length for DualChunkSwap strategy
         assert query.shape[1] % 2 == 0, (
@@ -1877,8 +1989,7 @@ def flashmask_attention_ulysses(
         raise NotImplementedError(
             "flashmask_attention_ulysses does not support setting softmax_scale"
         )
-    hcg = fleet.get_hybrid_communicate_group()
-    cp_group = hcg.get_context_parallel_group()
+    cp_group = get_current_cp_group()
     cp_size = cp_group.nranks
     cp_rank = cp_group.rank
 
@@ -2031,8 +2142,7 @@ def flashmask_attention_cp(
         )
 
     if mode == "contiguous_swap2p":
-        hcg = fleet.get_hybrid_communicate_group()
-        cp_group = hcg.get_context_parallel_group()
+        cp_group = get_current_cp_group()
 
         q_head_dim = query.shape[-1]
         v_head_dim = value.shape[-1]
@@ -2179,8 +2289,7 @@ class MTPDistillationLossShift(PyLayer):
     def forward(
         ctx, tensor, num_nextn_predict_layers, mode="contiguous_allgather"
     ):
-        hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = get_current_cp_group()
 
         assert len(tensor.shape) == 3, (
             f"Expect input of shape [B, S, H], got {tensor.shape}"

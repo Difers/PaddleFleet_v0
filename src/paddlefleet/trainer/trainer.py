@@ -381,6 +381,11 @@ class Trainer:
 
     """
 
+    # Whether this trainer's training loop drives dynamic context parallel,
+    # i.e. calls parallel_state.set_current_context_parallel_size() for every
+    # microbatch. Only such trainers accept enable_dynamic_context_parallel.
+    supports_dynamic_context_parallel = False
+
     from .trainer_utils import (
         log_metrics,
         metrics_format,
@@ -428,6 +433,24 @@ class Trainer:
             args = TrainingArguments(output_dir=output_dir)
 
         self.args = args
+        # Dynamic context parallel needs a training loop that calls
+        # parallel_state.set_current_context_parallel_size() per microbatch.
+        # This Trainer's loop does not, so enabling DCP here would only build
+        # extra groups and silently keep every microbatch on the static CP
+        # group. Subclasses that drive DCP opt in via the class attribute.
+        if getattr(
+            args, "enable_dynamic_context_parallel", False
+        ) and not getattr(
+            type(self), "supports_dynamic_context_parallel", False
+        ):
+            raise NotImplementedError(
+                "enable_dynamic_context_parallel=True requires a trainer that "
+                "selects the CP group per microbatch "
+                "(parallel_state.set_current_context_parallel_size); "
+                f"{type(self).__name__} does not. Set "
+                "`supports_dynamic_context_parallel = True` on a Trainer "
+                "subclass that does."
+            )
         # An accuracy-aligned run has to reproduce its reference's optimizer
         # trajectory, and the Megatron alignment suite runs with clipping off.
         # ``max_grad_norm`` defaults to 1.0, so a config that simply does not

@@ -25,6 +25,8 @@ from paddlefleet.training.global_vars import set_global_variables
 def initialize_fleet(
     strategy: fleet.DistributedStrategy,
     parsed_args=None,
+    enable_dynamic_context_parallel: bool | None = None,
+    max_dynamic_cp_size: int | None = None,
     **kwargs,
 ):
     # Parse arguments
@@ -41,7 +43,29 @@ def initialize_fleet(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    ps.initialize_model_parallel(hcg)
+    # Dynamic context parallel: pre-build the multi-size CP groups. Explicit
+    # arguments win over yaml/CLI args, so callers that do not go through
+    # parse_args (e.g. PaddleFormers' training_args) can still turn it on.
+    # Off by default -- nothing extra is created unless asked.
+    if enable_dynamic_context_parallel is None:
+        enable_dynamic_context_parallel = getattr(
+            args, "enable_dynamic_context_parallel", False
+        )
+    if max_dynamic_cp_size is None:
+        max_dynamic_cp_size = getattr(args, "max_dynamic_cp_size", None)
+    # -1 is the "unset" value on the PaddleFormers side; it means "use the whole
+    # rank pool", which is what None means downstream.
+    if max_dynamic_cp_size is not None and max_dynamic_cp_size <= 0:
+        max_dynamic_cp_size = None
+
+    ps.initialize_model_parallel(
+        hcg,
+        enable_dynamic_context_parallel=enable_dynamic_context_parallel,
+        max_dynamic_context_parallel_size=max_dynamic_cp_size,
+    )
+    # The DCP group table is logged by
+    # parallel_state.initialize_dynamic_context_parallel_groups itself, which is
+    # where all the numbers live -- don't duplicate it here.
     print(f"fleet initialize successfully: {rank=} {world_size=}")
 
 

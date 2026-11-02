@@ -47,6 +47,7 @@ from paddlefleet.accuracy_target import targets_hf
 from paddlefleet.context_parallel_utils import (
     ContextParallelAllGatherOp,
     ContextParallelGatherOp,
+    refresh_context_parallel_size,
 )
 from paddlefleet.cp_shard import cp_shard_source, to_cp_local
 from paddlefleet.parallel_state import (
@@ -543,6 +544,9 @@ class StandardMoERouter(nn.Layer):
 
         self.tensor_model_parallel_size = config.tensor_model_parallel_size
         self.sequence_parallel = config.sequence_parallel
+        # Under dynamic context parallel this is re-read per microbatch by
+        # refresh_context_parallel_size() at the top of TopKRouter.forward,
+        # because _cal_seq_aux_loss branches on it.
         self.context_parallel_size = max(get_context_parallel_world_size(), 1)
 
         self.scoring_func = config.scoring_func
@@ -1937,6 +1941,9 @@ class TopKRouter(StandardMoERouter):
         self._setup_multimodal_bias()
 
     def forward(self, input, input_ids=None, origin_input_ids=None):
+        # Dynamic context parallel: re-read the CP size for this microbatch
+        # (_cal_seq_aux_loss branches on it). No-op when DCP is off.
+        refresh_context_parallel_size(self)
         # The gate matmul gets this tensor, not the flattened view made below:
         # FusedGateDetachMatmul keeps what it is given until backward, so a view
         # would pin the mHC layernorm output against the recompute's _clear_data().

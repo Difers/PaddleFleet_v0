@@ -152,3 +152,40 @@ class ProcessGroupCollection:
         init_dict = {pg: pg_to_func[pg]() for pg in required_pgs}
 
         return cls(**init_dict)
+
+
+def _get_cp(self):
+    """CP group of this collection, following dynamic context parallel.
+
+    The collection stores the group it was built with. When DCP has selected a
+    size for the current microbatch and the stored group is the static
+    whole-run CP group, the group of the selected size is returned instead, so
+    every layer that reads ``pg_collection.cp`` at forward time switches with
+    the microbatch without being adapted one by one. A collection holding any
+    other group (a layer's own CP group) is returned as stored, and with no
+    size selected -- DCP off, or after ``reset_current_context_parallel_size``
+    -- the stored group is returned, i.e. behaviour is unchanged.
+    """
+    try:
+        group = self.__dict__["_cp"]
+    except KeyError:
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute 'cp'"
+        ) from None
+    if (
+        parallel_state.get_current_context_parallel_size() is not None
+        and group is parallel_state.get_global_context_parallel_group()
+    ):
+        # None is a real answer: a size-1 CP group needs no communicator.
+        return parallel_state.get_context_parallel_group()
+    return group
+
+
+def _set_cp(self, group):
+    self.__dict__["_cp"] = group
+
+
+# Installed after @dataclass ran, so ``cp`` stays a dataclass field (accepted by
+# __init__ / use_mpu_process_groups, listed by fields()) while reads go through
+# _get_cp.
+ProcessGroupCollection.cp = property(_get_cp, _set_cp, doc=_get_cp.__doc__)

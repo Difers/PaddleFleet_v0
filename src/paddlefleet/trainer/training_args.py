@@ -957,6 +957,32 @@ class TrainingArguments:
             )
         },
     )
+    enable_dynamic_context_parallel: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable dynamic context parallel (DCP), which lets each microbatch pick a "
+                "CP group size according to its packed sequence length. When False (default) nothing "
+                "changes: no extra communication group is created and the static CP group is used. "
+                "Not supported with tensor or pipeline model parallel yet: tensor_model_parallel_size and "
+                "pipeline_model_parallel_size must stay at 1 (or -1), otherwise initialization raises. "
+                "Also requires a trainer whose training loop selects the CP group per microbatch "
+                "(parallel_state.set_current_context_parallel_size) and sets "
+                "`supports_dynamic_context_parallel = True`; the built-in Trainer does not and raises."
+            )
+        },
+    )
+    max_dynamic_cp_size: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Upper bound of the dynamic CP group size, only used when enable_dynamic_context_parallel "
+                "is True. -1 means the whole rank pool, i.e. sharding_parallel_degree, so a long sample "
+                "can be spread over the entire sharding group. Set it to context_parallel_size to keep "
+                "every dynamic group inside one static CP group."
+            )
+        },
+    )
     context_parallel_size: int = field(
         default=-1,
         metadata={
@@ -2973,7 +2999,11 @@ class TrainingArguments:
                     and get_tensor_model_parallel_group is not None
                     and get_tensor_model_parallel_group(False) is None
                 ):
-                    initialize_fleet(strategy)
+                    initialize_fleet(
+                        strategy,
+                        enable_dynamic_context_parallel=self.enable_dynamic_context_parallel,
+                        max_dynamic_cp_size=self.max_dynamic_cp_size,
+                    )
                 logger.info(strategy)
 
                 if self.reorder_pipeline_priority:

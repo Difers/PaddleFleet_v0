@@ -1259,7 +1259,7 @@ class LanguageLoss(FleetLayer):
                         if get_context_parallel_world_size() > 1:
                             dist.all_reduce(
                                 ploss,
-                                group=fleet.get_hybrid_communicate_group().get_context_parallel_group(),
+                                group=get_context_parallel_group(),
                             )
 
                         ploss = ploss / xishu

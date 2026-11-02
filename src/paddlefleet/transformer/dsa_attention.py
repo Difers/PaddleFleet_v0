@@ -1373,9 +1373,11 @@ class DSAIndexerLossLoggingHelper:
             values /= tracker["avg_group"].nranks
 
         # DP avg
+        # NOTE(dcp): which group to average over is a whole-run structural
+        # choice, so it must not follow the per-microbatch DCP group.
         dp_group = parallel_state.get_data_parallel_group(
             check_initialized=False,
-            with_context_parallel=parallel_state.get_context_parallel_world_size()
+            with_context_parallel=parallel_state.get_global_context_parallel_world_size()
             > 1,
         )
         if dp_group is not None and dp_group.nranks > 1:

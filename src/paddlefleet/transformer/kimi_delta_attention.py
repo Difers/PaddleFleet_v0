@@ -40,6 +40,7 @@ from paddle.distributed.flex_checkpoint.dcp.sharded_weight import (
     build_sharded_state_dict,
 )
 
+from paddlefleet import parallel_state
 from paddlefleet.jit import jit_fuser
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.recompute_utils import module_needs_recompute
@@ -662,6 +663,20 @@ class KimiDeltaAttention(FleetLayer):
         if packed_seq_params is not None:
             raise NotImplementedError(
                 "KDA does not support packed sequence for now."
+            )
+        # self.cp_size, and the headwise divisibility check built on it, are
+        # fixed in __init__, while pg_collection.cp follows the dynamic context
+        # parallel selection. Refuse a microbatch whose CP size differs instead
+        # of splitting by one size and communicating over another.
+        current_cp_size = get_pg_size(getattr(self.pg_collection, "cp", None))
+        if (
+            parallel_state.get_current_context_parallel_size() is not None
+            and current_cp_size != self.cp_size
+        ):
+            raise NotImplementedError(
+                "KDA does not support dynamic context parallel yet: the "
+                f"layer was built for cp_size={self.cp_size}, but the current "
+                f"microbatch selected cp_size={current_cp_size}."
             )
 
         # Inference cache: the first pass prefills the recurrent state, every

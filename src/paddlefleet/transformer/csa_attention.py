@@ -49,7 +49,12 @@ from paddlefleet.utils import use_dsv4_accuracy_compatible
 _ACCURACY_COMPATIBLE_KERNEL: bool = (
     os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 )
-from paddlefleet.context_parallel_utils import ContextParallelGatherOp
+from paddlefleet.context_parallel_utils import (
+    ContextParallelGatherOp,
+    _dcp_probe,
+    get_current_cp_world_size,
+    refresh_cp_state,
+)
 from paddlefleet.parallel_state import get_context_parallel_world_size
 from paddlefleet.train_infer_consistent_ops.inspect_util import (
     get_current_layer,
@@ -2830,7 +2835,11 @@ class CompressedSparseAttention(FleetLayer):
         self.n_local_heads = config.num_attention_heads
         self.softmax_scale = config.v_head_dim**-0.5
 
-        # CP state: derived from pg_collection.cp; cp_size=1 means CP disabled
+        # CP state: derived from pg_collection.cp; cp_size=1 means CP disabled.
+        # Under dynamic context parallel these four fields are re-derived for
+        # the current microbatch by refresh_cp_state() at the top of forward:
+        # pg_collection.cp follows the DCP selection, but values cached here
+        # would not.
         cp_pg = pg_collection.cp if pg_collection is not None else None
         if cp_pg is not None and getattr(cp_pg, "nranks", 1) > 1:
             self.cp_group = cp_pg
@@ -4452,6 +4461,10 @@ class CompressedSparseAttention(FleetLayer):
         Returns:
             output: [b, sq, np * v_head_dim]
         """
+        # Dynamic context parallel: this microbatch may run on a smaller CP group
+        # than the one captured in __init__. No-op (and bitwise unchanged) when
+        # DCP is off; every helper below reads self.cp_* after this point.
+        refresh_cp_state(self)
         b, sq, np_heads, hn = query.shape
         indexcache_state_next = indexcache_state
         indexcache_state_updated = False
@@ -5034,6 +5047,17 @@ class CompressedSparseAttention(FleetLayer):
             reduce_scatter(SUM) + optimizer x cp_size aggregates them correctly
         """
         b, sq, np_heads, hn = query.shape
+        # DCP bring-up probe: cp_size / cp_group are resolved per call now, so
+        # printing them next to the incoming shape is what tells apart "the
+        # scatter used the static cp_degree" from "CSA read a stale cp_size".
+        _dcp_probe(
+            "CSA",
+            f"query_sq={sq} self.cp_size={self.cp_size} "
+            f"self.cp_group_nranks={getattr(self.cp_group, 'nranks', None)} "
+            f"current_cp={get_current_cp_world_size()} "
+            f"sq*self.cp_size={sq * self.cp_size} "
+            f"compress_ratio={self.compress_ratio}",
+        )
         indexcache_state_next = indexcache_state
         indexcache_state_updated = False
         sq_global = sq * self.cp_size

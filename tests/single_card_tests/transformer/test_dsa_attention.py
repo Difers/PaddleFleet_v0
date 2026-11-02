@@ -1004,6 +1004,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     ):
         """Empty tracker should initialize zeros and join PP all_reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         pp_group = MagicMock()
         pp_group.nranks = 2
         mock_ps.get_pipeline_model_parallel_group.return_value = pp_group
@@ -1020,6 +1023,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_empty_tracker_uses_registered_num_layers(self, mock_ps):
         """Empty tracker should infer registered layer count for PP reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         pp_group = MagicMock()
         pp_group.nranks = 2
         mock_ps.get_pipeline_model_parallel_group.return_value = pp_group
@@ -1037,6 +1043,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_no_distributed_groups(self, mock_ps):
         """Reduce with no distributed groups should keep values unchanged."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = None
         mock_ps.get_data_parallel_group.return_value = None
 
@@ -1057,6 +1066,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_with_pp_group(self, mock_ps):
         """Reduce with PP group should call all_reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         pp_group = MagicMock()
         pp_group.nranks = 2
         mock_ps.get_pipeline_model_parallel_group.return_value = pp_group
@@ -1074,6 +1086,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_with_dp_group(self, mock_ps):
         """Reduce with DP group should call all_reduce and divide by nranks."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = None
         dp_group = MagicMock()
         dp_group.nranks = 4
@@ -1093,6 +1108,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_with_reduce_group(self, mock_ps):
         """Reduce with TP reduce_group should call all_reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = None
         mock_ps.get_data_parallel_group.return_value = None
 
@@ -1113,6 +1131,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_with_avg_group(self, mock_ps):
         """Reduce with avg_group should call all_reduce and divide by nranks."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = None
         mock_ps.get_data_parallel_group.return_value = None
 
@@ -1133,6 +1154,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_pp_group_single_rank_skipped(self, mock_ps):
         """PP group with nranks=1 should not trigger all_reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         pp_group = MagicMock()
         pp_group.nranks = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = pp_group
@@ -1150,6 +1174,9 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
     def test_reduce_dp_group_single_rank_skipped(self, mock_ps):
         """DP group with nranks=1 should not trigger all_reduce."""
         mock_ps.get_context_parallel_world_size.return_value = 1
+        # dp 组的组成按"整轮静态 CP 尺寸"决定（DCP 下不跟随每个 microbatch 的组），
+        # 见 dsa_attention.py 的 with_context_parallel。
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
         mock_ps.get_pipeline_model_parallel_group.return_value = None
         dp_group = MagicMock()
         dp_group.nranks = 1

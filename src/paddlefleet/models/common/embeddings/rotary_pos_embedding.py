@@ -297,10 +297,25 @@ class RotaryEmbedding(nn.Layer):
             if transformer_config.sequence_parallel:
                 rotary_seq_len *= transformer_config.tensor_model_parallel_size
 
-        # TODO: self.cp_group.world_size --> transformer_config.context_parallel_size
-        # rotary_seq_len *= transformer_config.context_parallel_size
-        if self.cp_group is not None and self.cp_group.world_size > 1:
-            rotary_seq_len *= self.cp_group.world_size
+        # Scale the local length back up to the global one. Under dynamic context
+        # parallel the size must come from the group *currently* in effect, not from
+        # ``self.cp_group``: that group is captured when the layer is built, so it
+        # keeps reporting the static degree. MLA validates
+        # ``rotary_seq_len == cp_size * local_seq_len`` with the current size (the
+        # CP RoPE check in ``MLASelfAttention.get_query_key_value_tensors``), so a
+        # static cp=4 against a cp=2 microbatch fails that check.
+        # With DCP off nothing changes: the layer's own group wins, which is what
+        # callers that pass ``cp_group`` explicitly (including the single-card
+        # tests) rely on, and the global getter is only the last resort.
+        dcp_size = parallel_state.get_current_context_parallel_size()
+        if dcp_size is not None:
+            cp_world_size = dcp_size
+        elif self.cp_group is not None:
+            cp_world_size = self.cp_group.world_size
+        else:
+            cp_world_size = parallel_state.get_context_parallel_world_size()
+        if cp_world_size > 1:
+            rotary_seq_len *= cp_world_size
 
         return rotary_seq_len
 
