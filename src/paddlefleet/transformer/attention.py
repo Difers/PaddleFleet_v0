@@ -408,8 +408,45 @@ class Attention(FleetLayer, ABC):
             )
         )
 
-    def _post_core_attention_hook(self, core_attn_out: Tensor) -> Tensor:
-        """Hook called after core attention. Override in subclasses (e.g. VHA postmix)."""
+    def _use_fused_rope(self) -> bool:
+        """Whether q/k RoPE may take the fused cos/sin kernel."""
+        return (
+            self.config.apply_rope_fusion
+            and not self.config.high_precision_rope
+        )
+
+    def _use_ec_mrope(self, position_ids: Tensor | None) -> bool:
+        """Whether q/k RoPE takes the EC-compatible complex 3D MRoPE branch."""
+        return (
+            self.config.gpt_model_use_experimental_version
+            and position_ids is not None
+            and not self.config.multi_latent_attention
+        )
+
+    def _check_forward_inputs(
+        self,
+        *,
+        rotary_pos_emb: tuple[Tensor, Tensor] | None,
+        rope_freqs_cis: Tensor | None,
+        position_ids: Tensor | None,
+        packed_seq_params: Tensor | None,
+    ) -> None:
+        """Validate forward inputs before any computation. Override in subclasses."""
+
+    def _post_core_attention_hook(
+        self,
+        core_attn_out: Tensor,
+        *,
+        k_pos_emb: Tensor | None = None,
+        cu_seqlens_kv: Tensor | None = None,
+        total_seqlen_kv: int | None = None,
+        position_ids: Tensor | None = None,
+    ) -> Tensor:
+        """Hook called after core attention. Override in subclasses (e.g. VHA postmix).
+
+        The keyword arguments carry the key-side RoPE context so subclasses can
+        undo the rotation on the attention output (VHA shared-KV).
+        """
         return core_attn_out
 
     @abstractmethod
@@ -458,15 +495,6 @@ class Attention(FleetLayer, ABC):
             (tuple[Tensor, Tensor]) Attention output and bias.
 
         """
-        # Check if we need to skip RoPE
-        # no_rope is 0-indexed array and self.layer_number is 1-indexed
-        # no_rope = (
-        #    self.config.no_rope_freq[self.layer_number - 1]
-        #    if self.config.no_rope_freq
-        #    else False
-        # )
-        no_rope = False
-
         if self.is_swa:
             if rope_freqs_cis is not None:
                 raise ValueError("Sliding Window Not Support rope_freqs_cis")
@@ -474,14 +502,18 @@ class Attention(FleetLayer, ABC):
             rotary_pos_cos = swa_rotary_pos_cos
             rotary_pos_sin = swa_rotary_pos_sin
 
-        if no_rope:
-            rotary_pos_emb = None
-
         # hidden_states: [b, sq, h]
 
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        self._check_forward_inputs(
+            rotary_pos_emb=rotary_pos_emb,
+            rope_freqs_cis=rope_freqs_cis,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
 
         # =====================
         # Query, Key, and Value
@@ -519,11 +551,10 @@ class Attention(FleetLayer, ABC):
                 axis=-1,
             )
 
-        if (
-            self.config.gpt_model_use_experimental_version
-            and position_ids is not None
-            and not self.config.multi_latent_attention
-        ):
+        # Key-side RoPE context, forwarded to _post_core_attention_hook.
+        k_pos_emb = cu_seqlens_kv = total_seqlen_kv = None
+
+        if self._use_ec_mrope(position_ids):
             # EC-compatible complex multiplication 3D MRoPE
             query, key = _apply_ec_complex_3d_mrope(
                 query,
@@ -574,8 +605,7 @@ class Attention(FleetLayer, ABC):
                 total_seqlen_q = total_seqlen_kv = None
 
             if (
-                self.config.apply_rope_fusion
-                and not self.config.high_precision_rope
+                self._use_fused_rope()
                 and q_pos_emb is not None
                 and k_pos_emb is not None
             ):
@@ -637,6 +667,10 @@ class Attention(FleetLayer, ABC):
         if self.qk_rope_head_dim > 0 and self.qk_rope_head_dim < self.head_dim:
             query = paddle.concat([query, query_nope], axis=-1)
             key = paddle.concat([key, key_nope], axis=-1)
+
+        if value is None:
+            # Shared-KV: V is the rotated K.
+            value = key.clone()
 
         # ==================================
         # core attention computation
@@ -713,7 +747,13 @@ class Attention(FleetLayer, ABC):
         ) and self.config.sequence_parallel:
             core_attn_out = core_attn_out.transpose([1, 0, 2]).contiguous()
 
-        core_attn_out = self._post_core_attention_hook(core_attn_out)
+        core_attn_out = self._post_core_attention_hook(
+            core_attn_out,
+            k_pos_emb=k_pos_emb,
+            cu_seqlens_kv=cu_seqlens_kv,
+            total_seqlen_kv=total_seqlen_kv,
+            position_ids=position_ids,
+        )
 
         # Apply gated attention: gate the attention output before output projection
         gate_recompute = None
@@ -1532,6 +1572,10 @@ class SelfAttentionVHA(Attention):
         self.shared_kv = self.config.vha_shared_kv
         if self.shared_kv:
             assert self.head_dim == self.v_head_dim
+            if self.config.sequence_parallel:
+                raise NotImplementedError(
+                    "VHA shared-KV does not support sequence_parallel"
+                )
 
         self.gated_attention = getattr(self.config, "gated_attention", False)
 
@@ -1836,16 +1880,64 @@ class SelfAttentionVHA(Attention):
 
         return core_attn_out.reshape([b, sq, -1])
 
-    def _post_core_attention_hook(self, core_attn_out: Tensor) -> Tensor:
+    def _use_fused_rope(self) -> bool:
+        # The shared-KV inverse RoPE rotates with k_pos_emb, so the forward
+        # rotation must use the same unfused path and frequencies.
+        return not self.shared_kv and super()._use_fused_rope()
+
+    def _check_forward_inputs(
+        self,
+        *,
+        rotary_pos_emb: tuple[Tensor, Tensor] | None,
+        rope_freqs_cis: Tensor | None,
+        position_ids: Tensor | None,
+        packed_seq_params: Tensor | None,
+    ) -> None:
+        if not self.shared_kv:
+            return
+        # The shared-KV inverse RoPE only undoes the plain k_pos_emb rotation
+        # on [b, s, ...] layout; reject every other RoPE / layout up front.
+        if packed_seq_params is not None:
+            raise NotImplementedError(
+                "VHA shared-KV does not support packed_seq_params"
+            )
+        if rope_freqs_cis is not None:
+            raise NotImplementedError(
+                "VHA shared-KV does not support rope_freqs_cis"
+            )
+        if self._use_ec_mrope(position_ids):
+            raise NotImplementedError(
+                "VHA shared-KV does not support the experimental EC 3D MRoPE"
+            )
+        if rotary_pos_emb is None or rotary_pos_emb[1] is None:
+            raise ValueError(
+                "VHA shared-KV requires rotary_pos_emb with a key-side embedding"
+            )
+
+    def _post_core_attention_hook(
+        self,
+        core_attn_out: Tensor,
+        *,
+        k_pos_emb: Tensor | None = None,
+        cu_seqlens_kv: Tensor | None = None,
+        total_seqlen_kv: int | None = None,
+        position_ids: Tensor | None = None,
+    ) -> Tensor:
+        if self.shared_kv:
+            # Inputs were validated by _check_forward_inputs.
+            core_attn_out = self._apply_shared_kv_inverse_rope(
+                core_attn_out,
+                k_pos_emb,
+                cu_seqlens_kv,
+                total_seqlen_kv,
+                position_ids,
+            )
         return self._apply_vha_postmix(core_attn_out)
 
     def get_query_key_value_tensors(
         self, hidden_states, key_value_states=None, split_qkv=True
     ):
         """Derives query, key, value (and optionally gate) from hidden_states."""
-        return self._get_qkv_vha(hidden_states)
-
-    def _get_qkv_vha(self, hidden_states):
         query, _ = self.q_proj(hidden_states)  # [b, sq, g*q_head_dim]
         if self.shared_kv:
             shared_kv, _ = self.shared_kv_proj(hidden_states)
@@ -1922,11 +2014,8 @@ class SelfAttentionVHA(Attention):
 
         if self.shared_kv:
             assert self.v_scale is None
-            shared_kv = norm_key
-            if gate is not None:
-                return query, shared_kv, gate
-
-            return query, shared_kv
+            # value=None: Attention.forward derives V from the rotated K.
+            return query, norm_key, None, gate
 
         else:
             if self.v_scale is not None:
@@ -1940,219 +2029,6 @@ class SelfAttentionVHA(Attention):
                 return query, key, value, gate
 
             return query, key, value
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        attn_mask_startend_row_indices: Tensor | None = None,
-        key_value_states: Tensor | None = None,
-        rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
-        rotary_pos_cos: Tensor | None = None,
-        rotary_pos_sin: Tensor | None = None,
-        rope_freqs_cis: Tensor | None = None,
-        swa_rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
-        swa_rotary_pos_cos: Tensor | None = None,
-        swa_rotary_pos_sin: Tensor | None = None,
-        position_ids: Tensor | None = None,
-        attention_bias: Tensor | None = None,
-        packed_seq_params: Tensor | None = None,
-        in_recompute: bool = False,
-        past_key_values=None,
-        layer_idx=None,
-        use_cache: bool = False,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Perform a forward pass through the attention layer.
-
-        Args:
-            hidden_states (Tensor): Hidden states.
-            attention_mask (Tensor): Attention mask.
-            key_value_states (Optional[Tensor]): Key/value states (for cross attention).
-            rotary_pos_emb (Optional[Union[Tensor, tuple[Tensor, Tensor]]]): Rotary
-                embedding tensor(s).
-            attention_bias (Optional[Tensor]): Attention bias.
-            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
-
-        Return:
-            (tuple[Tensor, Tensor]) Attention output and bias.
-
-        """
-        if not self.shared_kv:
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                key_value_states=key_value_states,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rope_freqs_cis=rope_freqs_cis,
-                swa_rotary_pos_emb=swa_rotary_pos_emb,
-                swa_rotary_pos_cos=swa_rotary_pos_cos,
-                swa_rotary_pos_sin=swa_rotary_pos_sin,
-                position_ids=position_ids,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                in_recompute=in_recompute,
-                past_key_values=past_key_values,
-                layer_idx=layer_idx,
-                use_cache=use_cache,
-            )
-
-        if self.is_swa:
-            if rope_freqs_cis is not None:
-                raise ValueError("Sliding Window Not Support rope_freqs_cis")
-            rotary_pos_emb = swa_rotary_pos_emb
-            rotary_pos_cos = swa_rotary_pos_cos
-            rotary_pos_sin = swa_rotary_pos_sin
-
-        # hidden_states: [b, sq, h]
-
-        # For self attention we just duplicate the rotary_pos_emb if it isn't already
-        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = (rotary_pos_emb,) * 2
-
-        # Get the query, key and value tensors based on the type of attention -
-        # self or cross attn.
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, split_qkv=True
-        )
-        attn_mask_type = self.attn_mask_type
-
-        if len(qkv_output) == 3:
-            query, shared_kv, gate = qkv_output
-        else:
-            query, shared_kv = qkv_output
-            gate = None
-
-        # ================================================
-        # relative positional embedding (rotary embedding)
-        # ================================================
-        if self.qk_rope_head_dim > 0 and self.qk_rope_head_dim < self.head_dim:
-            query, query_nope = query.split(
-                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-                axis=-1,
-            )
-            shared_kv, shared_kv_nope = shared_kv.split(
-                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-                axis=-1,
-            )
-        assert rope_freqs_cis is None
-        assert rotary_pos_emb is not None
-        assert packed_seq_params is None
-
-        q_pos_emb, k_pos_emb = rotary_pos_emb
-        cu_seqlens_q = cu_seqlens_kv = None
-        total_seqlen_q = total_seqlen_kv = None
-
-        if q_pos_emb is not None:
-            # For sequence parallel, input is [S_sp, B, H, D] (time-major),
-            # so we need to set time_major=True for RoPE
-            query = apply_rotary_pos_emb(
-                query,
-                q_pos_emb,
-                None,
-                None,
-                config=self.config,
-                cu_seqlens=cu_seqlens_q,
-                total_seq_len=total_seqlen_q,
-                position_ids=position_ids,
-                mscale=_yarn_get_concentration_factor_from_config(self.config),
-                cp_group=self.pg_collection.cp,
-                sp_group=self.pg_collection.tp
-                if self.config.sequence_parallel
-                else None,
-            )
-
-        if k_pos_emb is not None:
-            shared_kv = apply_rotary_pos_emb(
-                shared_kv,
-                k_pos_emb,
-                None,
-                None,
-                config=self.config,
-                cu_seqlens=cu_seqlens_kv,
-                total_seq_len=total_seqlen_kv,
-                position_ids=position_ids,
-                mscale=_yarn_get_concentration_factor_from_config(self.config),
-                cp_group=self.pg_collection.cp,
-                sp_group=self.pg_collection.tp
-                if self.config.sequence_parallel
-                else None,
-            )
-        if self.qk_rope_head_dim > 0 and self.qk_rope_head_dim < self.head_dim:
-            query = paddle.concat([query, query_nope], axis=-1)
-            shared_kv = paddle.concat([shared_kv, shared_kv_nope], axis=-1)
-
-        assert not self.config.sequence_parallel
-        key = shared_kv
-        value = shared_kv.clone()
-
-        if self.recompute_core_attention and self.training:
-            core_attn_out = recompute(
-                self.core_attention,
-                query,
-                key,
-                value,
-                attention_mask.clone() if attention_mask is not None else None,
-                attn_mask_startend_row_indices.clone()
-                if attn_mask_startend_row_indices is not None
-                else None,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                use_rr_flash_attention=self.use_rr_flash_attention,
-            )
-        else:
-            # Static batching attention kernel.
-            core_attn_out = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_startend_row_indices,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                use_rr_flash_attention=self.use_rr_flash_attention
-                and in_recompute,
-                past_key_values=past_key_values,
-                layer_idx=layer_idx,
-                use_cache=use_cache,
-            )
-
-        # apply reverse rope
-        core_attn_out = self._apply_shared_kv_inverse_rope(
-            core_attn_out,
-            k_pos_emb,
-            cu_seqlens_kv,
-            total_seqlen_kv,
-            position_ids,
-        )
-        core_attn_out = self._post_core_attention_hook(core_attn_out)
-
-        # Apply gated attention: gate the attention output before output projection
-        gate_recompute = None
-        if gate is not None:
-            if self.recompute_gated_attn and self.training:
-                gate_recompute = RecomputeWithoutOutput()
-                core_attn_out = gate_recompute.recompute(
-                    self._gate_apply,
-                    core_attn_out,
-                    gate,
-                    preserve_rng_state=False,
-                    share_grad_holder=True,
-                )
-            else:
-                core_attn_out = self._gate_apply(core_attn_out, gate)
-
-        output, bias = self.o_proj(core_attn_out)
-
-        if gate_recompute is not None:
-            gate_recompute.discard_output_and_register_recompute(output)
-
-        return output, bias
 
     def backward_dw(self) -> NoReturn:
         """Execute weight update operations."""

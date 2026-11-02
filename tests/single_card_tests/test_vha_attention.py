@@ -15,15 +15,17 @@
 """Unit tests for SelfAttentionVHA (Virtual Head Attention).
 
 Covers: SelfAttentionVHA init, _apply_vha_premix, _apply_vha_postmix,
-_post_core_attention_hook, _get_qkv_vha, backward_dw, SelfAttentionVHASublayersSpec.
+_post_core_attention_hook, get_query_key_value_tensors, backward_dw, SelfAttentionVHASublayersSpec.
 Also covers: DotProductAttention.expand_attn_mask_startend_row_indices_for_cp,
 get_doc_lens, get_doc_starts, startend_row_indices_add_sliding_window (num_vec=2).
 """
 
+import math
 import unittest
 
 import paddle
 
+from paddlefleet.packed_seq_params import PackedSeqParams
 from paddlefleet.training.initialize import initialize_fleet
 from paddlefleet.transformer.attention import (
     SelfAttentionVHA,
@@ -171,7 +173,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
         config = self._make_config()
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        q, k, v = attn._get_qkv_vha(hidden)
+        q, k, v = attn.get_query_key_value_tensors(hidden)
         self.assertEqual(list(q.shape), [2, 16, 8, 32])
         self.assertEqual(list(k.shape), [2, 16, 2, 32])
         self.assertEqual(list(v.shape), [2, 16, 2, 32])
@@ -180,7 +182,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
         config = self._make_config(gated=True)
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        result = attn._get_qkv_vha(hidden)
+        result = attn.get_query_key_value_tensors(hidden)
         self.assertEqual(len(result), 4)
         q, k, v, gate = result
         self.assertEqual(list(gate.shape), [2, 16, 256])
@@ -189,7 +191,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
         config = self._make_config(per_layer_norm=True)
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        q, k, v = attn._get_qkv_vha(hidden)
+        q, k, v = attn.get_query_key_value_tensors(hidden)
         self.assertEqual(list(q.shape), [2, 16, 8, 32])
         self.assertEqual(list(k.shape), [2, 16, 2, 32])
 
@@ -254,7 +256,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
         self.assertIsNone(attn.q_norm)
         self.assertIsNone(attn.k_norm)
         hidden = paddle.randn([2, 8, 256])
-        q, k, v = attn._get_qkv_vha(hidden)
+        q, k, v = attn.get_query_key_value_tensors(hidden)
         self.assertEqual(list(q.shape), [2, 8, 8, 32])
 
     def test_orthogonal_init_path(self):
@@ -301,7 +303,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
         config.attention_value_scale = 0.5
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 8, 256])
-        q, k, v = attn._get_qkv_vha(hidden)
+        q, k, v = attn.get_query_key_value_tensors(hidden)
         self.assertEqual(list(v.shape), [2, 8, 2, 32])
 
     def test_vha_debug_env(self):
@@ -312,7 +314,7 @@ class TestSelfAttentionVHA(unittest.TestCase):
             config = self._make_config()
             attn = self._build_vha(config)
             hidden = paddle.randn([2, 8, 256])
-            attn._get_qkv_vha(hidden)
+            attn.get_query_key_value_tensors(hidden)
         finally:
             del os.environ["VHA_DEBUG"]
 
@@ -649,25 +651,29 @@ class TestSelfAttentionVHASharedKV(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._build_vha(config)
 
-    def test_get_qkv_shared_kv_returns_2(self):
+    def test_get_qkv_shared_kv_returns_4(self):
         config = self._make_config()
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        result = attn._get_qkv_vha(hidden)
-        self.assertEqual(len(result), 2)
-        query, shared_kv = result
+        result = attn.get_query_key_value_tensors(hidden)
+        self.assertEqual(len(result), 4)
+        query, shared_kv, value, gate = result
         self.assertEqual(list(query.shape), [2, 16, 8, 32])
         self.assertEqual(list(shared_kv.shape), [2, 16, 2, 32])
+        self.assertIsNone(value)
+        self.assertIsNone(gate)
 
-    def test_get_qkv_shared_kv_gated_returns_3(self):
+    def test_get_qkv_shared_kv_gated_returns_4(self):
         config = self._make_config(gated=True)
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        result = attn._get_qkv_vha(hidden)
-        self.assertEqual(len(result), 3)
-        query, shared_kv, gate = result
+        result = attn.get_query_key_value_tensors(hidden)
+        self.assertEqual(len(result), 4)
+        query, shared_kv, value, gate = result
         self.assertEqual(list(query.shape), [2, 16, 8, 32])
         self.assertEqual(list(shared_kv.shape), [2, 16, 2, 32])
+        self.assertIsNone(value)
+        self.assertIsNotNone(gate)
 
     def test_forward_shared_kv(self):
         config = self._make_config()
@@ -750,7 +756,7 @@ class TestSelfAttentionVHASharedKV(unittest.TestCase):
             config = self._make_config()
             attn = self._build_vha(config)
             hidden = paddle.randn([2, 8, 256])
-            attn._get_qkv_vha(hidden)
+            attn.get_query_key_value_tensors(hidden)
         finally:
             del os.environ["VHA_DEBUG"]
 
@@ -763,9 +769,9 @@ class TestSelfAttentionVHASharedKV(unittest.TestCase):
         config.qk_norm_type = "per_layer"
         attn = self._build_vha(config)
         hidden = paddle.randn([2, 16, 256])
-        result = attn._get_qkv_vha(hidden)
-        self.assertEqual(len(result), 2)
-        query, shared_kv = result
+        result = attn.get_query_key_value_tensors(hidden)
+        self.assertEqual(len(result), 4)
+        query, shared_kv, _, _ = result
         self.assertEqual(list(query.shape), [2, 16, 8, 32])
 
     def test_forward_shared_kv_with_attention_mask(self):
@@ -778,6 +784,124 @@ class TestSelfAttentionVHASharedKV(unittest.TestCase):
             hidden, attention_mask=mask, rotary_pos_emb=rotary_pos_emb
         )
         self.assertEqual(list(output.shape), [2, 16, 256])
+
+    @staticmethod
+    def _rope(x, freqs, inverse=False):
+        """Rotate-half RoPE on the leading ``freqs.shape[-1]`` channels."""
+        rot_dim = freqs.shape[-1]
+        t, t_pass = x[..., :rot_dim], x[..., rot_dim:]
+        cos, sin = paddle.cos(freqs), paddle.sin(freqs)
+        if inverse:
+            sin = -sin
+        x1, x2 = paddle.chunk(t, 2, axis=-1)
+        rotated = paddle.concat([-x2, x1], axis=-1)
+        return paddle.concat([t * cos + rotated * sin, t_pass], axis=-1)
+
+    def _reference_forward(self, attn, hidden, freqs):
+        """Shared-KV forward from basic ops, reusing only the module weights."""
+        b, s, _ = hidden.shape
+        nh, nkv = attn.num_attention_heads, attn.num_key_value_heads
+        hd, g = attn.head_dim, nh // nkv
+
+        q, _ = attn.q_proj(hidden)
+        q = q.reshape([b, s, g, attn.q_head_dim])
+        q = paddle.einsum("btgr,krd->btkgd", q, attn.vha_premix_weight)
+        q = attn.q_norm(q.reshape([b, s, nh, hd]))
+        kv, _ = attn.shared_kv_proj(hidden)
+        k = attn.k_norm(kv.reshape([b, s, nkv, hd]))
+
+        q = self._rope(q, freqs)
+        k = self._rope(k, freqs)
+        v = k  # shared-KV: V is the rotated K
+        k = paddle.repeat_interleave(k, g, axis=2)
+        v = paddle.repeat_interleave(v, g, axis=2)
+
+        scores = paddle.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(hd)
+        causal = paddle.tril(paddle.ones([s, s], dtype="bool"))
+        scores = paddle.where(
+            causal, scores, paddle.full_like(scores, float("-inf"))
+        )
+        probs = paddle.nn.functional.softmax(scores, axis=-1)
+        out = paddle.einsum("bhqk,bkhd->bqhd", probs, v)
+
+        out = self._rope(out, freqs, inverse=True)
+        mix = paddle.matmul(
+            attn.vha_postmix_V, attn.vha_postmix_U, transpose_y=True
+        ) + paddle.eye(nh)
+        out = paddle.einsum("ij,bsjd->bsid", mix, out).reshape([b, s, nh * hd])
+        if attn.gate_proj is not None:
+            gate, _ = attn.gate_proj(hidden)
+            out = out * paddle.nn.functional.sigmoid(gate)
+        out, _ = attn.o_proj(out)
+        return out
+
+    def test_forward_backward_shared_kv_matches_reference(self):
+        for gated, rotary_percent in [
+            (False, 1.0),
+            (False, 0.5),
+            (True, 1.0),
+            (True, 0.5),
+        ]:
+            with self.subTest(gated=gated, rotary_percent=rotary_percent):
+                paddle.seed(2024)
+                config = self._make_config(
+                    gated=gated, rotary_percent=rotary_percent
+                )
+                attn = self._build_vha(config)
+                hidden = paddle.randn([2, 16, 256])
+                freqs = paddle.randn([1, 16, 1, int(32 * rotary_percent)])
+                grad_out = paddle.randn([2, 16, 256])
+
+                h_mod = hidden.clone()
+                h_mod.stop_gradient = False
+                out, _ = attn(h_mod, attention_mask=None, rotary_pos_emb=freqs)
+                (out * grad_out).sum().backward()
+
+                h_ref = hidden.clone()
+                h_ref.stop_gradient = False
+                ref = self._reference_forward(attn, h_ref, freqs)
+                (ref * grad_out).sum().backward()
+
+                paddle.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+                paddle.testing.assert_close(
+                    h_mod.grad, h_ref.grad, rtol=1e-4, atol=1e-5
+                )
+
+    def test_shared_kv_rejects_packed_seq_params(self):
+        attn = self._build_vha(self._make_config())
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=paddle.to_tensor([0, 16], dtype="int32"),
+            cu_seqlens_kv=paddle.to_tensor([0, 16], dtype="int32"),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "packed_seq_params"):
+            attn(
+                paddle.randn([1, 16, 256]),
+                attention_mask=None,
+                rotary_pos_emb=paddle.randn([1, 16, 1, 32]),
+                packed_seq_params=packed,
+            )
+
+    def test_shared_kv_rejects_rope_freqs_cis(self):
+        attn = self._build_vha(self._make_config())
+        with self.assertRaisesRegex(NotImplementedError, "rope_freqs_cis"):
+            attn(
+                paddle.randn([1, 16, 256]),
+                attention_mask=None,
+                rotary_pos_emb=paddle.randn([1, 16, 1, 32]),
+                rope_freqs_cis=paddle.randn([16, 16]),
+            )
+
+    def test_shared_kv_requires_rotary_pos_emb(self):
+        attn = self._build_vha(self._make_config())
+        with self.assertRaisesRegex(ValueError, "rotary_pos_emb"):
+            attn(paddle.randn([1, 16, 256]), attention_mask=None)
+
+    def test_shared_kv_rejects_sequence_parallel(self):
+        config = self._make_config()
+        config.sequence_parallel = True
+        with self.assertRaisesRegex(NotImplementedError, "sequence_parallel"):
+            self._build_vha(config)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@
 Multi-card test for VHA (SelfAttentionVHA) + Context Parallel (CP).
 
 Exercises:
-- SelfAttentionVHA: init, _apply_vha_premix, _apply_vha_postmix, _post_core_attention_hook, _get_qkv_vha, backward_dw
+- SelfAttentionVHA: init, _apply_vha_premix, _apply_vha_postmix, _post_core_attention_hook, get_query_key_value_tensors, backward_dw
 - DotProductAttention.forward CP path: expand_attn_mask_startend_row_indices_for_cp with experimental_dataflow (shape[-1]==2 pass), flashmask_attention_cp dispatch
 - SelfAttentionVHASublayersSpec
 - VHA layer spec in gpt_layer_specs.py
