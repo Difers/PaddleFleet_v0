@@ -61,6 +61,7 @@ from paddlefleet.trainer.trainer_utils import (
 )
 from paddlefleet.trainer.utils.zero_cost_checkpoint import (
     _SHM_DIR,
+    ZCCTaskType,
     ZeroCostCheckpointEMAProcessor,
     ZeroCostCheckpointManager,
     ZeroCostCheckpointWorker,
@@ -606,6 +607,29 @@ class TestEmaReadinessCoordination(unittest.TestCase):
             stuck = self._manager([self._worker(ready=5, generation=1)])
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 stuck.get_ema_package(timeout=0.01)
+
+    def test_shutdown_reads_the_package_a_worker_cannot_exit_without(self):
+        """The last HF step can publish after the last read, and a worker
+        cannot exit while its package is still waiting in the pipe."""
+        worker = self._worker(ready=6, generation=1)
+        worker.task_queue = queue.Queue()
+        worker.ema_meta_queue.put({"metas": {"a": 1}})
+        mgr = self._manager([worker])
+
+        def join(timeout=None):
+            if timeout is None and not worker.ema_meta_queue.empty():
+                raise AssertionError("package never read: join() hangs")
+
+        mgr.processes = [
+            SimpleNamespace(
+                is_alive=lambda: not worker.ema_meta_queue.empty(), join=join
+            )
+        ]
+        mgr.terminate_workers()
+        self.assertEqual(
+            worker.task_queue.get_nowait(), (ZCCTaskType.FINISH, None)
+        )
+        self.assertEqual(mgr.get_ema_package(), {"metas": {"a": 1}})
 
     def test_released_segments_are_resolved_under_shm(self):
         """Handles are bare segment names, not paths."""

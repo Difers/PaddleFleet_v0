@@ -1818,7 +1818,9 @@ class ZeroCostCheckpointManager:
             task = (ZCCTaskType.FINISH, None)
             worker.task_queue.put(task)
         for p in self.processes:
-            p.join()
+            while p.is_alive():
+                self.get_ema_package()
+                p.join(timeout=1)
 
 
 def worker_loop(worker):
